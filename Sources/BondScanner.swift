@@ -95,6 +95,35 @@ func cleanAlnum(_ s: String) -> String {
     return s.uppercased().filter { $0.isLetter || $0.isNumber }
 }
 
+/// Uppercase, strip spaces and dashes. Convert O to 0 only in the numeric body
+/// of a serial (not a leading prefix letter, and not a trailing E / EE suffix).
+func normalizeSerial(_ raw: String) -> String {
+    let upper = raw.uppercased().filter { $0.isLetter || $0.isNumber }
+    guard !upper.isEmpty else { return "" }
+    var chars = Array(upper)
+    var start = 0
+    while start < chars.count && chars[start].isLetter { start += 1 }
+    var end = chars.count
+    if end > start && chars[end - 1] == "E" {
+        end -= 1
+        if end > start && chars[end - 1] == "E" { end -= 1 }
+    }
+    if start < end {
+        for i in start..<end where chars[i] == "O" { chars[i] = "0" }
+    }
+    return String(chars)
+}
+
+func recordMatchingSerial(_ raw: String, in records: [BondRecord], excluding id: String? = nil) -> BondRecord? {
+    let key = normalizeSerial(raw)
+    guard !key.isEmpty else { return nil }
+    return records.first { record in
+        if let id = id, record.id == id { return false }
+        let other = normalizeSerial(record.serial)
+        return !other.isEmpty && other == key
+    }
+}
+
 func monthNumber(_ text: String) -> String? {
     let names = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
     let s = text.uppercased().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1231,8 +1260,9 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         preview.showDetected(rect)
         let now = Date().timeIntervalSince1970
         if lockedAfterCapture {
-            // OCR also handles re-arming when the table itself creates a rectangle.
-            scheduleTextHunt(frame, forRearm: true)
+            // The bond is still in view if a paper outline is visible — do not re-arm.
+            if rect != nil { noBondChecks = 0 }
+            scheduleTextHunt(frame, forRearm: true, rectangleVisible: rect != nil)
             return
         }
         guard automatic && !isProcessing && now >= nextAutoAllowedAt else { return }
@@ -1263,7 +1293,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         scheduleTextHunt(frame, forRearm: false)
     }
 
-    private func scheduleTextHunt(_ frame: CGImage, forRearm: Bool) {
+    private func scheduleTextHunt(_ frame: CGImage, forRearm: Bool, rectangleVisible: Bool = false) {
         let now = Date().timeIntervalSince1970
         guard !huntRunning && !isProcessing && now - lastHuntAt > 1.8 else { return }
         lastHuntAt = now
@@ -1275,10 +1305,13 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 guard let self = self else { return }
                 self.huntRunning = false
                 let hasBond = probe.found && probe.score >= 52 && probe.lines >= 4
-                ScanLog.shared.write("ocr hunt: score=\(probe.score) lines=\(probe.lines) bond_signal=\(probe.found) accepted=\(hasBond) rearm_check=\(forRearm)")
+                // For re-arm, treat any bond signal, moderate score, or visible outline as "still present".
+                // The stricter hasBond threshold previously re-armed while a Series E was still in view.
+                let stillPresent = probe.found || probe.score >= 20 || rectangleVisible
+                ScanLog.shared.write("ocr hunt: score=\(probe.score) lines=\(probe.lines) bond_signal=\(probe.found) accepted=\(hasBond) still_present=\(stillPresent) rearm_check=\(forRearm)")
                 if forRearm {
                     guard self.lockedAfterCapture else { return }
-                    if hasBond { self.noBondChecks = 0 }
+                    if stillPresent { self.noBondChecks = 0 }
                     else { self.noBondChecks += 1 }
                     if self.noBondChecks >= 2 {
                         self.lockedAfterCapture = false
@@ -1287,6 +1320,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                         self.priorRect = nil
                         self.status("Ready for next bond. Hunting for edges or text…")
                         ScanLog.shared.write("re-armed after two empty OCR checks")
+                    } else if stillPresent {
+                        ScanLog.shared.write("re-arm deferred: bond still in view")
                     }
                     return
                 }
@@ -1533,11 +1568,11 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         record.sourcePhoto = existing.sourcePhoto
         record.photo = existing.photo
 
-        if !record.serial.isEmpty && records.contains(where: { $0.id != record.id && $0.serial == record.serial }) {
-            record.status = "REVIEW"
-            if !record.notes.isEmpty { record.notes += " " }
-            record.notes += "Duplicate serial (value not written to the debug log)."
-            ScanLog.shared.write("scan duplicate detected (serial omitted from debug log)")
+        if let prior = recordMatchingSerial(record.serial, in: records, excluding: record.id) {
+            record.status = "DUPLICATE"
+            let note = "DUPLICATE of record \(prior.id). Flagged for review."
+            record.notes = record.notes.isEmpty ? note : record.notes + " " + note
+            ScanLog.shared.write("scan duplicate detected; photograph kept and record flagged (serial omitted from debug log, prior id=\(prior.id))")
         }
 
         let processedURL = outputRoot.appendingPathComponent(record.photo)
@@ -1571,10 +1606,16 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         ScanLog.shared.write("scan updated status=\(record.status) fields_nonempty=\([record.series, record.serial, record.issueMonth, record.issueYear, record.denomination, record.owner].filter { !$0.isEmpty }.count) rectified=\(result.rectified) total=\(records.count)")
         let serialDisplay = record.serial.isEmpty ? "unreadable serial" : record.serial
         lastLabel.stringValue = "Last: \(record.series) \(serialDisplay) | \(record.issueMonth)/\(record.issueYear) | $\(record.denomination) | \(record.status)"
-        preview.captureFlash(color: record.status == "OK" ? .systemGreen : .systemYellow)
-        status(record.status == "OK"
-            ? "OCR complete — verified. Remove the bond, then show the next one."
-            : "OCR complete — review needed. Remove the bond, then show the next one.")
+        if record.status == "OK" {
+            preview.captureFlash(color: .systemGreen)
+            status("OCR complete — verified. Remove the bond, then show the next one.")
+        } else if record.status == "DUPLICATE" {
+            preview.captureFlash(color: .systemOrange)
+            status("Duplicate of an earlier record — photograph kept for review. Remove the bond.")
+        } else {
+            preview.captureFlash(color: .systemYellow)
+            status("OCR complete — review needed. Remove the bond, then show the next one.")
+        }
         lockedAfterCapture = true
         emptyFrames = 0
         enrichRecordInBackground(record)
@@ -1583,14 +1624,13 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
 
     private func handleOCR(_ result: OCRResult, auto: Bool) {
         var record = result.record
-        if !record.serial.isEmpty && records.contains(where: { $0.serial == record.serial }) {
-            ScanLog.shared.write("scan duplicate detected (serial omitted from debug log)")
-            isProcessing = false
-            status("Duplicate serial \(record.serial) — skipped. Remove this bond.")
-            preview.captureFlash(color: .systemOrange)
-            NSSound.beep()
-            if auto { lockedAfterCapture = true }
-            return
+        var isDuplicate = false
+        if let prior = recordMatchingSerial(record.serial, in: records, excluding: record.id) {
+            isDuplicate = true
+            record.status = "DUPLICATE"
+            let note = "DUPLICATE of record \(prior.id). Flagged for review."
+            record.notes = record.notes.isEmpty ? note : record.notes + " " + note
+            ScanLog.shared.write("scan duplicate detected; photograph will be kept and the record flagged (serial omitted from debug log, prior id=\(prior.id))")
         }
         // Save partial readings for later review instead of silently dropping a real bond.
         // Do not save random backgrounds, even if a false-positive rectangle was found.
@@ -1619,12 +1659,20 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             ScanLog.shared.write("scan saved status=\(record.status) fields_nonempty=\([record.series, record.serial, record.issueMonth, record.issueYear, record.denomination, record.owner].filter { !$0.isEmpty }.count) rectified=\(result.rectified) total=\(records.count)")
             let serialDisplay = record.serial.isEmpty ? "unreadable serial" : record.serial
             lastLabel.stringValue = "Last: \(record.series) \(serialDisplay) | \(record.issueMonth)/\(record.issueYear) | $\(record.denomination) | \(record.status)"
-            preview.captureFlash(color: record.status == "OK" ? .systemGreen : .systemYellow)
+            if record.status == "OK" {
+                preview.captureFlash(color: .systemGreen)
+                status("Saved! Remove bond, then show the next one.")
+            } else if isDuplicate || record.status == "DUPLICATE" {
+                preview.captureFlash(color: .systemOrange)
+                status("Duplicate of an earlier record — photograph kept for review. Remove the bond.")
+            } else {
+                preview.captureFlash(color: .systemYellow)
+                status("Saved for REVIEW. Remove bond, then show the next one.")
+            }
             NSSound(named: NSSound.Name("Glass"))?.play()
-            status(record.status == "OK" ? "Saved! Remove bond, then show the next one." : "Saved for REVIEW. Remove bond, then show the next one.")
-            if auto { lockedAfterCapture = true; emptyFrames = 0 }
-            // Also lock manually scanned bond to avoid accidental auto duplicate while held.
-            if !auto { lockedAfterCapture = true; emptyFrames = 0 }
+            // Stay locked until the bond actually leaves the frame (re-arm). Manual Space still captures.
+            lockedAfterCapture = true
+            emptyFrames = 0
             enrichRecordInBackground(record)
         } catch {
             ScanLog.shared.write("scan save failed")
@@ -1671,9 +1719,11 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
 
     private func updateCount() {
         let processing = records.filter { $0.status == "PROCESSING" }.count
-        let reviews = records.filter { $0.status != "OK" && $0.status != "PROCESSING" }.count
+        let duplicates = records.filter { $0.status == "DUPLICATE" }.count
+        let reviews = records.filter { $0.status != "OK" && $0.status != "PROCESSING" && $0.status != "DUPLICATE" }.count
         let verified = records.filter { $0.status == "OK" }.count
         var text = "\(records.count) captured  •  \(verified) verified  •  \(reviews) need review"
+        if duplicates > 0 { text += "  •  \(duplicates) duplicate" }
         if processing > 0 { text += "  •  \(processing) reading" }
         countLabel.stringValue = text
     }
