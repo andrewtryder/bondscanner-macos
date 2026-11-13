@@ -431,7 +431,21 @@ func monthFromName(_ text: String) -> String? {
     if let i = names.firstIndex(where: { s.hasPrefix($0) }) {
         return String(format: "%02d", i + 1)
     }
+    // Common OCR confusions for a faint 3-letter month (especially SEP).
+    let aliases: [String: String] = [
+        "SEF": "SEP", "SFP": "SEP", "5EP": "SEP", "SCP": "SEP", "SETEMBER": "SEP"
+    ]
+    let token = s.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).first.map(String.init) ?? s
+    if let canon = aliases[token], let i = names.firstIndex(of: canon) {
+        return String(format: "%02d", i + 1)
+    }
     return nil
+}
+
+func monthAbbrev(_ month: String) -> String {
+    let names = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+    if let i = Int(month), (1...12).contains(i) { return names[i - 1] }
+    return month
 }
 
 func isRulerLikeText(_ text: String) -> Bool {
@@ -750,7 +764,16 @@ func ocrHarnessMain() {
             print("FILE \(url.lastPathComponent) unreadable")
             continue
         }
-        let result = scanImage(image)
+        let focus = ProcessInfo.processInfo.environment["BONDSCANNER_FOCUS_DATE"] == "1"
+        let recent: [(month: String, year: String)] = {
+            guard let raw = ProcessInfo.processInfo.environment["BONDSCANNER_RECENT_DATES"], !raw.isEmpty else { return [] }
+            return raw.split(separator: ",").compactMap { part -> (month: String, year: String)? in
+                let bits = part.split(separator: "/").map(String.init)
+                guard bits.count == 2 else { return nil }
+                return (bits[0], bits[1])
+            }
+        }()
+        let result = scanImage(image, focusIssueDate: focus, recentIssueDates: recent)
         let r = result.record
         // Operator fields (stdout only). Includes serial; omits owner/address.
         print("FILE \(url.lastPathComponent) dims=\(image.width)x\(image.height) series=\(r.series.isEmpty ? "-" : r.series) denom=\(r.denomination.isEmpty ? "-" : r.denomination) issue=\(r.issueMonth.isEmpty && r.issueYear.isEmpty ? "-/-" : "\(r.issueMonth)/\(r.issueYear)") status=\(r.status) notes=\(r.notes) rectified=\(result.rectified) lines=\(result.lineCount) bond_text=\(result.bondTextFound)")
@@ -775,6 +798,10 @@ func ocrHarnessMain() {
                 // Only the date-relevant tokens, never a full line (may contain a name).
                 let toks = regexMatches(monthBits + "|[0-3]?[0-9]", in: u)
                 print("  date_tokens=\(toks.joined(separator: ","))")
+            }
+            // datingStamp is a structured day+month+year, never an owner name.
+            if !r.datingStamp.isEmpty {
+                print("  datingStamp=\(r.datingStamp)")
             }
 
         }
@@ -863,20 +890,574 @@ func extractIssueDateReading(_ lines: [OCRLine], series: String) -> FieldReading
     return FieldReading(value: "\(best.0)/\(best.1)", confidence: conf, source: src)
 }
 
-func issueDateCrops(_ image: CGImage) -> [CGImage] {
+func issueDateCrops(_ image: CGImage, intensive: Bool = false) -> [CGImage] {
     let w = image.width, h = image.height
-    // CGImage cropping origin is top-left. Series E issue date is upper-right.
-    let regions = [
-        CGRect(x: Int(Double(w) * 0.45), y: 0, width: max(Int(Double(w) * 0.55), 1), height: max(Int(Double(h) * 0.58), 1)),
-        CGRect(x: Int(Double(w) * 0.38), y: 0, width: max(Int(Double(w) * 0.62), 1), height: max(Int(Double(h) * 0.68), 1))
+    // Issue date sits in the upper-right, ABOVE the issuing-agent / dating stamp.
+    // Keep these tight so a stamp "12 AUG 1966" is not mixed into the issue year.
+    var regions = [
+        CGRect(x: Int(Double(w) * 0.55), y: 0, width: max(Int(Double(w) * 0.45), 1), height: max(Int(Double(h) * 0.40), 1)),
+        CGRect(x: Int(Double(w) * 0.50), y: 0, width: max(Int(Double(w) * 0.50), 1), height: max(Int(Double(h) * 0.36), 1)),
+        CGRect(x: Int(Double(w) * 0.58), y: Int(Double(h) * 0.04), width: max(Int(Double(w) * 0.40), 1), height: max(Int(Double(h) * 0.38), 1))
     ]
+    if intensive {
+        regions.append(CGRect(x: Int(Double(w) * 0.48), y: 0, width: max(Int(Double(w) * 0.52), 1), height: max(Int(Double(h) * 0.48), 1)))
+        regions.append(CGRect(x: Int(Double(w) * 0.62), y: 0, width: max(Int(Double(w) * 0.36), 1), height: max(Int(Double(h) * 0.44), 1)))
+    }
     var crops: [CGImage] = []
     for r in regions {
-        guard r.width > 80, r.height > 60, let crop = image.cropping(to: r) else { continue }
-        crops.append(upscaledImage(crop, scale: 2.2) ?? crop)
+        guard r.width > 80, r.height > 50, let crop = image.cropping(to: r) else { continue }
+        crops.append(crop)
     }
     return crops
 }
+
+func stampRegionCrops(_ image: CGImage) -> [CGImage] {
+    let w = image.width, h = image.height
+    // Dating stamp is typically below the issue-date line, still on the right.
+    let regions = [
+        CGRect(x: Int(Double(w) * 0.40), y: Int(Double(h) * 0.22), width: max(Int(Double(w) * 0.58), 1), height: max(Int(Double(h) * 0.50), 1)),
+        CGRect(x: Int(Double(w) * 0.35), y: Int(Double(h) * 0.30), width: max(Int(Double(w) * 0.62), 1), height: max(Int(Double(h) * 0.50), 1))
+    ]
+    var crops: [CGImage] = []
+    for r in regions {
+        guard r.width > 80, r.height > 50, let crop = image.cropping(to: r) else { continue }
+        crops.append(upscaledImage(crop, scale: 2.0) ?? crop)
+    }
+    return crops
+}
+
+func visionBoxToCG(_ box: CGRect, image: CGImage) -> CGRect {
+    let w = CGFloat(image.width), h = CGFloat(image.height)
+    return CGRect(x: box.minX * w, y: (1 - box.maxY) * h,
+                  width: box.width * w, height: box.height * h)
+}
+
+func isIssueDateAnchorText(_ text: String) -> Bool {
+    let t = text.uppercased()
+    return (t.contains("ISSUE") && t.contains("DATE"))
+        || t.contains("FIRST DAY") || t.contains("FURST DAY") || t.contains("EIRST DAY")
+        || t.contains("FFIRST")
+}
+
+/// Tight crops around the printed "ISSUE DATE" / "FIRST DAY OF" label, extending
+/// just far enough down to catch the typed month and year — works on a full
+/// unrectified frame where a fixed top-40% crop would miss the date.
+func issueDateAnchoredCrops(_ image: CGImage, lines: [OCRLine]) -> [CGImage] {
+    let w = CGFloat(image.width), h = CGFloat(image.height)
+    var rects: [CGRect] = []
+    for line in lines {
+        guard isIssueDateAnchorText(line.text) else { continue }
+        // The printed ISSUE DATE box is on the right half of the bond.
+        if line.box.midX < 0.35 { continue }
+        let box = visionBoxToCG(line.box, image: image)
+        let x = max(0, box.minX - 0.10 * w)
+        let maxX = min(w, box.maxX + 0.14 * w)
+        let top = max(0, box.minY - 0.03 * h)
+        // Typed JUL/SEP 1966 sits immediately below "WHICH IS THE FIRST DAY OF".
+        // Stay short of the dating stamp further down (below the issuing agent).
+        let height = min(h - top, max(0.18 * h, box.height * 8))
+        let r = CGRect(x: x, y: top, width: maxX - x, height: height)
+        if r.width > 60, r.height > 36 { rects.append(r) }
+    }
+    var crops: [CGImage] = []
+    var seen: [CGRect] = []
+    for r in rects {
+        if seen.contains(where: { abs($0.midX - r.midX) < 10 && abs($0.midY - r.midY) < 10 }) { continue }
+        seen.append(r)
+        let ir = CGRect(x: Int(r.origin.x), y: Int(r.origin.y), width: Int(r.width), height: Int(r.height))
+        if let crop = image.cropping(to: ir) { crops.append(crop) }
+    }
+    return crops
+}
+
+/// Dating-stamp crops anchored below the ISSUE DATE label (right side, mid bond).
+func stampAnchoredCrops(_ image: CGImage, lines: [OCRLine]) -> [CGImage] {
+    let w = CGFloat(image.width), h = CGFloat(image.height)
+    var rects: [CGRect] = []
+    for line in lines {
+        guard isIssueDateAnchorText(line.text) else { continue }
+        if line.box.midX < 0.35 { continue }
+        let box = visionBoxToCG(line.box, image: image)
+        let x = max(0, box.minX - 0.16 * w)
+        let maxX = min(w, box.maxX + 0.16 * w)
+        // Start below the typed issue date, cover the agent stamp area.
+        let top = min(h - 40, box.minY + max(0.10 * h, box.height * 4))
+        let height = min(h - top, 0.38 * h)
+        let r = CGRect(x: x, y: top, width: maxX - x, height: height)
+        if r.width > 60, r.height > 36 { rects.append(r) }
+    }
+    var crops: [CGImage] = []
+    for r in rects {
+        let ir = CGRect(x: Int(r.origin.x), y: Int(r.origin.y), width: Int(r.width), height: Int(r.height))
+        if let crop = image.cropping(to: ir) {
+            crops.append(upscaledImage(crop, scale: 2.0) ?? crop)
+        }
+    }
+    return crops
+}
+
+func highContrastImage(_ image: CGImage, contrast: Float, brightness: Float = 0) -> CGImage? {
+    let controls = CIFilter.colorControls()
+    controls.inputImage = CIImage(cgImage: image)
+    controls.contrast = contrast
+    controls.brightness = brightness
+    controls.saturation = 0
+    guard let out = controls.outputImage else { return nil }
+    return ciContext.createCGImage(out, from: out.extent)
+}
+
+func dateBoxVariants(_ crop: CGImage, intensive: Bool) -> [(String, CGImage)] {
+    var out: [(String, CGImage)] = [("raw", crop)]
+    if let up2 = upscaledImage(crop, scale: 2.2) { out.append(("up2", up2)) }
+    if let up3 = upscaledImage(crop, scale: 3.0) { out.append(("up3", up3)) }
+    if let faint = adjustedForFaintPrinting(crop) {
+        out.append(("faint", faint))
+        if let fu = upscaledImage(faint, scale: 2.6) { out.append(("faint-up", fu)) }
+    }
+    if let hi = highContrastImage(crop, contrast: 1.7, brightness: 0.05) {
+        out.append(("hi", hi))
+        if let hu = upscaledImage(hi, scale: 2.5) { out.append(("hi-up", hu)) }
+    }
+    if intensive {
+        if let up4 = upscaledImage(crop, scale: 3.6) { out.append(("up4", up4)) }
+        if let darker = highContrastImage(crop, contrast: 2.0, brightness: -0.08),
+           let du = upscaledImage(darker, scale: 3.0) {
+            out.append(("dark-up", du))
+        }
+    }
+    return out
+}
+
+func yearMonthIndex(_ month: String, _ year: String) -> Int? {
+    guard let y = Int(year), let m = Int(month), (1...12).contains(m), isPlausibleIssueYear(year, series: "") || (1941...2026).contains(y) else { return nil }
+    return y * 12 + (m - 1)
+}
+
+func monthsBetweenIssue(_ monthA: String, _ yearA: String, _ monthB: String, _ yearB: String) -> Int? {
+    guard let a = yearMonthIndex(monthA, yearA), let b = yearMonthIndex(monthB, yearB) else { return nil }
+    return b - a
+}
+
+/// Bank dating stamp: day + month name + year (e.g. "12 AUG 1966").
+/// Not the printed "FIRST DAY OF JUL 1966" issue date.
+struct DatingStampReading {
+    var day: Int
+    var month: String
+    var year: String
+    var confidence: String
+    var raw: String
+}
+
+func extractDatingStamp(_ lines: [OCRLine], series: String) -> DatingStampReading? {
+    let months = "JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?"
+    // Day + month name + year, allowing punctuation and O/I/l OCR slips in digits.
+    let pattern = "(?:^|[^A-Z0-9])([0-3IlLO]?[0-9IlLO])[\\.\\-]?\\s+(\(months))\\.?\\s+((?:19|20)[0-9O]{2})(?:[^0-9]|$)"
+
+    func stampYear(_ raw: String) -> String? {
+        let y = raw.uppercased().replacingOccurrences(of: "O", with: "0")
+        guard isPlausibleIssueYear(y, series: series) || isPlausibleIssueYear(y, series: "") else { return nil }
+        return y
+    }
+    func stampDay(_ raw: String) -> Int? {
+        var t = raw.uppercased()
+        t = t.replacingOccurrences(of: "O", with: "0")
+            .replacingOccurrences(of: "I", with: "1")
+            .replacingOccurrences(of: "L", with: "1")
+        guard let day = Int(t), (1...31).contains(day) else { return nil }
+        return day
+    }
+    func isIssueLabel(_ text: String) -> Bool {
+        let t = text.uppercased()
+        return t.contains("ISSUE") || t.contains("FIRST DAY") || t.contains("FURST DAY")
+            || t.contains("EIRST DAY") || t.contains("FFIRST")
+    }
+    func isSerialLike(_ text: String) -> Bool {
+        return !regexMatches("[A-Z]?[0-9]{8,}E?", in: cleanAlnum(text)).isEmpty
+    }
+
+    var hits: [DatingStampReading] = []
+    func collect(from text: String, assembled: Bool) {
+        if isIssueLabel(text) || isSerialLike(text) { return }
+        let u = text.uppercased()
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return }
+        let ns = NSRange(u.startIndex..<u.endIndex, in: u)
+        for match in re.matches(in: u, range: ns) {
+            guard let dR = Range(match.range(at: 1), in: u),
+                  let mR = Range(match.range(at: 2), in: u),
+                  let yR = Range(match.range(at: 3), in: u),
+                  let day = stampDay(String(u[dR])),
+                  let month = monthFromName(String(u[mR])),
+                  let year = stampYear(String(u[yR])) else { continue }
+            // High only for a single-line day+month+year. Assembled "1" + issue
+            // month + year from "FIRST DAY OF MAR 1960" is not a dating stamp.
+            let conf: String
+            if assembled {
+                conf = "uncertain"
+            } else {
+                conf = (1941...2026).contains(Int(year) ?? 0) ? "high" : "uncertain"
+            }
+            hits.append(DatingStampReading(day: day, month: month, year: year, confidence: conf,
+                                           raw: "\(day) \(monthAbbrev(month)) \(year)"))
+        }
+    }
+
+    for line in lines {
+        collect(from: line.text, assembled: false)
+    }
+    // Join only nearby, non-serial lines so a split "12" / "AUG" / "1966" can match
+    // without swallowing the serial number or the $25 corner. These are uncertain.
+    for (i, a) in lines.enumerated() {
+        if isIssueLabel(a.text) || isSerialLike(a.text) { continue }
+        var group = a.text.uppercased()
+        for (j, b) in lines.enumerated() where j != i {
+            if isIssueLabel(b.text) || isSerialLike(b.text) { continue }
+            let dx = abs(b.box.midX - a.box.midX), dy = abs(b.box.midY - a.box.midY)
+            if dy < 0.10 && dx < 0.28 {
+                group += " " + b.text.uppercased()
+            }
+        }
+        collect(from: group, assembled: true)
+    }
+
+    return hits.first(where: { $0.confidence == "high" }) ?? hits.first
+}
+
+func allIssueDateCandidates(_ lines: [OCRLine], series: String) -> [(month: String, year: String, score: Int)] {
+    // Reuse the deterministic collector by calling extract logic's candidates.
+    // Duplicated collection so we can inspect every variant, not just the winner.
+    var dateCandidates: [(String, String, Int)] = []
+    let upper = lines.map(\.text).joined(separator: "\n").uppercased()
+    let months = "JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?"
+    let namePattern = "\\b(\(months))\\s+((?:19|20)[0-9]{2})\\b"
+    let slashPattern = "\\b(0?[1-9]|1[0-2])\\s*[-./]\\s*((?:19|20)[0-9]{2})\\b"
+    func collect(_ pattern: String, fromLine line: OCRLine, namedMonth: Bool) {
+        let text = line.text.uppercased()
+        if isRulerLikeText(text) { return }
+        if text.contains("DATING") { return }
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return }
+        let ns = NSRange(text.startIndex..<text.endIndex, in: text)
+        for match in re.matches(in: text, range: ns) {
+            guard let r1 = Range(match.range(at: 1), in: text), let r2 = Range(match.range(at: 2), in: text) else { continue }
+            let year = String(text[r2])
+            guard isPlausibleIssueYear(year, series: series) else { continue }
+            let month = namedMonth ? monthFromName(String(text[r1])) : monthNumber(String(text[r1]))
+            guard let month = month else { continue }
+            var score = namedMonth ? 3 : 1
+            if line.box.midX > 0.50 { score += 2 }
+            if text.contains("ISSUE") || upper.contains("ISSUE") { score += 6 }
+            if upper.contains("FIRST DAY") || upper.contains("FURST DAY") || upper.contains("EIRST DAY") { score += 5 }
+            if isDateLikeText(text) && regexMatches("\\b[0-3]?[0-9]\\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)", in: text).isEmpty == false {
+                score -= 6
+            }
+            dateCandidates.append((month, year, score))
+        }
+    }
+    for line in lines {
+        collect(namePattern, fromLine: line, namedMonth: true)
+        collect(slashPattern, fromLine: line, namedMonth: false)
+    }
+    for a in lines {
+        if isRulerLikeText(a.text) { continue }
+        guard let month = monthFromName(a.text) else { continue }
+        for b in lines {
+            if isRulerLikeText(b.text) { continue }
+            var year = cleanAlnum(b.text)
+            // "196O" (letter O) — only fold O to 0 in a 4-digit year token.
+            if year.count == 4 { year = year.replacingOccurrences(of: "O", with: "0") }
+            if !isPlausibleIssueYear(year, series: series) { continue }
+            let dx = abs(b.box.midX - a.box.midX), dy = abs(b.box.midY - a.box.midY)
+            if (dy < 0.22 && dx < 0.45) || (dx < 0.22 && dy < 0.22) {
+                var score = 3
+                if upper.contains("ISSUE") { score += 6 }
+                if upper.contains("FIRST DAY") || upper.contains("FURST DAY") || upper.contains("EIRST DAY") { score += 5 }
+                dateCandidates.append((month, year, score))
+            }
+        }
+    }
+    if let re = try? NSRegularExpression(pattern: namePattern, options: [.caseInsensitive]) {
+        let ns = NSRange(upper.startIndex..<upper.endIndex, in: upper)
+        for match in re.matches(in: upper, range: ns) {
+            guard let r1 = Range(match.range(at: 1), in: upper), let r2 = Range(match.range(at: 2), in: upper),
+                  let month = monthFromName(String(upper[r1])) else { continue }
+            let year = String(upper[r2])
+            guard isPlausibleIssueYear(year, series: series) else { continue }
+            var score = 3
+            if upper.contains("ISSUE") { score += 6 }
+            if upper.contains("FIRST DAY") || upper.contains("FURST DAY") || upper.contains("EIRST DAY") { score += 5 }
+            dateCandidates.append((month, year, score))
+        }
+    }
+    return dateCandidates
+}
+
+/// Confusable year-ending digits (6 reads as 0, 8 as 0 or 3, 5 as 6, etc.).
+let ambiguousYearDigits: Set<Character> = ["0", "3", "5", "6", "8", "9"]
+
+func yearLastDigitAmbiguous(_ year: String) -> Bool {
+    guard let last = year.last else { return false }
+    return ambiguousYearDigits.contains(last)
+}
+
+func stampConsistent(month: String, year: String, stamp: DatingStampReading) -> Bool {
+    guard issueOnOrBeforeStamp(month: month, year: year, stamp: stamp) else { return false }
+    guard let gap = monthsBetweenIssue(month, year, stamp.month, stamp.year) else { return false }
+    return (0...6).contains(gap)
+}
+
+func issueOnOrBeforeStamp(month: String, year: String, stamp: DatingStampReading) -> Bool {
+    guard let i = yearMonthIndex(month, year), let s = yearMonthIndex(stamp.month, stamp.year) else { return false }
+    return i <= s
+}
+
+func fitsRecentSequence(month: String, year: String, recent: [(month: String, year: String)]) -> Bool {
+    guard !recent.isEmpty else { return true }
+    let indexes = recent.compactMap { yearMonthIndex($0.month, $0.year) }
+    guard let earliest = indexes.min(), let latest = indexes.max(),
+          let issue = yearMonthIndex(month, year) else { return true }
+    // Earlier than the previous few by more than 2 months, or more than ~1 year ahead.
+    if issue < earliest - 2 { return false }
+    if issue > latest + 12 { return false }
+    return true
+}
+
+func recentScanIssueDates(before capturedAt: String, among records: [BondRecord], window: Int = 3) -> [(month: String, year: String)] {
+    // Last few scans in capture-time order only — not the whole ledger and not
+    // serial-number neighbours. An earlier out-of-sequence test bond drops out
+    // of this window once more recent scans have been taken.
+    return records
+        .filter { $0.capturedAt < capturedAt && !$0.issueMonth.isEmpty && !$0.issueYear.isEmpty }
+        .sorted { $0.capturedAt > $1.capturedAt }
+        .prefix(window)
+        .map { ($0.issueMonth, $0.issueYear) }
+}
+
+/// Sequence flag: REVIEW with a note, never rewrite the date.
+/// The first dated scan of a session has no history and is not flagged.
+func sequenceInconsistencyNote(month: String, year: String, recent: [(month: String, year: String)], unambiguous: Bool) -> String? {
+    guard !recent.isEmpty else { return nil }
+    let indexes = recent.compactMap { yearMonthIndex($0.month, $0.year) }
+    guard let earliest = indexes.min(), let latest = indexes.max(),
+          let issue = yearMonthIndex(month, year) else { return nil }
+    if issue < earliest - 2 {
+        // Going backward in a chronological session is always suspicious.
+        // A confusable last digit (0/6) is never "unambiguous" enough to override this.
+        return "Issue date is more than 2 months earlier than the previous few scans."
+    }
+    if issue > latest + 12 {
+        // A clear unanimous reading (e.g. 1966 after a 1960 test bond) is allowed.
+        if unambiguous { return nil }
+        return "Issue date jumps more than a year ahead of the previous few scans."
+    }
+    return nil
+}
+
+func resolveIssueDate(
+    candidates: [(month: String, year: String, source: String)],
+    stamp: DatingStampReading?,
+    series: String,
+    recent: [(month: String, year: String)]
+) -> FieldReading {
+    guard !candidates.isEmpty else { return FieldReading() }
+    let months = Dictionary(grouping: candidates, by: { $0.month })
+    let years = Dictionary(grouping: candidates, by: { $0.year })
+    // Aggressive contrast/upscale filters can fabricate a 0/6. A dissenting
+    // year counts for agreement only if a non-aggressive variant produced it
+    // (or several distinct aggressive sources did).
+    func isAggressiveSource(_ source: String) -> Bool {
+        let s = source.lowercased()
+        return s.contains("hi-up") || s.contains("dark-up")
+    }
+    func yearIsCredible(_ year: String) -> Bool {
+        // "paired" is a cross-variant assembly, not an independent reading.
+        // Duplicate collector hits from the same source label count as one.
+        let hits = candidates.filter { $0.year == year && $0.source != "paired" && !isAggressiveSource($0.source) }
+        return Set(hits.map(\.source)).count >= 2
+    }
+    let allYears = Set(candidates.map(\.year))
+    let credibleYears = Set(allYears.filter(yearIsCredible))
+    let uniqueYears = credibleYears.isEmpty ? allYears : credibleYears
+    let uniqueMonths = Set(candidates.map(\.month))
+    let agreedYear = uniqueYears.count == 1 ? uniqueYears.first : nil
+    let agreedMonth = uniqueMonths.count == 1 ? uniqueMonths.first : (months.max(by: { $0.value.count < $1.value.count })?.key)
+    let yearCounts = years.mapValues(\.count)
+    let chosenSourceCount = agreedYear.map { year in Set(candidates.filter { $0.year == year }.map(\.source)).count } ?? 0
+    let unanimousYear = agreedYear != nil && chosenSourceCount >= 2 && (yearCounts[agreedYear ?? ""] ?? 0) >= 2
+    let disagreed = uniqueYears.count > 1
+    let ambiguous = disagreed && uniqueYears.contains(where: { yearLastDigitAmbiguous($0) })
+
+    func pick(_ month: String, _ year: String, conf: String, src: String) -> FieldReading {
+        return FieldReading(value: "\(month)/\(year)", confidence: conf, source: src)
+    }
+
+    // Prefer a candidate that was actually read, fits the dating stamp (0–6 months,
+    // on or before the stamp), and/or fits the recent scan sequence. Never invent a year.
+    var preferred: (month: String, year: String, source: String)?
+    if let stamp = stamp, stamp.confidence == "high" {
+        let consistent = candidates.filter { stampConsistent(month: $0.month, year: $0.year, stamp: stamp) }
+        let consistentYears = Set(consistent.map(\.year))
+        if consistentYears.count == 1, let c = consistent.first {
+            preferred = c
+        } else if let stampFit = consistent.max(by: { yearCounts[$0.year, default: 0] < yearCounts[$1.year, default: 0] }),
+                  years[stampFit.year] != nil {
+            preferred = stampFit
+        }
+    }
+    if preferred == nil, !recent.isEmpty, uniqueYears.count > 1 {
+        let fitting = candidates.filter { fitsRecentSequence(month: $0.month, year: $0.year, recent: recent) }
+        let fittingYears = Set(fitting.map(\.year))
+        // Only one candidate year fits the sequence, and an OCR variant actually read it.
+        if fittingYears.count == 1, let c = fitting.first {
+            preferred = c
+        }
+    }
+    if preferred == nil {
+        if let y = agreedYear, let m = agreedMonth {
+            preferred = (m, y, "variants")
+        } else if let y = yearCounts.max(by: { $0.value < $1.value })?.key,
+                  let m = agreedMonth ?? candidates.first(where: { $0.year == y })?.month {
+            preferred = (m, y, "variants-majority")
+        } else if let c = candidates.max(by: { a, b in
+            if yearCounts[a.year, default: 0] != yearCounts[b.year, default: 0] {
+                return yearCounts[a.year, default: 0] < yearCounts[b.year, default: 0]
+            }
+            return a.source.count < b.source.count
+        }) {
+            preferred = c
+        }
+    }
+    guard let chosen = preferred, !chosen.month.isEmpty, !chosen.year.isEmpty else {
+        return FieldReading()
+    }
+
+    // High only when variants agree on the year (several readings, no disagreement).
+    var conf = "uncertain"
+    var src = chosen.source
+    if unanimousYear && !disagreed && chosen.year == agreedYear, let m = agreedMonth {
+        conf = "high"
+        src = "variants-agree"
+        if let stamp = stamp, stamp.confidence == "high" {
+            if stampConsistent(month: m, year: chosen.year, stamp: stamp) {
+                src = "variants+stamp"
+            } else {
+                // Agreed year conflicts with a clear stamp and no consistent variant.
+                conf = "uncertain"
+                src = "stamp-conflict"
+            }
+        }
+    }
+    // Stamp or sequence selected a year a variant actually read.
+    if let stamp = stamp, stamp.confidence == "high",
+       stampConsistent(month: chosen.month, year: chosen.year, stamp: stamp),
+       candidates.contains(where: { $0.year == chosen.year && $0.month == chosen.month || $0.year == chosen.year }) {
+        if !disagreed && unanimousYear {
+            conf = "high"
+            src = "variants+stamp"
+        } else if disagreed {
+            // Stamp selected a year a variant actually read, but years still
+            // disagree: prefer that year, never high. Agreement is required for green.
+            conf = "uncertain"
+            src = "stamp-preferred-variant"
+        }
+    }
+    if ambiguous && conf == "high" && disagreed {
+        // Agreement is required for high when 0/6/8-style digits disagree.
+        conf = "uncertain"
+        src = "year-digit-ambiguous"
+    }
+
+        if ProcessInfo.processInfo.environment["BONDSCANNER_DENOM_DEBUG"] == "1" {
+        let listed = candidates.map { "\($0.month)/\($0.year)@\($0.source)" }.joined(separator: ",")
+        let stampDesc = stamp.map { "\($0.day)/\($0.month)/\($0.year):\($0.confidence)" } ?? "-"
+        print("  year_variants=[\(listed)] chosen=\(chosen.month)/\(chosen.year) conf=\(conf) src=\(src) stamp=\(stampDesc)")
+    }
+    return pick(chosen.month, chosen.year, conf: conf, src: src)
+}
+
+func extractIssueDateFromImage(_ image: CGImage, series: String, baseLines: [OCRLine], intensive: Bool, recent: [(month: String, year: String)]) -> (date: FieldReading, stamp: DatingStampReading?) {
+    var candidates: [(month: String, year: String, source: String)] = []
+    var stampLines: [OCRLine] = baseLines
+    for c in allIssueDateCandidates(baseLines, series: series) {
+        candidates.append((c.month, c.year, "base"))
+    }
+    var crops = issueDateCrops(image, intensive: intensive)
+    crops += issueDateAnchoredCrops(image, lines: baseLines)
+    for (ci, crop) in crops.enumerated() {
+        for (label, variant) in dateBoxVariants(crop, intensive: intensive) {
+            let lines = textOCR(variant, fast: false, minimumTextHeight: 0.003, alternateCount: 3)
+            stampLines += lines
+            for c in allIssueDateCandidates(lines, series: series) {
+                candidates.append((c.month, c.year, "\(label)-\(ci)"))
+            }
+        }
+    }
+    // Dating stamp: default + label-anchored crops, a few enhancements, alternate OCR readings.
+    var stampCrops = stampRegionCrops(image)
+    stampCrops += stampAnchoredCrops(image, lines: baseLines)
+    for crop in stampCrops {
+        let variants: [(String, CGImage)] = {
+            var v: [(String, CGImage)] = [("raw", crop)]
+            if let faint = adjustedForFaintPrinting(crop) { v.append(("faint", faint)) }
+            if let hi = highContrastImage(crop, contrast: 1.8, brightness: 0.05) { v.append(("hi", hi)) }
+            if intensive, let up = upscaledImage(crop, scale: 2.8) { v.append(("up", up)) }
+            return v
+        }()
+        for (_, variant) in variants {
+            stampLines += textOCR(variant, fast: false, minimumTextHeight: 0.003, alternateCount: 3)
+        }
+    }
+    // If a month and a year were each actually read in the date box, pair them.
+    // Never invent a digit: both pieces must already appear in OCR. Used so
+    // "SEP" in one variant and "1966" in another can form 09/1966 (uncertain).
+    var isolatedMonths: [String] = []
+    var isolatedYears: [String] = []
+    func harvest(_ lines: [OCRLine]) {
+        for line in lines {
+            if isRulerLikeText(line.text) { continue }
+            if let m = monthFromName(line.text) { isolatedMonths.append(m) }
+            let u = line.text.uppercased()
+            if let re = try? NSRegularExpression(pattern: "\\b((?:19|20)[0-9O]{2})\\b", options: []) {
+                let ns = NSRange(u.startIndex..<u.endIndex, in: u)
+                for match in re.matches(in: u, range: ns) {
+                    guard let r = Range(match.range(at: 1), in: u) else { continue }
+                    let y = String(u[r]).replacingOccurrences(of: "O", with: "0")
+                    if isPlausibleIssueYear(y, series: series) { isolatedYears.append(y) }
+                }
+            }
+        }
+    }
+    harvest(baseLines)
+    harvest(stampLines)
+    let knownMonths = Set(candidates.map(\.month) + isolatedMonths)
+    let knownYears = Set(candidates.map(\.year) + isolatedYears)
+    for m in knownMonths {
+        for y in knownYears {
+            if candidates.contains(where: { $0.month == m && $0.year == y }) { continue }
+            let monthRead = isolatedMonths.contains(m) || candidates.contains(where: { $0.month == m })
+            let yearRead = isolatedYears.contains(y) || candidates.contains(where: { $0.year == y })
+            if monthRead && yearRead {
+                candidates.append((m, y, "paired"))
+            }
+        }
+    }
+    let stamp = extractDatingStamp(stampLines, series: series)
+    if ProcessInfo.processInfo.environment["BONDSCANNER_DENOM_DEBUG"] == "1" {
+        let monthBits = "JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|ISSUE|FIRST|FURST|EIRST|DATE|19[0-9]{2}|20[0-9]{2}"
+        var stampToks: [String] = []
+        var seen = Set<String>()
+        for line in stampLines {
+            let u = line.text.uppercased()
+            let toks = regexMatches(monthBits + "|[0-3]?[0-9]", in: u)
+            if toks.isEmpty { continue }
+            let key = toks.joined(separator: ",")
+            if seen.insert(key).inserted { stampToks.append(key) }
+        }
+        print("  stamp_tokens=[\(stampToks.joined(separator: " | "))]")
+    }
+    let date = resolveIssueDate(candidates: candidates, stamp: stamp, series: series, recent: recent)
+    return (date, stamp)
+}
+
+
 
 func parseDeterministically(_ lines: [OCRLine]) -> BondRecord {
     let full = lines.map(\.text).joined(separator: "\n")
@@ -966,17 +1547,19 @@ func rotateCG(_ cg: CGImage, exif: Int) -> CGImage? {
     return ciContext.createCGImage(image, from: image.extent)
 }
 
-func textOCR(_ image: CGImage, fast: Bool) -> [OCRLine] {
+func textOCR(_ image: CGImage, fast: Bool, minimumTextHeight: Float = 0.007, alternateCount: Int = 1) -> [OCRLine] {
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = fast ? .fast : .accurate
     request.usesLanguageCorrection = false
     request.recognitionLanguages = ["en-US"]
-    request.minimumTextHeight = 0.007
+    request.minimumTextHeight = minimumTextHeight
     let handler = VNImageRequestHandler(cgImage: image, options: [:])
     do { try handler.perform([request]) } catch { return [] }
-    return (request.results ?? []).compactMap { obs in
-        guard let t = obs.topCandidates(1).first else { return nil }
-        return OCRLine(text: t.string, confidence: t.confidence, box: obs.boundingBox)
+    let n = max(1, alternateCount)
+    return (request.results ?? []).flatMap { obs -> [OCRLine] in
+        return obs.topCandidates(n).map { t in
+            OCRLine(text: t.string, confidence: t.confidence, box: obs.boundingBox)
+        }
     }
 }
 
@@ -1116,7 +1699,7 @@ func fallbackBondCrop(_ image: CGImage) -> CGImage? {
     return image.cropping(to: center)
 }
 
-func scanImage(_ image: CGImage) -> OCRResult {
+func scanImage(_ image: CGImage, focusIssueDate: Bool = false, recentIssueDates: [(month: String, year: String)] = []) -> OCRResult {
     // Field extraction uses ONLY text inside a bond-shaped crop (or the
     // inset fallback). The full frame is kept out so ruler tick numbers
     // (1…12) and other table text cannot become a denomination or date.
@@ -1207,23 +1790,40 @@ func scanImage(_ image: CGImage) -> OCRResult {
             }
         }
     }
-    if !fieldConfidenceIsHigh(result, "issueDate") {
-        var dateLines: [OCRLine] = finalLines
-        for crop in issueDateCrops(selectedImage) {
-            dateLines += textOCR(crop, fast: false)
-        }
-        let date = extractIssueDateReading(dateLines, series: result.series)
-        if date.isHigh || (result.issueMonth.isEmpty && date.isUncertain) {
-            let parts = date.value.split(separator: "/").map(String.init)
-            if parts.count == 2 {
-                result.issueMonth = parts[0]
-                result.issueYear = parts[1]
-                setFieldReading("issueDate", date, on: &result)
-                bestLabel += "/issue-date"
-            }
+    // Issue date: several upscaled/contrast variants of the upper-right date
+    // box, plus a dating-stamp cross-check. Agreement is required for high
+    // confidence, especially when the year's last digit is a 0/6/8-style shape.
+    let extracted = extractIssueDateFromImage(selectedImage, series: result.series,
+                                              baseLines: finalLines,
+                                              intensive: focusIssueDate,
+                                              recent: recentIssueDates)
+    if let stamp = extracted.stamp, stamp.confidence == "high" {
+        result.datingStamp = stamp.raw
+    }
+    let date = extracted.date
+    if !date.value.isEmpty {
+        // Variant-aware resolver is authoritative: a single-pass "high" from
+        // parseDeterministically must not stick when years disagree.
+        let parts = date.value.split(separator: "/").map(String.init)
+        if parts.count == 2 {
+            result.issueMonth = parts[0]
+            result.issueYear = parts[1]
+            setFieldReading("issueDate", date, on: &result)
+            bestLabel += "/issue-date"
         }
     }
     applyRequiredStatus(&result)
+    if let note = sequenceInconsistencyNote(month: result.issueMonth, year: result.issueYear,
+                                            recent: recentIssueDates,
+                                            unambiguous: fieldConfidenceIsHigh(result, "issueDate")
+                                                && (result.fieldSource?["issueDate"] ?? "").contains("agree")) {
+        result.status = "REVIEW"
+        if result.notes.isEmpty {
+            result.notes = note
+        } else if !result.notes.contains(note) {
+            result.notes = result.notes + " " + note
+        }
+    }
     let recognized = bondTextSignal(finalLines) || bondTextSignal(textOCR(bestImage, fast: true))
     ScanLog.shared.write("scan candidates=\(candidates.count) best=\(bestLabel) hunt_score=\(bestScore) final_score=\(finalScore) ocr_lines=\(finalLines.count) rectified=\(bestRectified) bond_text=\(recognized) fields_complete=\(requiredFieldsComplete(result)) denom=\(result.denomination.isEmpty ? "none" : "set")")
     return OCRResult(record: result, image: selectedImage, originalImage: image,
@@ -2385,12 +2985,39 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         }
     }
 
+    private func shouldFocusIssueDate() -> Bool {
+        // When the bond still in view is only missing a confident issue date,
+        // auto-retry zooms the date box (more crops, higher upscale, more variants).
+        if let aid = autoFillRecordId, let existing = records.first(where: { $0.id == aid }) {
+            return requiredFieldsMissing(existing).contains("issue date")
+        }
+        return false
+    }
+
+    private func applySequenceFlag(_ record: inout BondRecord) {
+        let recent = recentScanIssueDates(before: record.capturedAt, among: records.filter { $0.id != record.id })
+        let unambiguous = fieldConfidenceIsHigh(record, "issueDate")
+            && (record.fieldSource?["issueDate"] ?? "").contains("agree")
+        if let note = sequenceInconsistencyNote(month: record.issueMonth, year: record.issueYear,
+                                                recent: recent, unambiguous: unambiguous) {
+            record.status = "REVIEW"
+            if record.notes.isEmpty {
+                record.notes = note
+            } else if !record.notes.contains("previous few scans") && !record.notes.contains("jumps more than a year") {
+                record.notes = record.notes + " " + note
+            }
+        }
+    }
+
     private func finishCapture(image: CGImage, jpegBytes: Data?, automatic: Bool) {
+
         if automatic {
             ScanLog.shared.write("scan started mode=auto frame=\(image.width)x\(image.height)")
             status("Reading bond with local Apple Vision OCR…")
+            let focus = self.shouldFocusIssueDate()
+            let recent = recentScanIssueDates(before: ISO8601DateFormatter().string(from: Date()), among: self.records)
             analysisQueue.async { [weak self] in
-                let result = scanImage(image)
+                let result = scanImage(image, focusIssueDate: focus, recentIssueDates: recent)
                 DispatchQueue.main.async { self?.handleOCR(result, auto: true) }
             }
             return
@@ -2485,7 +3112,9 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 return
             }
             ScanLog.shared.write("ocr of saved photograph started frame=\(image.width)x\(image.height)")
-            let result = scanImage(image)
+            let focus = self.shouldFocusIssueDate()
+            let recent = recentScanIssueDates(before: ISO8601DateFormatter().string(from: Date()), among: self.records)
+            let result = scanImage(image, focusIssueDate: focus, recentIssueDates: recent)
             DispatchQueue.main.async {
                 self.applyOCR(result, to: job.id)
                 self.ocrBusy = false
@@ -2555,6 +3184,15 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     private func presentRecord(_ record: BondRecord, flash: NSColor, message: String, automatic: Bool, contributed: Bool, isNew: Bool) {
+        var record = record
+        let priorStatus = record.status
+        let priorNotes = record.notes
+        applySequenceFlag(&record)
+        if record.status != priorStatus || record.notes != priorNotes,
+           let idx = records.firstIndex(where: { $0.id == record.id }) {
+            records[idx] = record
+            try? writeRecords(records)
+        }
         updateCount()
         let serialDisplay = record.serial.isEmpty ? "unreadable serial" : record.serial
         lastLabel.stringValue = "Last: \(record.series) \(serialDisplay) | \(record.issueMonth)/\(record.issueYear) | $\(record.denomination) | \(record.status)"

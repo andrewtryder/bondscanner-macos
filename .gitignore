@@ -6,3 +6,4 @@
 /compile-log.txt
 /build/ocr-harness
 /build/compile-check/
+.tmp-crops/
