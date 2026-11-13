@@ -228,15 +228,18 @@ func validFaceValues(for series: String) -> [String] {
     return ["10000", "5000", "1000", "500", "200", "100", "75", "50", "25", "10"]
 }
 
-/// Series E: 1 letter + 10 digits + E (12 chars). Series EE: 1 letter + 10 digits + EE.
-/// Strips a leading junk character only when the remainder already matches exactly.
-/// Never invents a missing prefix letter or any other character.
+/// Series E serial length varies by denomination and era: 1 letter + 8, 9, or 10
+/// digits + E. $25 bonds are typically 10 digits (Q2234677197E); $50 bonds are
+/// typically 9 (L710124456E). $100 length is not assumed, so 8–10 are all accepted.
+/// Not tied to the $25 10-digit pattern. Series EE / I keep 1 letter + 10 digits
+/// + EE/I. Strips a leading junk character only when the remainder already
+/// matches exactly. Never invents characters.
 func validatedSerial(_ raw: String, series: String = "") -> FieldReading {
     let n = normalizeSerial(raw)
     guard !n.isEmpty else { return FieldReading() }
 
     func isExactE(_ s: String) -> Bool {
-        return s.count == 12 && regexMatches("^[A-Z][0-9]{10}E$", in: s).isEmpty == false
+        return regexMatches("^[A-Z][0-9]{8,10}E$", in: s).isEmpty == false
     }
     func isExactEE(_ s: String) -> Bool {
         return s.count == 13 && regexMatches("^[A-Z][0-9]{10}EE$", in: s).isEmpty == false
@@ -254,13 +257,15 @@ func validatedSerial(_ raw: String, series: String = "") -> FieldReading {
     // Prefer an exact-pattern SUBSTRING so a glued prefix (a name's last letter)
     // is treated as junk only when the remainder itself is an exact serial.
     let eeHits = regexMatches("[A-Z][0-9]{10}EE", in: n)
-    let eHits = regexMatches("[A-Z][0-9]{10}E", in: n).filter { hit in
+    // Greedy 8–10; prefer the longest exact hit so a 10-digit serial is not
+    // truncated to a shorter prefix that happens to end before an E.
+    let eHits = regexMatches("[A-Z][0-9]{8,10}E", in: n).filter { hit in
         // Do not accept the E-truncated form of an EE serial.
         guard let range = n.range(of: hit) else { return false }
         let after = range.upperBound
         if after < n.endIndex, n[after] == "E" { return false }
         return isExactE(hit)
-    }
+    }.sorted { $0.count > $1.count }
     let iHits = regexMatches("[A-Z][0-9]{10}I", in: n).filter { isExactI($0) }
 
     if series == "EE" || (series.isEmpty && !eeHits.isEmpty) {
@@ -1529,7 +1534,7 @@ func parseDeterministically(_ lines: [OCRLine]) -> BondRecord {
         issuingAgent: "", datingStamp: "", status: "REVIEW", notes: "",
         photo: "", sourcePhoto: "", rawOCR: full)
 
-    // Serial: accept only an exact pattern (Series E: 1 letter + 10 digits + E).
+    // Serial: accept an exact Series E/EE/I pattern (E allows 8–10 digits).
     // A letter glued from a neighboring word (e.g. a name ending in S + digits)
     // is leading junk and is kept only when the remainder itself is exact.
     var serialReadings: [(FieldReading, Int)] = []
@@ -2010,7 +2015,9 @@ func enrichWithAppleIntelligence(_ record: BondRecord) async -> BondRecord {
         if !fieldConfidenceIsHigh(next, "issueDate") && (next.issueMonth.isEmpty || next.issueYear.isEmpty) {
             let mo = (obj["issue_month"] ?? "")
             let yr = (obj["issue_year"] ?? "")
-            if let month = monthNumber(mo), regexMatches("^(?:19|20)[0-9]{2}$", in: yr).count == 1,
+            // Years outside the series range (e.g. 1907 for Series E, which is
+            // 1941–1980) must never be filled, even if the digits appeared in OCR.
+            if let month = monthNumber(mo), isPlausibleIssueYear(yr, series: next.series),
                 raw.contains(cleanAlnum(mo) + yr) {
                 next.issueMonth = month; next.issueYear = yr
                 setFieldReading("issueDate", FieldReading(value: "\(month)/\(yr)", confidence: "uncertain", source: "ai"), on: &next)
