@@ -9,6 +9,10 @@
 #   ./build.sh --staging  Same as default
 #   ./build.sh --install  Install to ~/Applications/BondScanner.app
 #                         (do not use while the installed app is being tested)
+#
+# Compiler output is written to a unique temp file, then copied to
+# compile-log.txt. This script never tees into a log it also cats, and
+# it does not write build.log (do not redirect this script into build.log).
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -24,7 +28,10 @@ fi
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SRC="$ROOT/Sources/BondScanner.swift"
 PLIST="$ROOT/Info.plist"
-LOG="$ROOT/build.log"
+SUMMARY="$ROOT/compile-log.txt"
+TMPLOG="$(mktemp -t bondscanner-compile)"
+cleanup() { rm -f "$TMPLOG"; }
+trap cleanup EXIT
 
 MODE="staging"
 for arg in "$@"; do
@@ -32,7 +39,7 @@ for arg in "$@"; do
         --staging) MODE="staging" ;;
         --install) MODE="install" ;;
         -h|--help)
-            sed -n '2,16p' "$0"
+            sed -n '2,18p' "$0"
             exit 0
             ;;
         *)
@@ -64,28 +71,36 @@ fi
 
 mkdir -p "$CONTENTS/MacOS"
 
-# Install Info.plist from the project (do not write a fresh README into ~/BondScans)
 cp "$PLIST" "$CONTENTS/Info.plist"
 
 echo "Building Bond Scanner ($MODE) from $SRC"
 echo "Output: $APP"
-# Same compiler flags and frameworks as the v2 launcher
-if ! xcrun swiftc -swift-version 5 -o "$EXEC" \
+
+set +e
+xcrun swiftc -swift-version 5 -o "$EXEC" \
     -framework AppKit -framework AVFoundation -framework Vision \
     -framework CoreImage -framework CoreMedia -framework CoreVideo \
     -framework QuartzCore -framework ImageIO \
     -framework AudioToolbox -framework UniformTypeIdentifiers \
-    "$SRC" >"$LOG" 2>&1; then
-    echo "Build error. First 100 lines of $LOG:" >&2
-    sed -n '1,100p' "$LOG" >&2
+    "$SRC" >"$TMPLOG" 2>&1
+SWIFTC_STATUS=$?
+set -e
+
+# Copy a finite snapshot after the compiler has finished. Never cat a file
+# that is also being written by this process or a tee into the same path.
+cp "$TMPLOG" "$SUMMARY"
+if [[ "$SWIFTC_STATUS" -ne 0 ]]; then
+    echo "Build error. First 100 lines of $SUMMARY:" >&2
+    sed -n '1,100p' "$SUMMARY" >&2
     exit 1
 fi
 
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 chmod +x "$EXEC"
 echo "Build complete: $APP"
-echo "Compiler output is in $LOG"
-if [[ -s "$LOG" ]]; then
-    echo "----- build.log -----"
-    cat "$LOG"
+if [[ -s "$SUMMARY" ]]; then
+    echo "Compiler messages ($SUMMARY):"
+    sed -n '1,80p' "$SUMMARY"
+else
+    echo "Compiler finished with no messages."
 fi
