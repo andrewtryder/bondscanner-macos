@@ -70,6 +70,11 @@ struct BondRecord: Codable {
     var photo: String
     var sourcePhoto: String
     var rawOCR: String
+    /// Field name → photograph that first supplied a non-empty value. Optional so existing records still decode.
+    var fieldPhoto: [String: String]?
+    var fieldCaptureId: [String: String]?
+    /// OCR text from later captures that contributed fields. The first capture's rawOCR is never overwritten.
+    var additionalOCR: String?
 }
 
 struct OCRResult {
@@ -132,6 +137,312 @@ func monthNumber(_ text: String) -> String? {
     return nil
 }
 
+func requiredFieldsComplete(_ record: BondRecord) -> Bool {
+    return !record.serial.isEmpty && !record.series.isEmpty
+        && !record.issueMonth.isEmpty && !record.issueYear.isEmpty
+        && !record.denomination.isEmpty
+}
+
+func requiredFieldsMissing(_ record: BondRecord) -> [String] {
+    var missing: [String] = []
+    if record.serial.isEmpty { missing.append("serial") }
+    if record.series.isEmpty { missing.append("series") }
+    if record.issueMonth.isEmpty || record.issueYear.isEmpty { missing.append("issue date") }
+    if record.denomination.isEmpty { missing.append("face value") }
+    return missing
+}
+
+/// Green / verified only when serial, series, issue month+year, and face value are all present.
+func applyRequiredStatus(_ record: inout BondRecord) {
+    let missing = requiredFieldsMissing(record)
+    if missing.isEmpty {
+        record.status = "OK"
+        record.notes = ""
+    } else {
+        record.status = "REVIEW"
+        record.notes = "Missing or uncertain: " + missing.joined(separator: ", ")
+    }
+}
+
+func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord, contributingPhoto: String, contributingSource: String, captureId: String) -> [String] {
+    var filled: [String] = []
+    func take(_ key: String, current: String, incomingValue: String, set: (String) -> Void) {
+        if current.isEmpty && !incomingValue.isEmpty {
+            set(incomingValue)
+            var photos = existing.fieldPhoto ?? [:]
+            var ids = existing.fieldCaptureId ?? [:]
+            photos[key] = contributingSource.isEmpty ? contributingPhoto : contributingSource
+            ids[key] = captureId
+            existing.fieldPhoto = photos
+            existing.fieldCaptureId = ids
+            filled.append(key)
+        }
+    }
+    take("series", current: existing.series, incomingValue: incoming.series) { existing.series = $0 }
+    take("serial", current: existing.serial, incomingValue: incoming.serial) { existing.serial = $0 }
+    take("issueMonth", current: existing.issueMonth, incomingValue: incoming.issueMonth) { existing.issueMonth = $0 }
+    take("issueYear", current: existing.issueYear, incomingValue: incoming.issueYear) { existing.issueYear = $0 }
+    take("denomination", current: existing.denomination, incomingValue: incoming.denomination) { existing.denomination = $0 }
+    if !filled.isEmpty {
+        if existing.owner.isEmpty && !incoming.owner.isEmpty { existing.owner = incoming.owner }
+        if existing.secondName.isEmpty && !incoming.secondName.isEmpty { existing.secondName = incoming.secondName }
+        if existing.secondRole.isEmpty && !incoming.secondRole.isEmpty { existing.secondRole = incoming.secondRole }
+        if existing.address.isEmpty && !incoming.address.isEmpty { existing.address = incoming.address }
+        if existing.issuingAgent.isEmpty && !incoming.issuingAgent.isEmpty { existing.issuingAgent = incoming.issuingAgent }
+        if existing.datingStamp.isEmpty && !incoming.datingStamp.isEmpty { existing.datingStamp = incoming.datingStamp }
+        if !incoming.rawOCR.isEmpty {
+            if let prev = existing.additionalOCR, !prev.isEmpty {
+                existing.additionalOCR = prev + "\n---\n" + incoming.rawOCR
+            } else {
+                existing.additionalOCR = incoming.rawOCR
+            }
+        }
+    }
+    applyRequiredStatus(&existing)
+    return filled
+}
+
+func annotateFieldSources(_ record: inout BondRecord, photo: String, captureId: String, fields: [String]? = nil) {
+    var photos = record.fieldPhoto ?? [:]
+    var ids = record.fieldCaptureId ?? [:]
+    let pairs: [(String, String)] = [
+        ("series", record.series), ("serial", record.serial),
+        ("issueMonth", record.issueMonth), ("issueYear", record.issueYear),
+        ("denomination", record.denomination)
+    ]
+    for (key, value) in pairs {
+        if value.isEmpty { continue }
+        if let fields = fields, !fields.contains(key) { continue }
+        if photos[key] == nil {
+            photos[key] = photo
+            ids[key] = captureId
+        }
+    }
+    record.fieldPhoto = photos
+    record.fieldCaptureId = ids
+}
+
+func normalizeDenominationText(_ raw: String) -> String {
+    var t = raw.uppercased()
+    let replacements = [
+        "DORLARS": "DOLLARS", "D0LLARS": "DOLLARS", "DCLLARS": "DOLLARS",
+        "DOLIARS": "DOLLARS", "DOILARS": "DOLLARS", "DOLARS": "DOLLARS",
+        "TWENTV": "TWENTY", "SEVENTV": "SEVENTY",
+        "I8.75": "18.75", "I8,75": "18.75",
+        "\u{2014}": "-", "\u{2013}": "-", "\u{2212}": "-"
+    ]
+    for (a, b) in replacements { t = t.replacingOccurrences(of: a, with: b) }
+    return t
+}
+
+/// Face / maturity value. Looks at word amounts, $ numerals, corner numerals,
+/// MATURITY VALUE labels, and Series E issue-price → face (e.g. $18.75 → $25).
+func extractDenomination(_ lines: [OCRLine], series: String, treatAsCorner: Bool = false) -> String {
+    let faceValues = ["10000", "5000", "1000", "500", "200", "100", "75", "50", "25", "20", "10"]
+    let blob = normalizeDenominationText(lines.map(\.text).joined(separator: " "))
+
+    let words: [(String, String)] = [
+        ("TEN THOUSAND", "10000"), ("FIVE THOUSAND", "5000"),
+        ("ONE THOUSAND", "1000"), ("FIVE HUNDRED", "500"),
+        ("TWO HUNDRED", "200"), ("ONE HUNDRED", "100"),
+        ("SEVENTY-FIVE", "75"), ("SEVENTY FIVE", "75"),
+        ("TWENTY-FIVE", "25"), ("TWENTY FIVE", "25"), ("TWENTYFIVE", "25"),
+        ("FIFTY DOLLARS", "50"), ("TWENTY DOLLARS", "20"), ("TEN DOLLARS", "10"),
+        ("SEVENTY FIVE DOLLARS", "75"), ("SEVENTY-FIVE DOLLARS", "75"),
+        ("TWENTY-FIVE DOLLARS", "25"), ("TWENTY FIVE DOLLARS", "25"),
+        ("FIFTY", "50")
+    ]
+    for (word, amount) in words where blob.contains(word) {
+        return amount
+    }
+    // Split across lines or OCR-garbled: "TWENTY" + "FIVE", "TWENTY-F1VE", "SEVENTY F1VE".
+    if regexMatches("TWENTY[\\s-]*F[I1L]?VE", in: blob).isEmpty == false { return "25" }
+    if regexMatches("SEVENTY[\\s-]*F[I1L]?VE", in: blob).isEmpty == false { return "75" }
+    if blob.contains("TWENTY") && regexMatches("\\bF[I1L]?VE\\b", in: blob).isEmpty == false
+        && !blob.contains("FIVE HUNDRED") && !blob.contains("TWENTY DOLLARS") {
+        return "25"
+    }
+    if blob.contains("SEVENTY") && regexMatches("\\bF[I1L]?VE\\b", in: blob).isEmpty == false {
+        return "75"
+    }
+
+    // $25, $50, $75, $100, $200, $500, $1000, optionally with .00
+    let dollarPattern = "\\$\\s*(10(?:000|00)?|5000|500|200|100|75|50|25|20|10)(?:\\.00)?"
+    if let hit = regexMatches(dollarPattern, in: blob).first {
+        let digits = hit.filter { $0.isNumber }
+        if faceValues.contains(digits) { return digits }
+    }
+
+    // "25 DOLLARS", "75 DOLLARS"
+    for value in faceValues {
+        if blob.contains(value + " DOLLARS") || blob.contains(value + " DOLLAR") {
+            return value
+        }
+    }
+
+    // MATURITY VALUE / FACE VALUE followed or preceded by a face numeral.
+    if blob.contains("MATURITY") || blob.contains("FACE VALUE") || blob.contains("MATURITY VALUE") {
+        for value in faceValues {
+            if regexMatches("(?:MATURITY|FACE)\\s*(?:VALUE)?[^A-Z0-9]{0,12}" + value + "\\b", in: blob).isEmpty == false {
+                return value
+            }
+            if regexMatches("\\b" + value + "\\b[^A-Z0-9]{0,12}(?:MATURITY|FACE)", in: blob).isEmpty == false {
+                return value
+            }
+        }
+        for line in lines {
+            let t = normalizeDenominationText(line.text)
+            if t.contains("MATURITY") || t.contains("FACE") {
+                let nearby = cleanAlnum(t)
+                for value in faceValues where nearby.contains(value) { return value }
+            }
+        }
+    }
+
+    // Series E (and unknown series) issue price → maturity / face.
+    // $18.75 bought a $25 bond, $37.50 → $50, $56.25 → $75, $75 → $100, etc.
+    if series == "E" || series.isEmpty || series == "I" {
+        let issueMap: [(String, String)] = [
+            ("18\\s*[.,]\\s*75", "25"),
+            ("37\\s*[.,]\\s*50", "50"),
+            ("56\\s*[.,]\\s*25", "75"),
+            ("75\\s*[.,]\\s*00", "100"),
+            ("150\\s*[.,]\\s*00", "200"),
+            ("375\\s*[.,]\\s*00", "500"),
+            ("750\\s*[.,]\\s*00", "1000"),
+            ("7\\s*[.,]\\s*50", "10")
+        ]
+        let priceContext = blob.contains("ISSUE") || blob.contains("PRICE") || blob.contains("PURCHASE") || series == "E" || series.isEmpty
+        if priceContext {
+            for (pattern, face) in issueMap {
+                if regexMatches(pattern, in: blob).isEmpty == false { return face }
+            }
+        }
+    }
+
+    func isCorner(_ box: CGRect) -> Bool {
+        let xEdge = box.midX < 0.22 || box.midX > 0.78
+        let yEdge = box.midY < 0.28 || box.midY > 0.72
+        return xEdge && yEdge
+    }
+    var cornerVotes: [String: Int] = [:]
+    for line in lines {
+        let token = cleanAlnum(line.text)
+        // "25", "$25"; "25.00" becomes "2500" after stripping punctuation — only then take the 2-digit stem.
+        var candidates: [String] = []
+        if faceValues.contains(token) { candidates.append(token) }
+        if token.hasSuffix("00") && token.count == 4 {
+            let stem = String(token.dropLast(2))
+            if ["10", "20", "25", "50", "75"].contains(stem) { candidates.append(stem) }
+        }
+        for value in candidates {
+            if treatAsCorner || isCorner(line.box) || line.box.midX < 0.22 || line.box.midX > 0.78 {
+                cornerVotes[value, default: 0] += (treatAsCorner || isCorner(line.box)) ? 2 : 1
+            }
+        }
+    }
+    if let best = cornerVotes.max(by: { $0.value < $1.value }), best.value >= 1 {
+        return best.key
+    }
+    return ""
+}
+
+func upscaledImage(_ image: CGImage, scale: CGFloat) -> CGImage? {
+    let source = CIImage(cgImage: image)
+    let lanczos = CIFilter.lanczosScaleTransform()
+    lanczos.inputImage = source
+    lanczos.scale = Float(scale)
+    lanczos.aspectRatio = 1
+    guard let scaled = lanczos.outputImage else { return nil }
+    let contrast = CIFilter.colorControls()
+    contrast.inputImage = scaled
+    contrast.contrast = 1.45
+    contrast.saturation = 0
+    contrast.brightness = 0.03
+    let sharpen = CIFilter.sharpenLuminance()
+    sharpen.inputImage = contrast.outputImage
+    sharpen.sharpness = 0.45
+    guard let final = sharpen.outputImage else { return ciContext.createCGImage(scaled, from: scaled.extent) }
+    return ciContext.createCGImage(final, from: final.extent)
+}
+
+func cornerCrops(_ image: CGImage) -> [CGImage] {
+    let w = image.width, h = image.height
+    let cw = max(80, Int(Double(w) * 0.32))
+    let ch = max(80, Int(Double(h) * 0.38))
+    let rects = [
+        CGRect(x: 0, y: 0, width: cw, height: ch),
+        CGRect(x: w - cw, y: 0, width: cw, height: ch),
+        CGRect(x: 0, y: h - ch, width: cw, height: ch),
+        CGRect(x: w - cw, y: h - ch, width: cw, height: ch)
+    ]
+    return rects.compactMap { image.cropping(to: $0) }
+}
+
+func centerBandCrop(_ image: CGImage) -> CGImage? {
+    let w = image.width, h = image.height
+    let rect = CGRect(
+        x: Int(Double(w) * 0.06),
+        y: Int(Double(h) * 0.25),
+        width: Int(Double(w) * 0.88),
+        height: Int(Double(h) * 0.50)
+    )
+    return image.cropping(to: rect)
+}
+
+func denominationVariantLines(_ image: CGImage) -> [OCRLine] {
+    var lines: [OCRLine] = []
+    if let up = upscaledImage(image, scale: 2.0) {
+        lines += textOCR(up, fast: false)
+    }
+    if let faint = adjustedForFaintPrinting(image), let up = upscaledImage(faint, scale: 2.0) {
+        lines += textOCR(up, fast: false)
+    }
+    if let band = centerBandCrop(image) {
+        let source = upscaledImage(band, scale: 2.2) ?? adjustedForFaintPrinting(band) ?? band
+        lines += textOCR(source, fast: false)
+    }
+    for corner in cornerCrops(image) {
+        let source = upscaledImage(corner, scale: 2.5) ?? corner
+        lines += textOCR(source, fast: false)
+    }
+    return lines
+}
+
+#if BONDSCANNER_OCR_HARNESS
+func ocrHarnessMain() {
+    _ = NSApplication.shared
+    let args = Array(CommandLine.arguments.dropFirst())
+    guard !args.isEmpty else {
+        fputs("usage: ocr-harness <image>...\n", stderr)
+        exit(2)
+    }
+    let debug = ProcessInfo.processInfo.environment["BONDSCANNER_DENOM_DEBUG"] == "1"
+    for path in args {
+        let url = URL(fileURLWithPath: path)
+        guard let image = cgImageFromFile(url) else {
+            print("FILE \(url.lastPathComponent) unreadable")
+            continue
+        }
+        let result = scanImage(image)
+        let r = result.record
+        // Operational fields only — no serials, names, addresses, or raw OCR text.
+        print("FILE \(url.lastPathComponent) dims=\(image.width)x\(image.height) series=\(r.series.isEmpty ? "-" : r.series) denom=\(r.denomination.isEmpty ? "-" : r.denomination) issue=\(r.issueMonth.isEmpty && r.issueYear.isEmpty ? "-/-" : "\(r.issueMonth)/\(r.issueYear)") status=\(r.status) notes=\(r.notes) rectified=\(result.rectified) lines=\(result.lineCount) bond_text=\(result.bondTextFound)")
+        if debug {
+            let pattern = "\\$\\s*\\d+[.,]?\\d*|\\b(?:TWENTY|SEVENTY|FIFTY|HUNDRED|THOUSAND|DOLLARS?|MATURITY|FACE|VALUE|EIGHTEEN|18[.,]?75|37[.,]?50|56[.,]?25|25|50|75|100|200|500|FIVE)\\b"
+            let money = regexMatches(pattern, in: normalizeDenominationText(r.rawOCR))
+            print("  denom_tokens=\(money.joined(separator: ","))")
+            let variants = denominationVariantLines(image)
+            let vblob = normalizeDenominationText(variants.map(\.text).joined(separator: " "))
+            let vmoney = regexMatches(pattern, in: vblob)
+            let vdenom = extractDenomination(variants, series: r.series, treatAsCorner: true)
+            print("  variant_tokens=\(vmoney.joined(separator: ",")) variant_denom=\(vdenom.isEmpty ? "-" : vdenom)")
+        }
+    }
+}
+#endif
+
+
 func parseDeterministically(_ lines: [OCRLine]) -> BondRecord {
     let full = lines.map(\.text).joined(separator: "\n")
     let upper = full.uppercased()
@@ -165,24 +476,7 @@ func parseDeterministically(_ lines: [OCRLine]) -> BondRecord {
     else if upper.contains("SERIES E") || record.serial.hasSuffix("E") { record.series = "E" }
     else if upper.contains("SERIES I") || record.serial.hasSuffix("I") { record.series = "I" }
 
-    // Denomination must come from the printed face value, not nearby account numbers.
-    let vals: [(String, String)] = [
-        ("TEN THOUSAND", "10000"), ("FIVE THOUSAND", "5000"),
-        ("ONE THOUSAND", "1000"), ("FIVE HUNDRED", "500"),
-        ("TWO HUNDRED", "200"), ("ONE HUNDRED", "100"),
-        ("FIFTY", "50"), ("TWENTY FIVE", "25"), ("TWENTY DOLLARS", "20"), ("TWENTY-FIVE", "25"), ("TEN DOLLARS", "10")]
-    for (words, amount) in vals where upper.contains(words) {
-        record.denomination = amount
-        break
-    }
-    if record.denomination.isEmpty {
-        for value in ["10000", "5000", "1000", "500", "200", "100", "50", "25", "20", "10"] {
-            if lines.contains(where: { cleanAlnum($0.text) == value && ($0.box.midX < 0.30 || $0.box.midX > 0.70) }) {
-                record.denomination = value
-                break
-            }
-        }
-    }
+    record.denomination = extractDenomination(lines, series: record.series)
 
     // Look for an issue MONTH YEAR near the upper-right, not the bank's dated stamp.
     var dateCandidates: [(String, String, Int)] = []
@@ -236,18 +530,7 @@ func parseDeterministically(_ lines: [OCRLine]) -> BondRecord {
     if upper.contains(" POD ") || upper.contains("POD") { record.secondRole = "POD" }
     else if upper.contains(" OR ") { record.secondRole = "OR" }
 
-    let required = [record.series, record.serial, record.issueMonth, record.issueYear, record.denomination]
-    if required.allSatisfy({ !$0.isEmpty }) {
-        record.status = "OK"
-        if record.owner.isEmpty { record.status = "REVIEW"; record.notes = "Check registered owner" }
-    } else {
-        var missing: [String] = []
-        if record.serial.isEmpty { missing.append("serial") }
-        if record.series.isEmpty { missing.append("series") }
-        if record.issueMonth.isEmpty || record.issueYear.isEmpty { missing.append("issue date") }
-        if record.denomination.isEmpty { missing.append("face value") }
-        record.notes = "Missing or uncertain: " + missing.joined(separator: ", ")
-    }
+    applyRequiredStatus(&record)
     return record
 }
 
@@ -409,9 +692,48 @@ func scanImage(_ image: CGImage) -> OCRResult {
             bestLabel += "/enhanced"
         }
     }
-    let result = parseDeterministically(finalLines)
+    var result = parseDeterministically(finalLines)
+    if result.denomination.isEmpty {
+        var variantLines = finalLines
+        variantLines += denominationVariantLines(selectedImage)
+        let denom = extractDenomination(variantLines, series: result.series)
+        if denom.isEmpty {
+            // Corner crops: treat every numeral there as a corner candidate.
+            var cornerLines: [OCRLine] = []
+            for corner in cornerCrops(selectedImage) {
+                let source = upscaledImage(corner, scale: 2.5) ?? corner
+                cornerLines += textOCR(source, fast: false)
+            }
+            let fromCorners = extractDenomination(cornerLines, series: result.series, treatAsCorner: true)
+            if !fromCorners.isEmpty {
+                result.denomination = fromCorners
+                bestLabel += "/denom-corner"
+            }
+        } else {
+            result.denomination = denom
+            bestLabel += "/denom-variant"
+        }
+        if result.denomination.isEmpty {
+            // The winning candidate may be the full frame; a tighter rectified
+            // crop is often what actually contains a readable face value.
+            candidateLoop: for candidate in candidates where candidate.rectified || candidate.label == "center" {
+                for orientation in [1, 3, 6, 8] {
+                    guard let rotated = rotateCG(candidate.image, exif: orientation) else { continue }
+                    var extra = textOCR(rotated, fast: false)
+                    extra += denominationVariantLines(rotated)
+                    let d = extractDenomination(extra, series: result.series)
+                    if !d.isEmpty {
+                        result.denomination = d
+                        bestLabel += "/denom-\(candidate.label)"
+                        break candidateLoop
+                    }
+                }
+            }
+        }
+        if !result.denomination.isEmpty { applyRequiredStatus(&result) }
+    }
     let recognized = bondTextSignal(finalLines) || bondTextSignal(textOCR(bestImage, fast: true))
-    ScanLog.shared.write("scan candidates=\(candidates.count) best=\(bestLabel) hunt_score=\(bestScore) final_score=\(finalScore) ocr_lines=\(finalLines.count) rectified=\(bestRectified) bond_text=\(recognized) fields_complete=\(result.status == "OK")")
+    ScanLog.shared.write("scan candidates=\(candidates.count) best=\(bestLabel) hunt_score=\(bestScore) final_score=\(finalScore) ocr_lines=\(finalLines.count) rectified=\(bestRectified) bond_text=\(recognized) fields_complete=\(requiredFieldsComplete(result)) denom=\(result.denomination.isEmpty ? "none" : "set")")
     return OCRResult(record: result, image: selectedImage, originalImage: image,
                      huntScore: max(bestScore, finalScore), lineCount: finalLines.count,
                      rectified: bestRectified, bondTextFound: recognized)
@@ -530,9 +852,7 @@ func enrichWithAppleIntelligence(_ record: BondRecord) async -> BondRecord {
                 next.issueMonth = month; next.issueYear = yr
             }
         }
-        let basics = [next.series, next.serial, next.issueMonth, next.issueYear, next.denomination, next.owner]
-        next.status = basics.allSatisfy({ !$0.isEmpty }) ? "OK" : "REVIEW"
-        if next.status == "OK" { next.notes = "" }
+        applyRequiredStatus(&next)
         return next
     } catch { return record }
 }
@@ -798,6 +1118,9 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var isProcessing = false
     private var automatic = true
     private var lockedAfterCapture = false
+    private var autoFillRecordId: String?
+    private var autoFillAttempts = 0
+    private let autoFillMaxAttempts = 4
     private var emptyFrames = 0
     private var priorRect: CGRect?
     private var stableFrames = 0
@@ -1318,6 +1641,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                         self.noBondChecks = 0
                         self.huntHits = 0
                         self.priorRect = nil
+                        self.autoFillRecordId = nil
+                        self.autoFillAttempts = 0
                         self.status("Ready for next bond. Hunting for edges or text…")
                         ScanLog.shared.write("re-armed after two empty OCR checks")
                     } else if stillPresent {
@@ -1556,43 +1881,132 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         ScanLog.shared.write("ocr failed; original photograph preserved")
     }
 
+    private func writeProcessedImage(_ image: CGImage, to relative: String, fallbackSource: String) {
+        let dest = outputRoot.appendingPathComponent(relative)
+        let original = outputRoot.appendingPathComponent(fallbackSource)
+        do {
+            if let data = jpegData(image) {
+                try data.write(to: dest, options: .atomic)
+            } else if FileManager.default.fileExists(atPath: original.path) {
+                if FileManager.default.fileExists(atPath: dest.path) { try FileManager.default.removeItem(at: dest) }
+                try FileManager.default.copyItem(at: original, to: dest)
+            }
+        } catch {
+            ScanLog.shared.write("processed photograph write issue; original is preserved")
+            if !FileManager.default.fileExists(atPath: dest.path), FileManager.default.fileExists(atPath: original.path) {
+                try? FileManager.default.copyItem(at: original, to: dest)
+            }
+        }
+    }
+
+    private func trashCapturePhotos(_ record: BondRecord) {
+        for rel in [record.photo, record.sourcePhoto] where !rel.isEmpty {
+            let usedElsewhere = records.contains { other in
+                other.id != record.id && (
+                    other.photo == rel || other.sourcePhoto == rel
+                    || (other.fieldPhoto ?? [:]).values.contains(rel)
+                )
+            }
+            if usedElsewhere { continue }
+            let url = outputRoot.appendingPathComponent(rel)
+            if FileManager.default.fileExists(atPath: url.path) {
+                try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            }
+        }
+    }
+
+    private func priorRecord(for incoming: BondRecord) -> BondRecord? {
+        if let match = recordMatchingSerial(incoming.serial, in: records, excluding: incoming.id) {
+            return match
+        }
+        if let aid = autoFillRecordId, aid != incoming.id, let existing = records.first(where: { $0.id == aid }) {
+            return existing
+        }
+        return nil
+    }
+
+    private func presentRecord(_ record: BondRecord, flash: NSColor, message: String, automatic: Bool, contributed: Bool, isNew: Bool) {
+        updateCount()
+        let serialDisplay = record.serial.isEmpty ? "unreadable serial" : record.serial
+        lastLabel.stringValue = "Last: \(record.series) \(serialDisplay) | \(record.issueMonth)/\(record.issueYear) | $\(record.denomination) | \(record.status)"
+        preview.captureFlash(color: flash)
+        status(message)
+        emptyFrames = 0
+        if contributed { enrichRecordInBackground(record) }
+        if automatic {
+            if isNew { autoFillRecordId = record.id; autoFillAttempts = 1 }
+            else { autoFillAttempts += 1 }
+            autoFillRecordId = record.id
+            if requiredFieldsComplete(record) {
+                lockedAfterCapture = true
+                autoFillAttempts = autoFillMaxAttempts
+                ScanLog.shared.write("auto fill complete required_fields=all attempts=\(autoFillAttempts)")
+            } else if autoFillAttempts >= autoFillMaxAttempts {
+                lockedAfterCapture = true
+                ScanLog.shared.write("auto fill exhausted attempts=\(autoFillAttempts) missing=\(requiredFieldsMissing(record).joined(separator: ","))")
+            } else {
+                lockedAfterCapture = false
+                nextAutoAllowedAt = Date().timeIntervalSince1970 + 1.2
+                ScanLog.shared.write("auto fill retry attempts=\(autoFillAttempts)/\(autoFillMaxAttempts) missing=\(requiredFieldsMissing(record).joined(separator: ","))")
+            }
+        } else {
+            lockedAfterCapture = true
+        }
+    }
+
     private func applyOCR(_ result: OCRResult, to id: String) {
         guard let index = records.firstIndex(where: { $0.id == id }) else {
             ScanLog.shared.write("ocr result ignored; record no longer present")
             return
         }
-        let existing = records[index]
-        var record = result.record
-        record.id = existing.id
-        record.capturedAt = existing.capturedAt
-        record.sourcePhoto = existing.sourcePhoto
-        record.photo = existing.photo
+        let row = records[index]
+        var incoming = result.record
+        incoming.id = row.id
+        incoming.capturedAt = row.capturedAt
+        incoming.sourcePhoto = row.sourcePhoto
+        incoming.photo = row.photo
+        applyRequiredStatus(&incoming)
 
-        if let prior = recordMatchingSerial(record.serial, in: records, excluding: record.id) {
-            record.status = "DUPLICATE"
-            let note = "DUPLICATE of record \(prior.id). Flagged for review."
-            record.notes = record.notes.isEmpty ? note : record.notes + " " + note
-            ScanLog.shared.write("scan duplicate detected; photograph kept and record flagged (serial omitted from debug log, prior id=\(prior.id))")
+        if let prior = priorRecord(for: incoming), let priorIndex = records.firstIndex(where: { $0.id == prior.id }) {
+            var merged = records[priorIndex]
+            let filled = mergeBondRecord(from: incoming, into: &merged,
+                                         contributingPhoto: incoming.photo,
+                                         contributingSource: incoming.sourcePhoto,
+                                         captureId: incoming.id)
+            if filled.isEmpty {
+                records.removeAll { $0.id == incoming.id }
+                trashCapturePhotos(incoming)
+                try? writeRecords(records)
+                ScanLog.shared.write("extra photograph dropped; no new required fields (prior id=\(prior.id))")
+                presentRecord(merged, flash: .systemOrange,
+                              message: "Same bond — no new required fields. Extra photograph not kept.",
+                              automatic: false, contributed: false, isNew: false)
+                return
+            }
+            writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
+            records.removeAll { $0.id == incoming.id }
+            if let idx = records.firstIndex(where: { $0.id == prior.id }) {
+                records[idx] = merged
+            } else {
+                records.append(merged)
+            }
+            do { try writeRecords(records) }
+            catch { status("OCR results could not be saved: \(error.localizedDescription)"); preview.captureFlash(color: .systemRed); return }
+            let fieldList = filled.joined(separator: ", ")
+            ScanLog.shared.write("merged fields=\(fieldList) into existing record; photograph kept (prior id=\(prior.id)) status=\(merged.status)")
+            let flash: NSColor = requiredFieldsComplete(merged) ? .systemGreen : .systemYellow
+            let message = requiredFieldsComplete(merged)
+                ? "Updated the existing record with \(fieldList). All required fields verified. Remove the bond."
+                : "Updated the existing record with \(fieldList). Still missing \(requiredFieldsMissing(merged).joined(separator: ", "))."
+            presentRecord(merged, flash: flash, message: message, automatic: false, contributed: true, isNew: false)
+            return
         }
 
-        let processedURL = outputRoot.appendingPathComponent(record.photo)
-        let originalURL = outputRoot.appendingPathComponent(record.sourcePhoto)
-        do {
-            if let data = jpegData(result.image) {
-                try data.write(to: processedURL, options: .atomic)
-            } else if FileManager.default.fileExists(atPath: originalURL.path) {
-                if FileManager.default.fileExists(atPath: processedURL.path) { try FileManager.default.removeItem(at: processedURL) }
-                try FileManager.default.copyItem(at: originalURL, to: processedURL)
-            }
-        } catch {
-            ScanLog.shared.write("processed photograph write issue; original is preserved")
-            if !FileManager.default.fileExists(atPath: processedURL.path), FileManager.default.fileExists(atPath: originalURL.path) {
-                try? FileManager.default.copyItem(at: originalURL, to: processedURL)
-            }
-        }
-
+        writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
+        annotateFieldSources(&incoming, photo: incoming.sourcePhoto, captureId: incoming.id)
+        applyRequiredStatus(&incoming)
         let previous = records
-        records[index] = record
+        records[index] = incoming
         do { try writeRecords(records) }
         catch {
             records = previous
@@ -1602,84 +2016,116 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             ScanLog.shared.write("ocr record write failed; original photograph preserved")
             return
         }
-        updateCount()
-        ScanLog.shared.write("scan updated status=\(record.status) fields_nonempty=\([record.series, record.serial, record.issueMonth, record.issueYear, record.denomination, record.owner].filter { !$0.isEmpty }.count) rectified=\(result.rectified) total=\(records.count)")
-        let serialDisplay = record.serial.isEmpty ? "unreadable serial" : record.serial
-        lastLabel.stringValue = "Last: \(record.series) \(serialDisplay) | \(record.issueMonth)/\(record.issueYear) | $\(record.denomination) | \(record.status)"
-        if record.status == "OK" {
-            preview.captureFlash(color: .systemGreen)
-            status("OCR complete — verified. Remove the bond, then show the next one.")
-        } else if record.status == "DUPLICATE" {
-            preview.captureFlash(color: .systemOrange)
-            status("Duplicate of an earlier record — photograph kept for review. Remove the bond.")
-        } else {
-            preview.captureFlash(color: .systemYellow)
-            status("OCR complete — review needed. Remove the bond, then show the next one.")
-        }
-        lockedAfterCapture = true
-        emptyFrames = 0
-        enrichRecordInBackground(record)
+        ScanLog.shared.write("scan updated status=\(incoming.status) fields_nonempty=\([incoming.series, incoming.serial, incoming.issueMonth, incoming.issueYear, incoming.denomination].filter { !$0.isEmpty }.count) rectified=\(result.rectified) total=\(records.count)")
+        let flash: NSColor = incoming.status == "OK" ? .systemGreen : .systemYellow
+        let message = incoming.status == "OK"
+            ? "OCR complete — verified. Remove the bond, then show the next one."
+            : "OCR complete — review needed (\(requiredFieldsMissing(incoming).joined(separator: ", "))). Remove the bond, then show the next one."
+        presentRecord(incoming, flash: flash, message: message, automatic: false, contributed: true, isNew: true)
     }
 
-
     private func handleOCR(_ result: OCRResult, auto: Bool) {
-        var record = result.record
-        var isDuplicate = false
-        if let prior = recordMatchingSerial(record.serial, in: records, excluding: record.id) {
-            isDuplicate = true
-            record.status = "DUPLICATE"
-            let note = "DUPLICATE of record \(prior.id). Flagged for review."
-            record.notes = record.notes.isEmpty ? note : record.notes + " " + note
-            ScanLog.shared.write("scan duplicate detected; photograph will be kept and the record flagged (serial omitted from debug log, prior id=\(prior.id))")
-        }
-        // Save partial readings for later review instead of silently dropping a real bond.
-        // Do not save random backgrounds, even if a false-positive rectangle was found.
-        if auto && (!result.bondTextFound || result.huntScore < 45) {
+        var incoming = result.record
+        applyRequiredStatus(&incoming)
+
+        if auto && autoFillRecordId == nil && (!result.bondTextFound || result.huntScore < 45) {
             nextAutoAllowedAt = Date().timeIntervalSince1970 + 3.0
             ScanLog.shared.write("auto scan rejected: low OCR evidence score=\(result.huntScore) count=\(result.lineCount)")
             isProcessing = false
             status("Not readable — improve lighting/focus, reposition, or press Space to save for review.")
             return
         }
-        // A capture is written immediately. Apple Intelligence enrichment updates the row later.
-        let filename = "\(record.capturedAt.replacingOccurrences(of: ":", with: "-"))_\(record.id.prefix(8)).jpg"
-        let imageURL = photosRoot.appendingPathComponent(filename)
-        record.photo = "photos/" + filename
-        record.sourcePhoto = "photos/original_" + filename
+
+        if let prior = priorRecord(for: incoming), let priorIndex = records.firstIndex(where: { $0.id == prior.id }) {
+            var merged = records[priorIndex]
+            let filled = mergeBondRecord(from: incoming, into: &merged, contributingPhoto: "", contributingSource: "", captureId: incoming.id)
+            if filled.isEmpty {
+                ScanLog.shared.write("auto/manual retry added no required fields; extra photograph not saved (prior id=\(prior.id))")
+                isProcessing = false
+                if auto {
+                    presentRecord(merged, flash: .systemOrange,
+                                  message: requiredFieldsComplete(merged)
+                                    ? "Same bond already verified. Remove it before the next one."
+                                    : "Same bond — no new required fields. Trying again…",
+                                  automatic: auto, contributed: false, isNew: false)
+                } else {
+                    presentRecord(merged, flash: .systemOrange,
+                                  message: "Same bond — no new required fields. Extra photograph not kept.",
+                                  automatic: false, contributed: false, isNew: false)
+                }
+                return
+            }
+            // Contributing retry: save this photograph and point new fields at it.
+            let filename = "\(incoming.capturedAt.replacingOccurrences(of: ":", with: "-"))_\(incoming.id.prefix(8)).jpg"
+            incoming.photo = "photos/" + filename
+            incoming.sourcePhoto = "photos/original_" + filename
+            do {
+                guard let original = jpegData(result.originalImage) else { throw NSError(domain: "Photos", code: 2, userInfo: [NSLocalizedDescriptionKey: "Original JPEG encoding failed"]) }
+                try original.write(to: outputRoot.appendingPathComponent(incoming.sourcePhoto), options: .atomic)
+                writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
+                // Re-merge so fieldPhoto paths are the ones we just wrote.
+                merged = records[priorIndex]
+                let filled2 = mergeBondRecord(from: incoming, into: &merged,
+                                              contributingPhoto: incoming.photo,
+                                              contributingSource: incoming.sourcePhoto,
+                                              captureId: incoming.id)
+                records[priorIndex] = merged
+                try writeRecords(records)
+                let fieldList = (filled2.isEmpty ? filled : filled2).joined(separator: ", ")
+                ScanLog.shared.write("merged fields=\(fieldList) into existing record; photograph kept (prior id=\(prior.id)) status=\(merged.status)")
+                isProcessing = false
+                let flash: NSColor = requiredFieldsComplete(merged) ? .systemGreen : .systemYellow
+                let message: String
+                if requiredFieldsComplete(merged) {
+                    message = "Updated the existing record with \(fieldList). All required fields verified. Remove the bond."
+                } else if auto && autoFillAttempts + 1 < autoFillMaxAttempts {
+                    message = "Updated with \(fieldList). Still missing \(requiredFieldsMissing(merged).joined(separator: ", ")). Trying another photograph…"
+                } else {
+                    message = "Updated with \(fieldList). Still missing \(requiredFieldsMissing(merged).joined(separator: ", "))."
+                }
+                NSSound(named: NSSound.Name("Glass"))?.play()
+                presentRecord(merged, flash: flash, message: message, automatic: auto, contributed: true, isNew: false)
+            } catch {
+                ScanLog.shared.write("scan save failed")
+                status("SAVE FAILED: \(error.localizedDescription)")
+                NSSound.beep()
+                isProcessing = false
+            }
+            return
+        }
+
+        let filename = "\(incoming.capturedAt.replacingOccurrences(of: ":", with: "-"))_\(incoming.id.prefix(8)).jpg"
+        incoming.photo = "photos/" + filename
+        incoming.sourcePhoto = "photos/original_" + filename
+        annotateFieldSources(&incoming, photo: incoming.sourcePhoto, captureId: incoming.id)
+        applyRequiredStatus(&incoming)
         do {
             guard let original = jpegData(result.originalImage) else { throw NSError(domain: "Photos", code: 2, userInfo: [NSLocalizedDescriptionKey: "Original JPEG encoding failed"]) }
-            try original.write(to: outputRoot.appendingPathComponent(record.sourcePhoto), options: .atomic)
-            guard let data = jpegData(result.image) else { throw NSError(domain: "Photos", code: 1, userInfo: [NSLocalizedDescriptionKey: "JPEG encoding failed"]) }
-            try data.write(to: imageURL, options: .atomic)
+            try original.write(to: outputRoot.appendingPathComponent(incoming.sourcePhoto), options: .atomic)
+            writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
             let previous = records
-            records.append(record)
+            records.append(incoming)
             do { try writeRecords(records) }
             catch { records = previous; throw error }
-            updateCount()
-            ScanLog.shared.write("scan saved status=\(record.status) fields_nonempty=\([record.series, record.serial, record.issueMonth, record.issueYear, record.denomination, record.owner].filter { !$0.isEmpty }.count) rectified=\(result.rectified) total=\(records.count)")
-            let serialDisplay = record.serial.isEmpty ? "unreadable serial" : record.serial
-            lastLabel.stringValue = "Last: \(record.series) \(serialDisplay) | \(record.issueMonth)/\(record.issueYear) | $\(record.denomination) | \(record.status)"
-            if record.status == "OK" {
-                preview.captureFlash(color: .systemGreen)
-                status("Saved! Remove bond, then show the next one.")
-            } else if isDuplicate || record.status == "DUPLICATE" {
-                preview.captureFlash(color: .systemOrange)
-                status("Duplicate of an earlier record — photograph kept for review. Remove the bond.")
-            } else {
-                preview.captureFlash(color: .systemYellow)
-                status("Saved for REVIEW. Remove bond, then show the next one.")
-            }
+            ScanLog.shared.write("scan saved status=\(incoming.status) fields_nonempty=\([incoming.series, incoming.serial, incoming.issueMonth, incoming.issueYear, incoming.denomination].filter { !$0.isEmpty }.count) rectified=\(result.rectified) total=\(records.count)")
             NSSound(named: NSSound.Name("Glass"))?.play()
-            // Stay locked until the bond actually leaves the frame (re-arm). Manual Space still captures.
-            lockedAfterCapture = true
-            emptyFrames = 0
-            enrichRecordInBackground(record)
+            let flash: NSColor = incoming.status == "OK" ? .systemGreen : .systemYellow
+            let message: String
+            if incoming.status == "OK" {
+                message = "Saved! All required fields verified. Remove the bond, then show the next one."
+            } else if auto {
+                message = "Saved. Still missing \(requiredFieldsMissing(incoming).joined(separator: ", ")). Trying another photograph…"
+            } else {
+                message = "Saved for REVIEW (\(requiredFieldsMissing(incoming).joined(separator: ", "))). Remove bond, then show the next one."
+            }
+            isProcessing = false
+            presentRecord(incoming, flash: flash, message: message, automatic: auto, contributed: true, isNew: true)
         } catch {
             ScanLog.shared.write("scan save failed")
             status("SAVE FAILED: \(error.localizedDescription)")
             NSSound.beep()
+            isProcessing = false
         }
-        isProcessing = false
     }
 
     private func enrichRecordInBackground(_ record: BondRecord) {
@@ -1744,6 +2190,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         emptyFrames = 0
         huntHits = 0
         noBondChecks = 0
+        autoFillRecordId = nil
+        autoFillAttempts = 0
         ScanLog.shared.write("manual re-arm")
         status("Ready for next bond. Hold steady inside the guide.")
     }
@@ -1810,8 +2258,12 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 }
 
+#if BONDSCANNER_OCR_HARNESS
+ocrHarnessMain()
+#else
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 let delegate = BondScannerApp()
 app.delegate = delegate
 app.run()
+#endif
