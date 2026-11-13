@@ -1,7 +1,9 @@
 #!/bin/bash
-# Bond Scanner project launcher.
-# Builds from ~/BondScannerProject and opens the app.
-# Does not extract or overwrite source. Does not run bondscan_v2.command.
+# Bond Scanner project launcher (staging).
+# Builds to ~/BondScannerProject/build/BondScanner.app and opens that copy.
+# Does not overwrite ~/Applications/BondScanner.app.
+# Does not extract or overwrite Application Support source.
+# Does not run ~/Downloads/bondscan_v2.command.
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -10,8 +12,9 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP="$HOME/Applications/BondScanner.app"
+APP="$ROOT/build/BondScanner.app"
 
-"$ROOT/build.sh"
-echo "Opening Bond Scanner. Output data remains in $HOME/BondScans (not modified by this launch script except via the running app)."
+"$ROOT/build.sh" --staging
+echo "Opening staging app: $APP"
+echo "Scan data remains in $HOME/BondScans."
 open "$APP"

@@ -3,6 +3,12 @@
 # Does not run or modify ~/Downloads/bondscan_v2.command.
 # Does not overwrite ~/Library/Application Support/BondScanner/BondScanner.swift.
 # Does not touch ~/BondScans data (photos, CSV, JSON, logs, README).
+#
+# Usage:
+#   ./build.sh            Build to ./build/BondScanner.app (staging; default)
+#   ./build.sh --staging  Same as default
+#   ./build.sh --install  Install to ~/Applications/BondScanner.app
+#                         (do not use while the installed app is being tested)
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -18,11 +24,34 @@ fi
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SRC="$ROOT/Sources/BondScanner.swift"
 PLIST="$ROOT/Info.plist"
-# Working v2 install location (the app is NOT under ~/BondScans)
-APP="$HOME/Applications/BondScanner.app"
+LOG="$ROOT/build.log"
+
+MODE="staging"
+for arg in "$@"; do
+    case "$arg" in
+        --staging) MODE="staging" ;;
+        --install) MODE="install" ;;
+        -h|--help)
+            sed -n '2,16p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg" >&2
+            echo "Usage: $0 [--staging|--install]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ "$MODE" == "staging" ]]; then
+    APP="$ROOT/build/BondScanner.app"
+else
+    APP="$HOME/Applications/BondScanner.app"
+    echo "WARNING: installing over $APP" >&2
+fi
+
 CONTENTS="$APP/Contents"
 EXEC="$CONTENTS/MacOS/BondScanner"
-LOG="$ROOT/build.log"
 
 if [[ ! -f "$SRC" ]]; then
     echo "Missing source: $SRC" >&2
@@ -33,12 +62,13 @@ if [[ ! -f "$PLIST" ]]; then
     exit 1
 fi
 
-mkdir -p "$CONTENTS/MacOS" "$HOME/Applications"
+mkdir -p "$CONTENTS/MacOS"
 
 # Install Info.plist from the project (do not write a fresh README into ~/BondScans)
-cp -p "$PLIST" "$CONTENTS/Info.plist"
+cp "$PLIST" "$CONTENTS/Info.plist"
 
-echo "Building Bond Scanner from $SRC ..."
+echo "Building Bond Scanner ($MODE) from $SRC"
+echo "Output: $APP"
 # Same compiler flags and frameworks as the v2 launcher
 if ! xcrun swiftc -swift-version 5 -o "$EXEC" \
     -framework AppKit -framework AVFoundation -framework Vision \
