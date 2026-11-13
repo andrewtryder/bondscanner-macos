@@ -76,13 +76,33 @@ cp "$PLIST" "$CONTENTS/Info.plist"
 echo "Building Bond Scanner ($MODE) from $SRC"
 echo "Output: $APP"
 
+OBJC_SRC="$ROOT/Sources/ExceptionCatcher.m"
+OBJC_HDR="$ROOT/Sources/ExceptionCatcher.h"
+OBJC_OBJ="$ROOT/build/ExceptionCatcher.o"
+if [[ ! -f "$OBJC_SRC" || ! -f "$OBJC_HDR" ]]; then
+    echo "Missing ExceptionCatcher sources in $ROOT/Sources" >&2
+    exit 1
+fi
+mkdir -p "$ROOT/build"
 set +e
+xcrun clang -c "$OBJC_SRC" -o "$OBJC_OBJ" -fobjc-arc -fmodules \
+    -mmacosx-version-min=13.0 >"$TMPLOG" 2>&1
+CLANG_STATUS=$?
+if [[ $CLANG_STATUS -ne 0 ]]; then
+    set -e
+    cp "$TMPLOG" "$SUMMARY"
+    echo "ObjC compile error. First 100 lines of $SUMMARY:" >&2
+    sed -n '1,100p' "$SUMMARY" >&2
+    exit 1
+fi
 xcrun swiftc -swift-version 5 -o "$EXEC" \
+    -import-objc-header "$OBJC_HDR" \
     -framework AppKit -framework AVFoundation -framework Vision \
     -framework CoreImage -framework CoreMedia -framework CoreVideo \
     -framework QuartzCore -framework ImageIO \
     -framework AudioToolbox -framework UniformTypeIdentifiers \
-    "$SRC" >"$TMPLOG" 2>&1
+    -framework Foundation \
+    "$SRC" "$OBJC_OBJ" >"$TMPLOG" 2>&1
 SWIFTC_STATUS=$?
 set -e
 
