@@ -135,6 +135,65 @@ func recordMatchingSerial(_ raw: String, in records: [BondRecord], excluding id:
     }
 }
 
+/// Strict 1-glyph OCR confusions used only when comparing two already-read serials.
+func serialCharsAreOCRConfusable(_ a: Character, _ b: Character) -> Bool {
+    if a == b { return true }
+    let pair = String([a, b]).uppercased()
+    let allowed: Set<String> = [
+        "0O", "O0", "0D", "D0", "08", "80", "06", "60", "09", "90",
+        "1I", "I1", "1L", "L1", "17", "71",
+        "5S", "S5", "56", "65",
+        "8B", "B8", "83", "38", "86", "68", "89", "98",
+        "2Z", "Z2", "4A", "A4"
+    ]
+    return allowed.contains(pair)
+}
+
+/// Exact normalized match, or a single confusable-character difference.
+/// Empty (unread) serials never match.
+func serialsMatchForMerge(_ incomingRaw: String, _ existingRaw: String) -> (exact: Bool, near: Bool) {
+    let a = normalizeSerial(incomingRaw)
+    let b = normalizeSerial(existingRaw)
+    if a.isEmpty || b.isEmpty { return (false, false) }
+    if a == b { return (true, false) }
+    guard a.count == b.count else { return (false, false) }
+    let diffs = zip(Array(a), Array(b)).filter { $0.0 != $0.1 }
+    guard diffs.count == 1, serialCharsAreOCRConfusable(diffs[0].0, diffs[0].1) else {
+        return (false, false)
+    }
+    return (false, true)
+}
+
+/// Other required fields that both sides actually read must be identical.
+func otherRequiredFieldsAgree(_ incoming: BondRecord, _ existing: BondRecord) -> Bool {
+    func agree(_ a: String, _ b: String) -> Bool {
+        if a.isEmpty || b.isEmpty { return true }
+        return a == b
+    }
+    return agree(incoming.series, existing.series)
+        && agree(incoming.denomination, existing.denomination)
+        && agree(incoming.issueMonth, existing.issueMonth)
+        && agree(incoming.issueYear, existing.issueYear)
+}
+
+/// A capture may merge into an existing record only when the capture's OWN
+/// serial was read and matches the record's serial exactly, or within a
+/// strict 1-character OCR-confusion tolerance with every other read field
+/// agreeing. "Retry in progress" or "bond still in view" is never enough.
+func canMergeCapture(_ incoming: BondRecord, into existing: BondRecord) -> Bool {
+    let match = serialsMatchForMerge(incoming.serial, existing.serial)
+    if match.exact { return true }
+    if match.near && otherRequiredFieldsAgree(incoming, existing) { return true }
+    return false
+}
+
+func rectangleChangedForScene(_ a: CGRect, _ b: CGRect) -> Bool {
+    return abs(a.midX - b.midX) > 0.12
+        || abs(a.midY - b.midY) > 0.12
+        || abs(a.width - b.width) > 0.18
+        || abs(a.height - b.height) > 0.18
+}
+
 struct FieldReading {
     var value: String = ""
     var confidence: String = "" // "high" or "uncertain"
@@ -2254,6 +2313,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var autoFillRecordId: String?
     private var autoFillAttempts = 0
     private let autoFillMaxAttempts = 4
+    private var autoFillRect: CGRect?
+    private var autoFillGoneFrames = 0
     private var emptyFrames = 0
     private var priorRect: CGRect?
     private var stableFrames = 0
@@ -2810,6 +2871,27 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         preview.sourceSize = CGSize(width: CGFloat(frame.width), height: CGFloat(frame.height))
         preview.showDetected(rect)
         let now = Date().timeIntervalSince1970
+        // During an auto-fill retry, a removed or replaced bond must end the
+        // retry immediately. "Still some paper in view" is not the same bond.
+        if autoFillRecordId != nil && !lockedAfterCapture {
+            if let rect = rect {
+                autoFillGoneFrames = 0
+                if let start = autoFillRect, rectangleChangedForScene(rect, start) {
+                    endAutoFill(reason: "rectangle changed")
+                    stableFrames = 0
+                    priorRect = rect
+                } else if autoFillRect == nil {
+                    autoFillRect = rect
+                }
+            } else {
+                autoFillGoneFrames += 1
+                if autoFillGoneFrames >= 2 {
+                    endAutoFill(reason: "bond removed")
+                    stableFrames = 0
+                    priorRect = nil
+                }
+            }
+        }
         if lockedAfterCapture {
             // The bond is still in view if a paper outline is visible — do not re-arm.
             if rect != nil { noBondChecks = 0 }
@@ -2871,6 +2953,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                         self.priorRect = nil
                         self.autoFillRecordId = nil
                         self.autoFillAttempts = 0
+                        self.autoFillRect = nil
+                        self.autoFillGoneFrames = 0
                         self.status("Ready for next bond. Hunting for edges or text…")
                         ScanLog.shared.write("re-armed after two empty OCR checks")
                     } else if stillPresent {
@@ -3174,13 +3258,29 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     private func priorRecord(for incoming: BondRecord) -> BondRecord? {
-        if let match = recordMatchingSerial(incoming.serial, in: records, excluding: incoming.id) {
+        // Exact normalized serial first.
+        if let match = recordMatchingSerial(incoming.serial, in: records, excluding: incoming.id),
+           canMergeCapture(incoming, into: match) {
             return match
         }
-        if let aid = autoFillRecordId, aid != incoming.id, let existing = records.first(where: { $0.id == aid }) {
-            return existing
+        // 1-character OCR-confusion near-match, only if the incoming serial was
+        // actually read and every other read field agrees.
+        let incomingSerial = normalizeSerial(incoming.serial)
+        guard !incomingSerial.isEmpty else { return nil }
+        for existing in records where existing.id != incoming.id {
+            if canMergeCapture(incoming, into: existing) { return existing }
         }
+        // Auto-fill / "still in view" is never a reason to merge on its own.
         return nil
+    }
+
+    private func endAutoFill(reason: String) {
+        guard autoFillRecordId != nil else { return }
+        ScanLog.shared.write("auto fill ended: \(reason)")
+        autoFillRecordId = nil
+        autoFillAttempts = 0
+        autoFillRect = nil
+        autoFillGoneFrames = 0
     }
 
     private func presentRecord(_ record: BondRecord, flash: NSColor, message: String, automatic: Bool, contributed: Bool, isNew: Bool) {
@@ -3207,12 +3307,15 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             if requiredFieldsComplete(record) {
                 lockedAfterCapture = true
                 autoFillAttempts = autoFillMaxAttempts
+                autoFillRect = nil
                 ScanLog.shared.write("auto fill complete required_fields=all attempts=\(autoFillAttempts)")
             } else if autoFillAttempts >= autoFillMaxAttempts {
                 lockedAfterCapture = true
+                autoFillRect = nil
                 ScanLog.shared.write("auto fill exhausted attempts=\(autoFillAttempts) missing=\(requiredFieldsMissing(record).joined(separator: ","))")
             } else {
                 lockedAfterCapture = false
+                if autoFillRect == nil { autoFillRect = priorRect }
                 nextAutoAllowedAt = Date().timeIntervalSince1970 + 1.2
                 ScanLog.shared.write("auto fill retry attempts=\(autoFillAttempts)/\(autoFillMaxAttempts) missing=\(requiredFieldsMissing(record).joined(separator: ","))")
             }
@@ -3233,6 +3336,14 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         incoming.sourcePhoto = row.sourcePhoto
         incoming.photo = row.photo
         applyRequiredStatus(&incoming)
+
+        if let aid = autoFillRecordId, let target = records.first(where: { $0.id == aid }),
+           aid != incoming.id, !canMergeCapture(incoming, into: target) {
+            let reason = normalizeSerial(incoming.serial).isEmpty
+                ? "serial unreadable on retry; saving as new record"
+                : "serial does not match retry target; saving as new record"
+            endAutoFill(reason: reason)
+        }
 
         if let prior = priorRecord(for: incoming), let priorIndex = records.firstIndex(where: { $0.id == prior.id }) {
             var merged = records[priorIndex]
@@ -3301,6 +3412,18 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             isProcessing = false
             status("Not readable — improve lighting/focus, reposition, or press Space to save for review.")
             return
+        }
+
+        // Never merge a retry into the auto-fill target unless this capture's
+        // own serial matches. A mismatch or unreadable serial ends the retry
+        // and is saved as a new record below.
+        if auto, let aid = autoFillRecordId, let target = records.first(where: { $0.id == aid }) {
+            if !canMergeCapture(incoming, into: target) {
+                let reason = normalizeSerial(incoming.serial).isEmpty
+                    ? "serial unreadable on retry; saving as new record"
+                    : "serial does not match retry target; saving as new record"
+                endAutoFill(reason: reason)
+            }
         }
 
         if let prior = priorRecord(for: incoming), let priorIndex = records.firstIndex(where: { $0.id == prior.id }) {
@@ -3459,6 +3582,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         noBondChecks = 0
         autoFillRecordId = nil
         autoFillAttempts = 0
+        autoFillRect = nil
+        autoFillGoneFrames = 0
         ScanLog.shared.write("manual re-arm")
         status("Ready for next bond. Hold steady inside the guide.")
     }
