@@ -553,8 +553,9 @@ func selectBestCaptureFormat(from formats: [AVCaptureDevice.Format]) -> AVCaptur
         let d = formatDimensions(format)
         let pixels = Int(d.width) * Int(d.height)
         var tier = 1
-        if d.width == 2592 && d.height == 1944 { tier = 3 }
-        else if d.width == 2560 && d.height == 1440 { tier = 2 }
+        if d.width == 2592 && d.height == 1944 { tier = 4 }
+        else if d.width == 2560 && d.height == 1440 { tier = 3 }
+        else if d.width == 2048 && d.height == 1536 { tier = 2 }
         let mjpeg = formatIsMJPEG(format) ? 1 : 0
         return (tier, pixels, mjpeg)
     }
@@ -613,6 +614,60 @@ func logCameraControls(_ camera: AVCaptureDevice) {
     ScanLog.shared.write("exposure supported=[\(expSupported)] current=\(expName(camera.exposureMode)) point_of_interest=\(camera.isExposurePointOfInterestSupported)")
     ScanLog.shared.write("white_balance supported=[\(wbSupported)] current=\(wbName(camera.whiteBalanceMode))")
 }
+
+
+func preferredFrameDuration(for format: AVCaptureDevice.Format, desiredFPS: Double) -> (duration: CMTime, fps: Double)? {
+    let ranges = format.videoSupportedFrameRateRanges
+    guard !ranges.isEmpty else { return nil }
+    var bestRange = ranges[0]
+    var bestFPS = min(bestRange.maxFrameRate, max(bestRange.minFrameRate, desiredFPS))
+    var bestDelta = abs(bestFPS - desiredFPS)
+    for range in ranges {
+        let fps: Double
+        if range.minFrameRate <= desiredFPS && desiredFPS <= range.maxFrameRate {
+            fps = desiredFPS
+        } else if range.maxFrameRate <= desiredFPS {
+            fps = range.maxFrameRate
+        } else {
+            fps = range.minFrameRate
+        }
+        let delta = abs(fps - desiredFPS)
+        if delta < bestDelta || (delta == bestDelta && fps <= desiredFPS && bestFPS > desiredFPS) {
+            bestRange = range
+            bestFPS = fps
+            bestDelta = delta
+        }
+    }
+    var duration = CMTime(seconds: 1.0 / max(bestFPS, 1), preferredTimescale: 600)
+    if CMTimeCompare(duration, bestRange.minFrameDuration) < 0 { duration = bestRange.minFrameDuration }
+    if CMTimeCompare(duration, bestRange.maxFrameDuration) > 0 { duration = bestRange.maxFrameDuration }
+    let fps = 1.0 / CMTimeGetSeconds(duration)
+    return (duration, fps)
+}
+
+func desiredFPSForFormatDimensions(_ width: Int32, _ height: Int32) -> Double {
+    // Uncompressed 2592x1944 420v at 30 fps is ~2.3 Gbps, far beyond USB 2.0 (~480 Mbps).
+    // Request a rate the bus can actually carry so the device does not silently downscale.
+    let pixels = Int(width) * Int(height)
+    if pixels >= 2592 * 1944 { return 10 }
+    if pixels >= 2048 * 1536 { return 15 }
+    return 30
+}
+
+func estimatedMegabitsPerSecond(width: Int, height: Int, fps: Double, bytesPerPixel: Double = 1.5) -> Double {
+    return Double(width) * Double(height) * bytesPerPixel * fps * 8.0 / 1_000_000.0
+}
+
+func largestSupportedPhotoDimensions(for format: AVCaptureDevice.Format) -> CMVideoDimensions? {
+    if #available(macOS 13.0, *) {
+        let supported = format.supportedMaxPhotoDimensions
+        return supported.max { a, b in
+            Int(a.width) * Int(a.height) < Int(b.width) * Int(b.height)
+        }
+    }
+    return nil
+}
+
 
 final class PreviewView: NSView {
     let videoLayer = AVCaptureVideoPreviewLayer()
@@ -705,7 +760,10 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var chosenFormatWidth = 0
     private var chosenFormatHeight = 0
     private var chosenFormatSubtype = ""
+    private var chosenDeviceFormat: AVCaptureDevice.Format?
+    private var videoDataOutput: AVCaptureVideoDataOutput?
     private var deliveredFrameLogged = false
+    private var resolutionPass = 0
     private var latestImage: CGImage?
     private var records: [BondRecord] = []
     private var isProcessing = false
@@ -934,6 +992,134 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         }
     }
 
+    private func applyDeviceFormat(_ format: AVCaptureDevice.Format, on camera: AVCaptureDevice, reason: String) throws {
+        let dims = formatDimensions(format)
+        let sub = fourCharCodeString(CMFormatDescriptionGetMediaSubType(format.formatDescription))
+        let desired = desiredFPSForFormatDimensions(dims.width, dims.height)
+        try camera.lockForConfiguration()
+        camera.activeFormat = format
+        if let frame = preferredFrameDuration(for: format, desiredFPS: desired) {
+            camera.activeVideoMinFrameDuration = frame.duration
+            camera.activeVideoMaxFrameDuration = frame.duration
+            ScanLog.shared.write("\(reason) format=\(dims.width)x\(dims.height) subtype=\(sub) fps=\(String(format: "%.2f", frame.fps)) raw_mbps=\(String(format: "%.0f", estimatedMegabitsPerSecond(width: Int(dims.width), height: Int(dims.height), fps: frame.fps)))")
+        } else {
+            ScanLog.shared.write("\(reason) format=\(dims.width)x\(dims.height) subtype=\(sub) fps=device-default")
+        }
+        camera.unlockForConfiguration()
+        chosenDeviceFormat = format
+        chosenFormatWidth = Int(dims.width)
+        chosenFormatHeight = Int(dims.height)
+        chosenFormatSubtype = sub
+        applyVideoOutputSettings(width: Int(dims.width), height: Int(dims.height), subtype: sub)
+        applyPhotoOutputDimensions(from: format)
+    }
+
+    private func applyVideoOutputSettings(width: Int, height: Int, subtype: String) {
+        guard let output = videoDataOutput else { return }
+        let pixelFormat: OSType
+        let lower = subtype.lowercased()
+        if lower == "420v" {
+            pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        } else if lower == "420f" {
+            pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        } else if lower == "yuvs" {
+            pixelFormat = kCVPixelFormatType_422YpCbCr8_yuvs
+        } else {
+            pixelFormat = kCVPixelFormatType_32BGRA
+        }
+        // Request the native format size explicitly so the session cannot silently
+        // emit a 1920x1080 buffer from a 2592x1944 activeFormat.
+        let settings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height
+        ]
+        output.videoSettings = settings
+        ScanLog.shared.write("video output settings \(width)x\(height) pixel_format=\(subtype)")
+    }
+
+    private func applyPhotoOutputDimensions(from format: AVCaptureDevice.Format) {
+        guard photoCaptureSupported else { return }
+        if #available(macOS 13.0, *) {
+            let supported = format.supportedMaxPhotoDimensions
+            let listed = supported.map { "\($0.width)x\($0.height)" }.joined(separator: ",")
+            if let best = largestSupportedPhotoDimensions(for: format) {
+                photoOutput.maxPhotoDimensions = best
+                ScanLog.shared.write("photo output max_photo=\(best.width)x\(best.height) from supported=[\(listed)]")
+            } else {
+                ScanLog.shared.write("photo output supportedMaxPhotoDimensions is empty; stills may match the video frame")
+            }
+        }
+    }
+
+    private func logActiveFormatState(_ camera: AVCaptureDevice, at moment: String) {
+        let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
+        let sub = fourCharCodeString(CMFormatDescriptionGetMediaSubType(camera.activeFormat.formatDescription))
+        ScanLog.shared.write("\(moment) active_format=\(dims.width)x\(dims.height) subtype=\(sub) session_preset=\(session.sessionPreset.rawValue) photo_output=\(photoCaptureSupported)")
+    }
+
+    private func reassertChosenFormatIfNeeded(afterStart: Bool) {
+        guard let camera = captureDevice, let format = chosenDeviceFormat else { return }
+        let dims = formatDimensions(camera.activeFormat)
+        let preset = session.sessionPreset.rawValue
+        let formatChanged = Int(dims.width) != chosenFormatWidth || Int(dims.height) != chosenFormatHeight
+        let presetLooksCapped = preset.lowercased().contains("high") || preset.lowercased().contains("1280") || preset.lowercased().contains("1920")
+        if !formatChanged && !presetLooksCapped { return }
+        ScanLog.shared.write("re-asserting format after \(afterStart ? "startRunning" : "setup"); was \(dims.width)x\(dims.height) preset=\(preset)")
+        session.beginConfiguration()
+        do {
+            try applyDeviceFormat(format, on: camera, reason: "re-assert")
+        } catch {
+            ScanLog.shared.write("re-assert of camera format failed")
+        }
+        session.commitConfiguration()
+        logActiveFormatState(camera, at: afterStart ? "after_reassert" : "after_setup_reassert")
+    }
+
+    private func handleDeliveredResolutionMismatch(deliveredWidth: Int, deliveredHeight: Int) {
+        guard let camera = captureDevice else { return }
+        let raw = estimatedMegabitsPerSecond(width: chosenFormatWidth, height: chosenFormatHeight, fps: desiredFPSForFormatDimensions(Int32(chosenFormatWidth), Int32(chosenFormatHeight)))
+        if resolutionPass == 0 {
+            resolutionPass = 1
+            ScanLog.shared.write("delivered \(deliveredWidth)x\(deliveredHeight) is smaller than chosen \(chosenFormatWidth)x\(chosenFormatHeight); re-asserting format at a USB-2-safe frame rate (est raw \(String(format: "%.0f", raw)) Mbps at the chosen size)")
+            session.beginConfiguration()
+            if let format = chosenDeviceFormat {
+                try? applyDeviceFormat(format, on: camera, reason: "mismatch-reassert")
+            }
+            session.commitConfiguration()
+            deliveredFrameLogged = false
+            return
+        }
+        if resolutionPass == 1 {
+            resolutionPass = 2
+            // Prefer 2560 then 2048, 420v over yuvs, and skip the already-chosen size.
+            func altScore(_ format: AVCaptureDevice.Format) -> (Int, Int) {
+                let d = formatDimensions(format)
+                let tier = (d.width == 2560) ? 2 : 1
+                return (tier, formatIsMJPEG(format) ? 1 : (fourCharCodeString(CMFormatDescriptionGetMediaSubType(format.formatDescription)).lowercased() == "420v" ? 1 : 0))
+            }
+            let usable = camera.formats.filter { format in
+                let d = formatDimensions(format)
+                return (Int(d.width) != chosenFormatWidth || Int(d.height) != chosenFormatHeight)
+                    && ((d.width == 2560 && d.height == 1440) || (d.width == 2048 && d.height == 1536))
+            }
+            if let alt = usable.max(by: { a, b in
+                let sa = altScore(a), sb = altScore(b)
+                if sa.0 != sb.0 { return sa.0 < sb.0 }
+                return sa.1 < sb.1
+            }) {
+                let d = formatDimensions(alt)
+                ScanLog.shared.write("trying fallback format \(d.width)x\(d.height)")
+                session.beginConfiguration()
+                try? applyDeviceFormat(alt, on: camera, reason: "fallback")
+                session.commitConfiguration()
+                deliveredFrameLogged = false
+                return
+            }
+        }
+        ScanLog.shared.write("hardware/USB could not deliver a 2K video frame (got \(deliveredWidth)x\(deliveredHeight); chosen was \(chosenFormatWidth)x\(chosenFormatHeight) subtype=\(chosenFormatSubtype)). Uncompressed 2592x1944 420v exceeds USB 2.0 bandwidth (~480 Mbps). Keeping \(deliveredWidth)x\(deliveredHeight) so preview and capture stay working.")
+    }
+
     private func startCamera() {
         let devices = videoCaptureDevices()
         ScanLog.shared.write("video devices found=\(devices.count)")
@@ -946,36 +1132,32 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             logAllCameraFormats(camera)
             let input = try AVCaptureDeviceInput(device: camera)
             session.beginConfiguration()
-            // .inputPriority is unavailable on macOS. Setting activeFormat below
-            // automatically promotes the session preset to input-priority behavior.
-            // Do not set .high — that lets the session override the chosen format
-            // and can leave 2592x1944 advertised while video only delivers 1920x1080.
+            // .inputPriority is unavailable on macOS. Do not set .high: that lets
+            // the session override a later activeFormat and deliver 1920x1080.
+            // Set activeFormat AFTER inputs and outputs are attached, then lock it.
             guard session.canAddInput(input) else { throw NSError(domain: "Camera", code: 1, userInfo: [NSLocalizedDescriptionKey: "Camera input unavailable"]) }
             session.addInput(input)
 
+            let output = AVCaptureVideoDataOutput()
+            output.alwaysDiscardsLateVideoFrames = true
+            output.setSampleBufferDelegate(self, queue: cameraQueue)
+            guard session.canAddOutput(output) else { throw NSError(domain: "Camera", code: 2, userInfo: [NSLocalizedDescriptionKey: "Video output unavailable"]) }
+            session.addOutput(output)
+            videoDataOutput = output
+
+            photoCaptureSupported = false
+            if session.canAddOutput(photoOutput) {
+                session.addOutput(photoOutput)
+                photoCaptureSupported = true
+                let codecs = photoOutput.availablePhotoCodecTypes.map { $0.rawValue }.joined(separator: ",")
+                ScanLog.shared.write("photo output attached codecs=[\(codecs)]")
+            } else {
+                ScanLog.shared.write("photo output not supported; stills will use the latest video frame")
+            }
+
             if let best = selectBestCaptureFormat(from: camera.formats) {
-                let dims = formatDimensions(best)
-                let sub = fourCharCodeString(CMFormatDescriptionGetMediaSubType(best.formatDescription))
                 do {
-                    try camera.lockForConfiguration()
-                    camera.activeFormat = best
-                    if let range = best.videoSupportedFrameRateRanges.max(by: { $0.maxFrameRate < $1.maxFrameRate }) {
-                        let target = min(range.maxFrameRate, 30.0)
-                        let clamped = max(range.minFrameRate, target)
-                        let duration = CMTimeMake(value: 100, timescale: CMTimeScale(max(1, Int32((clamped * 100).rounded()))))
-                        if duration >= range.minFrameDuration && duration <= range.maxFrameDuration {
-                            camera.activeVideoMinFrameDuration = duration
-                            camera.activeVideoMaxFrameDuration = duration
-                            ScanLog.shared.write("requested frame rate=\(clamped)")
-                        } else {
-                            ScanLog.shared.write("frame rate left at device default; range=\(range.minFrameRate)-\(range.maxFrameRate)")
-                        }
-                    }
-                    camera.unlockForConfiguration()
-                    chosenFormatWidth = Int(dims.width)
-                    chosenFormatHeight = Int(dims.height)
-                    chosenFormatSubtype = sub
-                    ScanLog.shared.write("chosen_camera_format=\(dims.width)x\(dims.height) subtype=\(sub) mjpeg=\(formatIsMJPEG(best))")
+                    try applyDeviceFormat(best, on: camera, reason: "chosen")
                 } catch {
                     ScanLog.shared.write("requested camera format unavailable; using the device default")
                 }
@@ -1001,36 +1183,16 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                         (autoFocus ? "Focus: one-shot autofocus requested" : "Focus: webcam controls unavailable / hardware-managed")
             focusLabel.stringValue = focusInfo + "  |  Debug: ~/BondScans/scan-debug.log"
 
-            let output = AVCaptureVideoDataOutput()
-            output.alwaysDiscardsLateVideoFrames = true
-            output.setSampleBufferDelegate(self, queue: cameraQueue)
-            guard session.canAddOutput(output) else { throw NSError(domain: "Camera", code: 2, userInfo: [NSLocalizedDescriptionKey: "Video output unavailable"]) }
-            session.addOutput(output)
-
-            photoCaptureSupported = false
-            if session.canAddOutput(photoOutput) {
-                session.addOutput(photoOutput)
-                photoCaptureSupported = true
-                var photoLog = "photo output attached"
-                if #available(macOS 13.0, *) {
-                    let max = photoOutput.maxPhotoDimensions
-                    photoLog += " max_photo=\(max.width)x\(max.height)"
-                }
-                let codecs = photoOutput.availablePhotoCodecTypes.map { $0.rawValue }.joined(separator: ",")
-                photoLog += " codecs=[\(codecs)]"
-                ScanLog.shared.write(photoLog)
-            } else {
-                ScanLog.shared.write("photo output not supported; stills will use the latest video frame")
-            }
-
             session.commitConfiguration()
-            let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
-            let sub = fourCharCodeString(CMFormatDescriptionGetMediaSubType(camera.activeFormat.formatDescription))
-            ScanLog.shared.write("active_camera_format=\(dims.width)x\(dims.height) subtype=\(sub) session_preset=\(session.sessionPreset.rawValue) photo_output=\(photoCaptureSupported)")
+            logActiveFormatState(camera, at: "after_commit")
             ScanLog.shared.write("camera=\(camera.localizedName) uid_matches_nexigo=\(camera.localizedName.lowercased().contains("nexigo")) continuous_focus=\(continuous) one_shot_focus=\(autoFocus) focus_point=\(pointSupported)")
             status("Camera: \(camera.localizedName). Finding bond outline or printed text…")
             deliveredFrameLogged = false
-            cameraQueue.async { self.session.startRunning() }
+            resolutionPass = 0
+            cameraQueue.async {
+                self.session.startRunning()
+                self.reassertChosenFormatIfNeeded(afterStart: true)
+            }
         } catch { status("Camera error: \(error.localizedDescription)") }
     }
 
@@ -1043,9 +1205,15 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         guard let cg = ciContext.createCGImage(image, from: image.extent) else { return }
         if !deliveredFrameLogged {
             deliveredFrameLogged = true
+            if let camera = captureDevice {
+                logActiveFormatState(camera, at: "first_frame")
+            }
             ScanLog.shared.write("delivered video frame=\(cg.width)x\(cg.height) chosen_format=\(chosenFormatWidth)x\(chosenFormatHeight) subtype=\(chosenFormatSubtype) photo_output=\(photoCaptureSupported)")
             if cg.width != chosenFormatWidth || cg.height != chosenFormatHeight {
-                ScanLog.shared.write("note: delivered video dimensions differ from activeFormat; still photographs use photo output when available")
+                let width = cg.width, height = cg.height
+                cameraQueue.async { [weak self] in
+                    self?.handleDeliveredResolutionMismatch(deliveredWidth: width, deliveredHeight: height)
+                }
             }
         }
         if now - lastVideoLogAt > 15.0 {
