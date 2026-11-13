@@ -491,6 +491,111 @@ func enrichWithAppleIntelligence(_ record: BondRecord) async -> BondRecord {
 }
 #endif
 
+
+func fourCharCodeString(_ code: FourCharCode) -> String {
+    let bytes: [UInt8] = [
+        UInt8((code >> 24) & 0xff),
+        UInt8((code >> 16) & 0xff),
+        UInt8((code >> 8) & 0xff),
+        UInt8(code & 0xff)
+    ]
+    if let s = String(bytes: bytes, encoding: .ascii),
+       s.unicodeScalars.allSatisfy({ $0.isASCII && $0.value >= 32 && $0.value < 127 }) {
+        return s
+    }
+    return String(format: "0x%08X", code)
+}
+
+func formatIsMJPEG(_ format: AVCaptureDevice.Format) -> Bool {
+    let name = fourCharCodeString(CMFormatDescriptionGetMediaSubType(format.formatDescription)).lowercased()
+    return name == "jpeg" || name == "mjpa" || name == "mjpb" || name == "mjpg"
+}
+
+func formatDimensions(_ format: AVCaptureDevice.Format) -> CMVideoDimensions {
+    return CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+}
+
+func videoCaptureDevices() -> [AVCaptureDevice] {
+    var types: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera]
+    if #available(macOS 14.0, *) {
+        types.append(.external)
+    } else {
+        types.append(AVCaptureDevice.DeviceType(rawValue: "AVCaptureDeviceTypeExternalUnknown"))
+    }
+    let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: .unspecified)
+    return discovery.devices
+}
+
+func selectBestCaptureFormat(from formats: [AVCaptureDevice.Format]) -> AVCaptureDevice.Format? {
+    let usable = formats.filter { format in
+        let d = formatDimensions(format)
+        return d.width >= 1280 && d.height >= 720 && d.width <= 4096 && d.height <= 4096
+    }
+    func score(_ format: AVCaptureDevice.Format) -> (Int, Int, Int) {
+        let d = formatDimensions(format)
+        let pixels = Int(d.width) * Int(d.height)
+        var tier = 1
+        if d.width == 2592 && d.height == 1944 { tier = 3 }
+        else if d.width == 2560 && d.height == 1440 { tier = 2 }
+        let mjpeg = formatIsMJPEG(format) ? 1 : 0
+        return (tier, pixels, mjpeg)
+    }
+    return usable.max { a, b in
+        let sa = score(a), sb = score(b)
+        if sa.0 != sb.0 { return sa.0 < sb.0 }
+        if sa.1 != sb.1 { return sa.1 < sb.1 }
+        return sa.2 < sb.2
+    }
+}
+
+func logAllCameraFormats(_ camera: AVCaptureDevice) {
+    for (index, format) in camera.formats.enumerated() {
+        let d = formatDimensions(format)
+        let sub = fourCharCodeString(CMFormatDescriptionGetMediaSubType(format.formatDescription))
+        let fps = format.videoSupportedFrameRateRanges.map { range in
+            String(format: "%.2f-%.2f", range.minFrameRate, range.maxFrameRate)
+        }.joined(separator: ",")
+        ScanLog.shared.write("camera format[\(index)] \(d.width)x\(d.height) subtype=\(sub) fps=[\(fps)]")
+    }
+}
+
+func logCameraControls(_ camera: AVCaptureDevice) {
+    func modeName(_ mode: AVCaptureDevice.FocusMode) -> String {
+        switch mode {
+        case .locked: return "locked"
+        case .autoFocus: return "autoFocus"
+        case .continuousAutoFocus: return "continuousAutoFocus"
+        @unknown default: return "other"
+        }
+    }
+    func expName(_ mode: AVCaptureDevice.ExposureMode) -> String {
+        switch mode {
+        case .locked: return "locked"
+        case .autoExpose: return "autoExpose"
+        case .continuousAutoExposure: return "continuousAutoExposure"
+        case .custom: return "custom"
+        @unknown default: return "other"
+        }
+    }
+    func wbName(_ mode: AVCaptureDevice.WhiteBalanceMode) -> String {
+        switch mode {
+        case .locked: return "locked"
+        case .autoWhiteBalance: return "autoWhiteBalance"
+        case .continuousAutoWhiteBalance: return "continuousAutoWhiteBalance"
+        @unknown default: return "other"
+        }
+    }
+    let focusModes: [AVCaptureDevice.FocusMode] = [.continuousAutoFocus, .autoFocus, .locked]
+    let expModes: [AVCaptureDevice.ExposureMode] = [.continuousAutoExposure, .autoExpose, .locked, .custom]
+    let wbModes: [AVCaptureDevice.WhiteBalanceMode] = [.continuousAutoWhiteBalance, .autoWhiteBalance, .locked]
+    let focusSupported = focusModes.filter { camera.isFocusModeSupported($0) }.map(modeName).joined(separator: ",")
+    let expSupported = expModes.filter { camera.isExposureModeSupported($0) }.map(expName).joined(separator: ",")
+    let wbSupported = wbModes.filter { camera.isWhiteBalanceModeSupported($0) }.map(wbName).joined(separator: ",")
+    ScanLog.shared.write("focus supported=[\(focusSupported)] current=\(modeName(camera.focusMode)) point_of_interest=\(camera.isFocusPointOfInterestSupported)")
+    ScanLog.shared.write("exposure supported=[\(expSupported)] current=\(expName(camera.exposureMode)) point_of_interest=\(camera.isExposurePointOfInterestSupported)")
+    ScanLog.shared.write("white_balance supported=[\(wbSupported)] current=\(wbName(camera.whiteBalanceMode))")
+}
+
 final class PreviewView: NSView {
     let videoLayer = AVCaptureVideoPreviewLayer()
     let guide = CAShapeLayer()
@@ -577,6 +682,12 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var lastDiagnosticAt: TimeInterval = 0
     private var lastVideoLogAt: TimeInterval = 0
     private var session = AVCaptureSession()
+    private let photoOutput = AVCapturePhotoOutput()
+    private var photoCaptureSupported = false
+    private var chosenFormatWidth = 0
+    private var chosenFormatHeight = 0
+    private var chosenFormatSubtype = ""
+    private var deliveredFrameLogged = false
     private var latestImage: CGImage?
     private var records: [BondRecord] = []
     private var isProcessing = false
@@ -795,7 +906,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     private func startCamera() {
-        let devices = AVCaptureDevice.devices(for: .video)
+        let devices = videoCaptureDevices()
         ScanLog.shared.write("video devices found=\(devices.count)")
         guard let camera = devices.first(where: { $0.uniqueID.lowercased().contains("1bcf0b26") || $0.localizedName.lowercased().contains("nexigo") }) ?? devices.first else {
             status("No webcam found. Plug in the NexiGo, then relaunch; you can still import photos.")
@@ -803,50 +914,93 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         }
         do {
             captureDevice = camera
+            logAllCameraFormats(camera)
             let input = try AVCaptureDeviceInput(device: camera)
             session.beginConfiguration()
-            session.sessionPreset = .high
-            // Prefer the NexiGo's full 2K frame resolution when available.
-            let formats = camera.formats.filter { format in
-                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                return dims.width >= 1280 && dims.height >= 720 && dims.width <= 4096 && dims.height <= 2160
-            }
-            if let best = formats.max(by: { a, b in
-                let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
-                let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
-                return Int(da.width) * Int(da.height) < Int(db.width) * Int(db.height)
-            }) {
+            // .inputPriority is unavailable on macOS. Setting activeFormat below
+            // automatically promotes the session preset to input-priority behavior.
+            // Do not set .high — that lets the session override the chosen format
+            // and can leave 2592x1944 advertised while video only delivers 1920x1080.
+            guard session.canAddInput(input) else { throw NSError(domain: "Camera", code: 1, userInfo: [NSLocalizedDescriptionKey: "Camera input unavailable"]) }
+            session.addInput(input)
+
+            if let best = selectBestCaptureFormat(from: camera.formats) {
+                let dims = formatDimensions(best)
+                let sub = fourCharCodeString(CMFormatDescriptionGetMediaSubType(best.formatDescription))
                 do {
                     try camera.lockForConfiguration()
                     camera.activeFormat = best
+                    if let range = best.videoSupportedFrameRateRanges.max(by: { $0.maxFrameRate < $1.maxFrameRate }) {
+                        let target = min(range.maxFrameRate, 30.0)
+                        let clamped = max(range.minFrameRate, target)
+                        let duration = CMTimeMake(value: 100, timescale: CMTimeScale(max(1, Int32((clamped * 100).rounded()))))
+                        if duration >= range.minFrameDuration && duration <= range.maxFrameDuration {
+                            camera.activeVideoMinFrameDuration = duration
+                            camera.activeVideoMaxFrameDuration = duration
+                            ScanLog.shared.write("requested frame rate=\(clamped)")
+                        } else {
+                            ScanLog.shared.write("frame rate left at device default; range=\(range.minFrameRate)-\(range.maxFrameRate)")
+                        }
+                    }
                     camera.unlockForConfiguration()
-                } catch { ScanLog.shared.write("requested camera resolution unavailable; using existing format") }
+                    chosenFormatWidth = Int(dims.width)
+                    chosenFormatHeight = Int(dims.height)
+                    chosenFormatSubtype = sub
+                    ScanLog.shared.write("chosen_camera_format=\(dims.width)x\(dims.height) subtype=\(sub) mjpeg=\(formatIsMJPEG(best))")
+                } catch {
+                    ScanLog.shared.write("requested camera format unavailable; using the device default")
+                }
             }
+
             let continuous = camera.isFocusModeSupported(.continuousAutoFocus)
             let autoFocus = camera.isFocusModeSupported(.autoFocus)
             let pointSupported = camera.isFocusPointOfInterestSupported
+            let continuousExp = camera.isExposureModeSupported(.continuousAutoExposure)
+            let continuousWB = camera.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance)
             do {
                 try camera.lockForConfiguration()
                 if pointSupported { camera.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5) }
                 if continuous { camera.focusMode = .continuousAutoFocus }
                 else if autoFocus { camera.focusMode = .autoFocus }
+                if camera.isExposurePointOfInterestSupported { camera.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5) }
+                if continuousExp { camera.exposureMode = .continuousAutoExposure }
+                if continuousWB { camera.whiteBalanceMode = .continuousAutoWhiteBalance }
                 camera.unlockForConfiguration()
-            } catch { ScanLog.shared.write("could not configure autofocus (camera may manage it internally)") }
+            } catch { ScanLog.shared.write("could not configure autofocus or exposure (camera may manage them internally)") }
+            logCameraControls(camera)
             focusInfo = continuous ? "Focus: continuous autofocus requested" :
                         (autoFocus ? "Focus: one-shot autofocus requested" : "Focus: webcam controls unavailable / hardware-managed")
             focusLabel.stringValue = focusInfo + "  |  Debug: ~/BondScans/scan-debug.log"
-            ScanLog.shared.write("camera=\(camera.localizedName) uid_matches_nexigo=\(camera.localizedName.lowercased().contains("nexigo")) continuous_focus=\(continuous) one_shot_focus=\(autoFocus) focus_point=\(pointSupported)")
-            guard session.canAddInput(input) else { throw NSError(domain: "Camera", code: 1, userInfo: [NSLocalizedDescriptionKey: "Camera input unavailable"]) }
-            session.addInput(input)
+
             let output = AVCaptureVideoDataOutput()
             output.alwaysDiscardsLateVideoFrames = true
             output.setSampleBufferDelegate(self, queue: cameraQueue)
             guard session.canAddOutput(output) else { throw NSError(domain: "Camera", code: 2, userInfo: [NSLocalizedDescriptionKey: "Video output unavailable"]) }
             session.addOutput(output)
+
+            photoCaptureSupported = false
+            if session.canAddOutput(photoOutput) {
+                session.addOutput(photoOutput)
+                photoCaptureSupported = true
+                var photoLog = "photo output attached"
+                if #available(macOS 13.0, *) {
+                    let max = photoOutput.maxPhotoDimensions
+                    photoLog += " max_photo=\(max.width)x\(max.height)"
+                }
+                let codecs = photoOutput.availablePhotoCodecTypes.map { $0.rawValue }.joined(separator: ",")
+                photoLog += " codecs=[\(codecs)]"
+                ScanLog.shared.write(photoLog)
+            } else {
+                ScanLog.shared.write("photo output not supported; stills will use the latest video frame")
+            }
+
             session.commitConfiguration()
             let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
-            ScanLog.shared.write("active_camera_format=\(dims.width)x\(dims.height)")
+            let sub = fourCharCodeString(CMFormatDescriptionGetMediaSubType(camera.activeFormat.formatDescription))
+            ScanLog.shared.write("active_camera_format=\(dims.width)x\(dims.height) subtype=\(sub) session_preset=\(session.sessionPreset.rawValue) photo_output=\(photoCaptureSupported)")
+            ScanLog.shared.write("camera=\(camera.localizedName) uid_matches_nexigo=\(camera.localizedName.lowercased().contains("nexigo")) continuous_focus=\(continuous) one_shot_focus=\(autoFocus) focus_point=\(pointSupported)")
             status("Camera: \(camera.localizedName). Finding bond outline or printed text…")
+            deliveredFrameLogged = false
             cameraQueue.async { self.session.startRunning() }
         } catch { status("Camera error: \(error.localizedDescription)") }
     }
@@ -858,6 +1012,13 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         lastAnalyzeAt = now
         let image = CIImage(cvPixelBuffer: pixel)
         guard let cg = ciContext.createCGImage(image, from: image.extent) else { return }
+        if !deliveredFrameLogged {
+            deliveredFrameLogged = true
+            ScanLog.shared.write("delivered video frame=\(cg.width)x\(cg.height) chosen_format=\(chosenFormatWidth)x\(chosenFormatHeight) subtype=\(chosenFormatSubtype) photo_output=\(photoCaptureSupported)")
+            if cg.width != chosenFormatWidth || cg.height != chosenFormatHeight {
+                ScanLog.shared.write("note: delivered video dimensions differ from activeFormat; still photographs use photo output when available")
+            }
+        }
         if now - lastVideoLogAt > 15.0 {
             ScanLog.shared.write("receiving video frames=\(cg.width)x\(cg.height) auto=\(automatic)")
             lastVideoLogAt = now
