@@ -308,30 +308,50 @@ func requiredFieldIsConfident(_ record: BondRecord, key: String, value: String) 
     return false
 }
 
+func acceptedFaceValue(_ value: String) -> Bool {
+    // This batch is $25, $50, and $100 only. Other extracted amounts stay
+    // in the record but are not enough for a green status.
+    return ["25", "50", "100"].contains(value)
+}
+
 func requiredFieldsComplete(_ record: BondRecord) -> Bool {
     return requiredFieldIsConfident(record, key: "serial", value: record.serial)
-        && requiredFieldIsConfident(record, key: "series", value: record.series)
-        && requiredFieldIsConfident(record, key: "issueDate", value: record.issueMonth)
-        && requiredFieldIsConfident(record, key: "issueDate", value: record.issueYear)
         && requiredFieldIsConfident(record, key: "denomination", value: record.denomination)
+        && acceptedFaceValue(record.denomination)
 }
 
 func requiredFieldsMissing(_ record: BondRecord) -> [String] {
     var missing: [String] = []
     if !requiredFieldIsConfident(record, key: "serial", value: record.serial) { missing.append("serial") }
-    if !requiredFieldIsConfident(record, key: "series", value: record.series) { missing.append("series") }
-    if !requiredFieldIsConfident(record, key: "issueDate", value: record.issueMonth)
-        || !requiredFieldIsConfident(record, key: "issueDate", value: record.issueYear) {
-        missing.append("issue date")
+    if !requiredFieldIsConfident(record, key: "denomination", value: record.denomination)
+        || !acceptedFaceValue(record.denomination) {
+        missing.append("face value")
     }
-    if !requiredFieldIsConfident(record, key: "denomination", value: record.denomination) { missing.append("face value") }
     return missing
 }
 
-/// Green / verified only when serial, series, issue month+year, and face value
-/// all pass validation with high confidence (agreement for face value; exact
-/// serial pattern). An uncertain amount or serial is REVIEW, never green.
+/// Date confidence for the CSV. An uncertain or missing date never blocks green.
+func dateCheck(for record: BondRecord, among records: [BondRecord]) -> String {
+    if record.issueMonth.isEmpty || record.issueYear.isEmpty { return "missing" }
+    let high = fieldConfidenceIsHigh(record, "issueDate")
+    let recent = recentScanIssueDates(before: record.capturedAt, among: records.filter { $0.id != record.id })
+    let unambiguous = high && (record.fieldSource?["issueDate"] ?? "").contains("agree")
+    if sequenceInconsistencyNote(month: record.issueMonth, year: record.issueYear,
+                                 recent: recent, unambiguous: unambiguous) != nil {
+        return "uncertain"
+    }
+    return high ? "ok" : "uncertain"
+}
+
+/// Green when the serial is a high-confidence Series E/EE/I pattern and the
+/// face value is a known $25, $50, or $100. An uncertain or missing issue
+/// date is recorded in date_check and does not block OK. REVIEW only when
+/// the serial or amount is missing or uncertain. PROCESSING and DUPLICATE
+/// (and any explicit failure status) are left unchanged.
 func applyRequiredStatus(_ record: inout BondRecord) {
+    if record.status == "PROCESSING" || record.status == "DUPLICATE" { return }
+    let upper = record.status.uppercased()
+    if upper == "FAILED" || upper == "FAIL" || upper == "ERROR" || upper == "FAILURE" { return }
     let missing = requiredFieldsMissing(record)
     if missing.isEmpty {
         record.status = "OK"
@@ -1728,14 +1748,29 @@ func bondTextSignal(_ lines: [OCRLine]) -> Bool {
 
 // Cheap OCR reconnaissance that runs even if paper edges cannot be detected.
 // It tries upside-down and portrait camera views before deciding if a bond is visible.
-func probeForBond(_ image: CGImage) -> (score: Int, lines: Int, found: Bool) {
-    var best = (score: -1, lines: 0, found: false)
+func highConfidenceSerial(from lines: [OCRLine]) -> String {
+    let joined = lines.map { $0.text }.joined(separator: " ")
+    let compact = lines.map { cleanAlnum($0.text) }.joined()
+    let reading = validatedSerial(joined)
+    if reading.isHigh { return reading.value }
+    let compactReading = validatedSerial(compact)
+    if compactReading.isHigh { return compactReading.value }
+    return ""
+}
+
+func probeForBond(_ image: CGImage) -> (score: Int, lines: Int, found: Bool, serial: String) {
+    var best = (score: -1, lines: 0, found: false, serial: "")
     for orientation in [1, 3, 6, 8] {
         guard let candidate = rotateCG(image, exif: orientation) else { continue }
         let lines = textOCR(candidate, fast: true)
         let signal = bondTextSignal(lines)
         let score = orientationScore(lines) + (signal ? 25 : 0)
-        if score > best.score { best = (score, lines.count, signal) }
+        let serial = highConfidenceSerial(from: lines)
+        if score > best.score {
+            best = (score, lines.count, signal, serial)
+        } else if best.serial.isEmpty && !serial.isEmpty {
+            best.serial = serial
+        }
     }
     return best
 }
@@ -1877,17 +1912,7 @@ func scanImage(_ image: CGImage, focusIssueDate: Bool = false, recentIssueDates:
         }
     }
     applyRequiredStatus(&result)
-    if let note = sequenceInconsistencyNote(month: result.issueMonth, year: result.issueYear,
-                                            recent: recentIssueDates,
-                                            unambiguous: fieldConfidenceIsHigh(result, "issueDate")
-                                                && (result.fieldSource?["issueDate"] ?? "").contains("agree")) {
-        result.status = "REVIEW"
-        if result.notes.isEmpty {
-            result.notes = note
-        } else if !result.notes.contains(note) {
-            result.notes = result.notes + " " + note
-        }
-    }
+    // Sequence disagreement is recorded in date_check only; it never blocks green.
     let recognized = bondTextSignal(finalLines) || bondTextSignal(textOCR(bestImage, fast: true))
     ScanLog.shared.write("scan candidates=\(candidates.count) best=\(bestLabel) hunt_score=\(bestScore) final_score=\(finalScore) ocr_lines=\(finalLines.count) rectified=\(bestRectified) bond_text=\(recognized) fields_complete=\(requiredFieldsComplete(result)) denom=\(result.denomination.isEmpty ? "none" : "set")")
     return OCRResult(record: result, image: selectedImage, originalImage: image,
@@ -1907,11 +1932,11 @@ func writeRecords(_ records: [BondRecord]) throws {
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let jsonData = try encoder.encode(records)
     try jsonData.write(to: recordsURL, options: .atomic)
-    let cols = ["id", "captured_at", "series", "serial_number", "issue_month", "issue_year",
+    let cols = ["id", "captured_at", "series", "serial_number", "issue_month", "issue_year", "date_check",
                 "face_value_usd", "registered_owner", "second_name", "second_role",
                 "address", "tax_id", "issuing_agent", "dating_stamp", "status", "notes", "photo", "source_photo", "raw_ocr"]
     let rows: [[String]] = records.map { r in
-        [r.id, r.capturedAt, r.series, r.serial, r.issueMonth, r.issueYear,
+        [r.id, r.capturedAt, r.series, r.serial, r.issueMonth, r.issueYear, dateCheck(for: r, among: records),
          r.denomination, r.owner, r.secondName, r.secondRole,
          r.address, r.taxID, r.issuingAgent, r.datingStamp,
          r.status, r.notes, r.photo, r.sourcePhoto, r.rawOCR]
@@ -2317,6 +2342,10 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var isProcessing = false
     private var automatic = true
     private var lockedAfterCapture = false
+    /// Normalized serial of the most recently captured bond. Never logged.
+    private var lastCapturedSerial = ""
+    /// True after a photograph is saved and before OCR has reported its serial.
+    private var awaitingSerialFromCapture = false
     private var autoFillRecordId: String?
     private var autoFillAttempts = 0
     private let autoFillMaxAttempts = 4
@@ -2341,6 +2370,11 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             try FileManager.default.createDirectory(at: photosRoot, withIntermediateDirectories: true)
             if FileManager.default.fileExists(atPath: recordsURL.path) {
                 records = try JSONDecoder().decode([BondRecord].self, from: Data(contentsOf: recordsURL))
+            }
+            for i in records.indices { applyRequiredStatus(&records[i]) }
+            if let latest = records.max(by: { $0.capturedAt < $1.capturedAt }) {
+                let serial = normalizeSerial(latest.serial)
+                if !serial.isEmpty { lastCapturedSerial = serial }
             }
             try writeRecords(records)
         } catch {
@@ -2951,6 +2985,26 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 ScanLog.shared.write("ocr hunt: score=\(probe.score) lines=\(probe.lines) bond_signal=\(probe.found) accepted=\(hasBond) still_present=\(stillPresent) rearm_check=\(forRearm)")
                 if forRearm {
                     guard self.lockedAfterCapture else { return }
+                    let viewedSerial = probe.serial
+                    let lastSerial = self.lastCapturedSerial
+                    let sameAsLast = !viewedSerial.isEmpty && !lastSerial.isEmpty
+                        && (serialsMatchForMerge(viewedSerial, lastSerial).exact
+                            || serialsMatchForMerge(viewedSerial, lastSerial).near)
+                    let newBondSerial = !viewedSerial.isEmpty && !sameAsLast
+                    if newBondSerial && !self.awaitingSerialFromCapture && !self.isProcessing {
+                        self.lockedAfterCapture = false
+                        self.noBondChecks = 0
+                        self.huntHits = 0
+                        self.priorRect = nil
+                        self.autoFillRecordId = nil
+                        self.autoFillAttempts = 0
+                        self.autoFillRect = nil
+                        self.autoFillGoneFrames = 0
+                        self.status("New bond detected. Capturing…")
+                        ScanLog.shared.write("re-armed: serial in view is not the last captured bond")
+                        self.performScan(frame, automaticScan: true)
+                        return
+                    }
                     if stillPresent { self.noBondChecks = 0 }
                     else { self.noBondChecks += 1 }
                     if self.noBondChecks >= 2 {
@@ -2965,7 +3019,13 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                         self.status("Ready for next bond. Hunting for edges or text…")
                         ScanLog.shared.write("re-armed after two empty OCR checks")
                     } else if stillPresent {
-                        ScanLog.shared.write("re-arm deferred: bond still in view")
+                        if newBondSerial && self.awaitingSerialFromCapture {
+                            ScanLog.shared.write("re-arm deferred: waiting for captured serial")
+                        } else if sameAsLast {
+                            ScanLog.shared.write("re-arm deferred: same serial still in view")
+                        } else {
+                            ScanLog.shared.write("re-arm deferred: bond still in view")
+                        }
                     }
                     return
                 }
@@ -3086,18 +3146,9 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     private func applySequenceFlag(_ record: inout BondRecord) {
-        let recent = recentScanIssueDates(before: record.capturedAt, among: records.filter { $0.id != record.id })
-        let unambiguous = fieldConfidenceIsHigh(record, "issueDate")
-            && (record.fieldSource?["issueDate"] ?? "").contains("agree")
-        if let note = sequenceInconsistencyNote(month: record.issueMonth, year: record.issueYear,
-                                                recent: recent, unambiguous: unambiguous) {
-            record.status = "REVIEW"
-            if record.notes.isEmpty {
-                record.notes = note
-            } else if !record.notes.contains("previous few scans") && !record.notes.contains("jumps more than a year") {
-                record.notes = record.notes + " " + note
-            }
-        }
+        // Sequence disagreement is surfaced as date_check=uncertain in the CSV.
+        // It must not force REVIEW now that a valid serial and face value are enough for green.
+        applyRequiredStatus(&record)
     }
 
     private func finishCapture(image: CGImage, jpegBytes: Data?, automatic: Bool) {
@@ -3167,6 +3218,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 self.preview.captureFlash(color: .systemBlue)
                 NSSound(named: NSSound.Name("Glass"))?.play()
                 self.lockedAfterCapture = true
+                self.awaitingSerialFromCapture = true
                 self.emptyFrames = 0
                 let waiting = self.ocrPending.count + (self.ocrBusy ? 1 : 0)
                 if waiting == 0 {
@@ -3227,6 +3279,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         updateCount()
         preview.captureFlash(color: .systemRed)
         status(message)
+        awaitingSerialFromCapture = false
         ScanLog.shared.write("ocr failed; original photograph preserved")
     }
 
@@ -3303,6 +3356,9 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         updateCount()
         let serialDisplay = record.serial.isEmpty ? "unreadable serial" : record.serial
         lastLabel.stringValue = "Last: \(record.series) \(serialDisplay) | \(record.issueMonth)/\(record.issueYear) | $\(record.denomination) | \(record.status)"
+        let captured = normalizeSerial(record.serial)
+        if !captured.isEmpty { lastCapturedSerial = captured }
+        awaitingSerialFromCapture = false
         preview.captureFlash(color: flash)
         status(message)
         emptyFrames = 0
@@ -3591,6 +3647,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         autoFillAttempts = 0
         autoFillRect = nil
         autoFillGoneFrames = 0
+        awaitingSerialFromCapture = false
         ScanLog.shared.write("manual re-arm")
         status("Ready for next bond. Hold steady inside the guide.")
     }
@@ -3612,6 +3669,12 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             if FileManager.default.fileExists(atPath: original.path) { try? FileManager.default.trashItem(at: original, resultingItemURL: nil) }
             updateCount()
             lockedAfterCapture = false
+            awaitingSerialFromCapture = false
+            if let previous = records.max(by: { $0.capturedAt < $1.capturedAt }) {
+                lastCapturedSerial = normalizeSerial(previous.serial)
+            } else {
+                lastCapturedSerial = ""
+            }
             status("Undid last scan. Ready.")
         } catch {
             records.append(last)
