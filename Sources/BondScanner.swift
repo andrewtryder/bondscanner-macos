@@ -419,6 +419,24 @@ func jpegData(_ image: CGImage) -> Data? {
     return NSBitmapImageRep(cgImage: image).representation(using: .jpeg, properties: [.compressionFactor: 0.93])
 }
 
+func cgImageFromFile(_ url: URL) -> CGImage? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: true] as CFDictionary) else { return nil }
+    return CGImageSourceCreateImageAtIndex(source, 0, nil)
+}
+
+func cgImageFromData(_ data: Data) -> CGImage? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    return CGImageSourceCreateImageAtIndex(source, 0, nil)
+}
+
+func emptyBondRecord(id: String, capturedAt: String) -> BondRecord {
+    return BondRecord(id: id, capturedAt: capturedAt,
+        series: "", serial: "", issueMonth: "", issueYear: "", denomination: "",
+        owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+        issuingAgent: "", datingStamp: "", status: "PROCESSING",
+        notes: "Photograph saved; OCR pending", photo: "", sourcePhoto: "", rawOCR: "")
+}
+
 #if canImport(FoundationModels)
 @available(macOS 26.0, *)
 func enrichWithAppleIntelligence(_ record: BondRecord) async -> BondRecord {
@@ -663,7 +681,7 @@ final class PreviewView: NSView {
     }
 }
 
-final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
+final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, AVCapturePhotoCaptureDelegate {
     private var window: NSWindow!
     private var preview: PreviewView!
     private var statusLabel: NSTextField!
@@ -702,6 +720,10 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var aiBusy = false
     private let cameraQueue = DispatchQueue(label: "bondscanner.camera", qos: .userInitiated)
     private let analysisQueue = DispatchQueue(label: "bondscanner.analysis", qos: .userInitiated)
+    private let saveQueue = DispatchQueue(label: "bondscanner.save", qos: .userInitiated)
+    private var photoRequests: [Int64: Bool] = [:]
+    private var ocrPending: [(id: String, url: URL, automatic: Bool)] = []
+    private var ocrBusy = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
@@ -716,13 +738,20 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         }
         setupMenu()
         makeWindow()
-        ScanLog.shared.write("app launch: version=2 records=\(records.count) no OCR text or identifiers logged")
+        ScanLog.shared.write("app launch: version=2.1 records=\(records.count) no OCR text or identifiers logged")
         updateCount()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.keyCode == 49 { self?.scanNow(); return nil } // Space
             return event
         }
         requestCameraAccess()
+        for record in records where record.status == "PROCESSING" {
+            let url = outputRoot.appendingPathComponent(record.sourcePhoto)
+            if FileManager.default.fileExists(atPath: url.path) {
+                ScanLog.shared.write("resuming OCR for a photograph saved before the last quit")
+                enqueueOCR(id: record.id, originalURL: url, automatic: false)
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -1111,22 +1140,278 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     @objc private func scanNow() {
-        guard let image = latestImage else { status("No image from camera yet."); return }
-        performScan(image, automaticScan: false)
+        // Manual capture never waits on rectangle detection or an in-flight OCR job.
+        requestPhotograph(automatic: false)
     }
 
     private func performScan(_ image: CGImage, automaticScan: Bool) {
-        guard !isProcessing else { return }
-        isProcessing = true
-        ScanLog.shared.write("scan started mode=\(automaticScan ? "auto" : "manual") frame=\(image.width)x\(image.height)")
-        status("Reading bond with local Apple Vision OCR…")
-        analysisQueue.async { [weak self] in
-            let result = scanImage(image)
+        if automaticScan {
+            guard !isProcessing else { return }
+            requestPhotograph(automatic: true, fallback: image)
+            return
+        }
+        requestPhotograph(automatic: false, fallback: image)
+    }
+
+    private func requestPhotograph(automatic: Bool, fallback: CGImage? = nil) {
+        if photoCaptureSupported, session.isRunning {
+            let settings = AVCapturePhotoSettings()
+            if #available(macOS 13.0, *) {
+                let max = photoOutput.maxPhotoDimensions
+                if max.width > 0 && max.height > 0 {
+                    settings.maxPhotoDimensions = max
+                }
+            }
+            photoRequests[settings.uniqueID] = automatic
+            if automatic { isProcessing = true }
+            else { lockedAfterCapture = true }
+            ScanLog.shared.write("photograph requested mode=\(automatic ? "auto" : "manual") via=photoOutput ocr_queue=\(ocrPending.count)")
+            photoOutput.capturePhoto(with: settings, delegate: self)
+            if !automatic {
+                let waiting = ocrPending.count + (ocrBusy ? 1 : 0)
+                status(waiting > 0
+                    ? "Capturing photograph… (\(waiting) still being read)."
+                    : "Capturing full-resolution photograph…")
+            }
+            return
+        }
+        let image = fallback ?? latestImage
+        guard let image = image else {
+            if automatic { isProcessing = false }
+            else { status("No image from camera yet.") }
+            return
+        }
+        if automatic { isProcessing = true }
+        else { lockedAfterCapture = true }
+        ScanLog.shared.write("photograph requested mode=\(automatic ? "auto" : "manual") via=videoFrame frame=\(image.width)x\(image.height)")
+        finishCapture(image: image, jpegBytes: nil, automatic: automatic)
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        let uniqueID = photo.resolvedSettings.uniqueID
+        let dims = photo.resolvedSettings.photoDimensions
+        let failure = error
+        let jpeg = (failure == nil) ? photo.fileDataRepresentation() : nil
+        let cg = (failure == nil) ? photo.cgImageRepresentation() : nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let automatic = self.photoRequests.removeValue(forKey: uniqueID) ?? false
+            if failure != nil {
+                ScanLog.shared.write("photo output failed; falling back to video frame")
+                if let frame = self.latestImage {
+                    self.finishCapture(image: frame, jpegBytes: nil, automatic: automatic)
+                } else {
+                    if automatic { self.isProcessing = false }
+                    else {
+                        self.status("Photograph capture failed and no video frame is available.")
+                        self.preview.captureFlash(color: .systemRed)
+                        NSSound.beep()
+                    }
+                }
+                return
+            }
+            ScanLog.shared.write("photo output captured \(dims.width)x\(dims.height)")
+            let image = cg ?? jpeg.flatMap { cgImageFromData($0) }
+            guard let image = image else {
+                if let frame = self.latestImage {
+                    self.finishCapture(image: frame, jpegBytes: nil, automatic: automatic)
+                } else {
+                    if automatic { self.isProcessing = false }
+                    else {
+                        self.status("Photograph could not be decoded.")
+                        self.preview.captureFlash(color: .systemRed)
+                    }
+                }
+                return
+            }
+            self.finishCapture(image: image, jpegBytes: jpeg, automatic: automatic)
+        }
+    }
+
+    private func finishCapture(image: CGImage, jpegBytes: Data?, automatic: Bool) {
+        if automatic {
+            ScanLog.shared.write("scan started mode=auto frame=\(image.width)x\(image.height)")
+            status("Reading bond with local Apple Vision OCR…")
+            analysisQueue.async { [weak self] in
+                let result = scanImage(image)
+                DispatchQueue.main.async { self?.handleOCR(result, auto: true) }
+            }
+            return
+        }
+        commitOriginalAndEnqueue(image: image, jpegBytes: jpegBytes)
+    }
+
+    private func commitOriginalAndEnqueue(image: CGImage, jpegBytes: Data?) {
+        let id = UUID().uuidString
+        let capturedAt = ISO8601DateFormatter().string(from: Date())
+        let filename = "\(capturedAt.replacingOccurrences(of: ":", with: "-"))_\(id.prefix(8)).jpg"
+        let originalRel = "photos/original_" + filename
+        let processedRel = "photos/" + filename
+        let originalURL = outputRoot.appendingPathComponent(originalRel)
+        let width = image.width
+        let height = image.height
+        saveQueue.async { [weak self] in
+            guard let self = self else { return }
+            guard let data = jpegBytes ?? jpegData(image) else {
+                DispatchQueue.main.async {
+                    self.status("SAVE FAILED: could not encode the photograph.")
+                    self.preview.captureFlash(color: .systemRed)
+                    NSSound.beep()
+                    ScanLog.shared.write("original photograph encode failed")
+                }
+                return
+            }
+            do {
+                try FileManager.default.createDirectory(at: photosRoot, withIntermediateDirectories: true)
+                try data.write(to: originalURL, options: .atomic)
+            } catch {
+                DispatchQueue.main.async {
+                    self.status("SAVE FAILED: \(error.localizedDescription)")
+                    self.preview.captureFlash(color: .systemRed)
+                    NSSound.beep()
+                    ScanLog.shared.write("original photograph save failed")
+                }
+                return
+            }
             DispatchQueue.main.async {
-                self?.handleOCR(result, auto: automaticScan)
+                var record = emptyBondRecord(id: id, capturedAt: capturedAt)
+                record.photo = processedRel
+                record.sourcePhoto = originalRel
+                let previous = self.records
+                self.records.append(record)
+                do { try writeRecords(self.records) }
+                catch {
+                    self.records = previous
+                    self.status("SAVE FAILED: \(error.localizedDescription)")
+                    self.preview.captureFlash(color: .systemRed)
+                    NSSound.beep()
+                    ScanLog.shared.write("original photograph record write failed")
+                    return
+                }
+                self.updateCount()
+                self.preview.captureFlash(color: .systemBlue)
+                NSSound(named: NSSound.Name("Glass"))?.play()
+                self.lockedAfterCapture = true
+                self.emptyFrames = 0
+                let waiting = self.ocrPending.count + (self.ocrBusy ? 1 : 0)
+                if waiting == 0 {
+                    self.status("Photograph saved (\(width)×\(height)). Reading it in the background…")
+                } else {
+                    self.status("Photograph saved (\(width)×\(height)). \(waiting) already in the OCR queue; this one will run next.")
+                }
+                self.lastLabel.stringValue = "Last: photograph saved, OCR pending…"
+                ScanLog.shared.write("original saved status=PROCESSING frame=\(width)x\(height) bytes=\(data.count) total=\(self.records.count) ocr_queue=\(waiting + 1)")
+                self.enqueueOCR(id: id, originalURL: originalURL, automatic: false)
             }
         }
     }
+
+    private func enqueueOCR(id: String, originalURL: URL, automatic: Bool) {
+        ocrPending.append((id: id, url: originalURL, automatic: automatic))
+        pumpOCR()
+    }
+
+    private func pumpOCR() {
+        guard !ocrBusy, let job = ocrPending.first else { return }
+        ocrPending.removeFirst()
+        ocrBusy = true
+        let remaining = ocrPending.count
+        status("Reading the saved photograph with Apple Vision OCR…" + (remaining > 0 ? " (\(remaining) waiting)." : ""))
+        analysisQueue.async { [weak self] in
+            guard let self = self else { return }
+            guard let image = cgImageFromFile(job.url) else {
+                DispatchQueue.main.async {
+                    self.markOCRFailed(id: job.id, message: "Could not read the saved photograph for OCR. The original file is still in the output folder.")
+                    self.ocrBusy = false
+                    self.pumpOCR()
+                }
+                return
+            }
+            ScanLog.shared.write("ocr of saved photograph started frame=\(image.width)x\(image.height)")
+            let result = scanImage(image)
+            DispatchQueue.main.async {
+                self.applyOCR(result, to: job.id)
+                self.ocrBusy = false
+                self.pumpOCR()
+            }
+        }
+    }
+
+    private func markOCRFailed(id: String, message: String) {
+        guard let index = records.firstIndex(where: { $0.id == id }) else { return }
+        records[index].status = "REVIEW"
+        records[index].notes = message
+        let dest = outputRoot.appendingPathComponent(records[index].photo)
+        let src = outputRoot.appendingPathComponent(records[index].sourcePhoto)
+        if !FileManager.default.fileExists(atPath: dest.path) {
+            try? FileManager.default.copyItem(at: src, to: dest)
+        }
+        try? writeRecords(records)
+        updateCount()
+        preview.captureFlash(color: .systemRed)
+        status(message)
+        ScanLog.shared.write("ocr failed; original photograph preserved")
+    }
+
+    private func applyOCR(_ result: OCRResult, to id: String) {
+        guard let index = records.firstIndex(where: { $0.id == id }) else {
+            ScanLog.shared.write("ocr result ignored; record no longer present")
+            return
+        }
+        let existing = records[index]
+        var record = result.record
+        record.id = existing.id
+        record.capturedAt = existing.capturedAt
+        record.sourcePhoto = existing.sourcePhoto
+        record.photo = existing.photo
+
+        if !record.serial.isEmpty && records.contains(where: { $0.id != record.id && $0.serial == record.serial }) {
+            record.status = "REVIEW"
+            if !record.notes.isEmpty { record.notes += " " }
+            record.notes += "Duplicate serial (value not written to the debug log)."
+            ScanLog.shared.write("scan duplicate detected (serial omitted from debug log)")
+        }
+
+        let processedURL = outputRoot.appendingPathComponent(record.photo)
+        let originalURL = outputRoot.appendingPathComponent(record.sourcePhoto)
+        do {
+            if let data = jpegData(result.image) {
+                try data.write(to: processedURL, options: .atomic)
+            } else if FileManager.default.fileExists(atPath: originalURL.path) {
+                if FileManager.default.fileExists(atPath: processedURL.path) { try FileManager.default.removeItem(at: processedURL) }
+                try FileManager.default.copyItem(at: originalURL, to: processedURL)
+            }
+        } catch {
+            ScanLog.shared.write("processed photograph write issue; original is preserved")
+            if !FileManager.default.fileExists(atPath: processedURL.path), FileManager.default.fileExists(atPath: originalURL.path) {
+                try? FileManager.default.copyItem(at: originalURL, to: processedURL)
+            }
+        }
+
+        let previous = records
+        records[index] = record
+        do { try writeRecords(records) }
+        catch {
+            records = previous
+            status("OCR results could not be saved: \(error.localizedDescription)")
+            preview.captureFlash(color: .systemRed)
+            NSSound.beep()
+            ScanLog.shared.write("ocr record write failed; original photograph preserved")
+            return
+        }
+        updateCount()
+        ScanLog.shared.write("scan updated status=\(record.status) fields_nonempty=\([record.series, record.serial, record.issueMonth, record.issueYear, record.denomination, record.owner].filter { !$0.isEmpty }.count) rectified=\(result.rectified) total=\(records.count)")
+        let serialDisplay = record.serial.isEmpty ? "unreadable serial" : record.serial
+        lastLabel.stringValue = "Last: \(record.series) \(serialDisplay) | \(record.issueMonth)/\(record.issueYear) | $\(record.denomination) | \(record.status)"
+        preview.captureFlash(color: record.status == "OK" ? .systemGreen : .systemYellow)
+        status(record.status == "OK"
+            ? "OCR complete — verified. Remove the bond, then show the next one."
+            : "OCR complete — review needed. Remove the bond, then show the next one.")
+        lockedAfterCapture = true
+        emptyFrames = 0
+        enrichRecordInBackground(record)
+    }
+
 
     private func handleOCR(_ result: OCRResult, auto: Bool) {
         var record = result.record
@@ -1217,8 +1502,12 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     private func updateCount() {
-        let reviews = records.filter { $0.status != "OK" }.count
-        countLabel.stringValue = "\(records.count) bonds scanned  •  \(reviews) need review"
+        let processing = records.filter { $0.status == "PROCESSING" }.count
+        let reviews = records.filter { $0.status != "OK" && $0.status != "PROCESSING" }.count
+        let verified = records.filter { $0.status == "OK" }.count
+        var text = "\(records.count) captured  •  \(verified) verified  •  \(reviews) need review"
+        if processing > 0 { text += "  •  \(processing) reading" }
+        countLabel.stringValue = text
     }
 
     @objc private func toggleAuto() {
@@ -1280,24 +1569,21 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private func importFiles(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
         status("Importing \(urls.count) photos…")
+        // Save each original immediately, then let the shared OCR queue process them.
         func next(_ index: Int) {
-            guard index < urls.count else { self.status("Photo import finished. Open output folder to review bonds.csv."); return }
+            guard index < urls.count else {
+                self.status("Import finished. Photographs are saved; OCR continues in the background.")
+                return
+            }
             let url = urls[index]
-            self.analysisQueue.async { [weak self] in
+            self.saveQueue.async { [weak self] in
                 guard let self = self else { return }
-                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                      let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                guard let image = cgImageFromFile(url) else {
                     DispatchQueue.main.async { next(index + 1) }
                     return
                 }
-                let result = scanImage(image)
                 DispatchQueue.main.async {
-                    if self.isProcessing {
-                        self.status("Scanner busy; import canceled. Try again.")
-                        return
-                    }
-                    self.isProcessing = true
-                    self.handleOCR(result, auto: false)
+                    self.commitOriginalAndEnqueue(image: image, jpegBytes: nil)
                     next(index + 1)
                 }
             }
