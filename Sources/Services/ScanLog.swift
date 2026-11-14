@@ -4,8 +4,10 @@ import Foundation
 final class ScanLog {
     static let shared = ScanLog()
     private let lock = NSLock()
+    var isEnabled: Bool = true
 
     func write(_ event: String) {
+        guard isEnabled else { return }
         lock.lock()
         defer { lock.unlock() }
         try? FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)

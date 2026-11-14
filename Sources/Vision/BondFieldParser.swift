@@ -20,12 +20,15 @@ func normalizeSerial(_ raw: String) -> String {
     let upper = raw.uppercased().filter { $0.isLetter || $0.isNumber }
     guard !upper.isEmpty else { return "" }
     var chars = Array(upper)
-    var start = 0
-    while start < chars.count && chars[start].isLetter { start += 1 }
+    // A standard US savings bond serial has a single leading prefix letter.
+    // If the first character is a letter, start numeric body at index 1 so any 'O' in the numeric body is converted to '0'.
+    let start = chars[0].isLetter ? 1 : 0
     var end = chars.count
     if end > start && chars[end - 1] == "E" {
         end -= 1
         if end > start && chars[end - 1] == "E" { end -= 1 }
+    } else if end > start && chars[end - 1] == "I" {
+        end -= 1
     }
     if start < end {
         for i in start..<end where chars[i] == "O" { chars[i] = "0" }
@@ -242,18 +245,40 @@ func applyRequiredStatus(_ record: inout BondRecord) {
     let upper = record.status.uppercased()
     if upper == "FAILED" || upper == "FAIL" || upper == "ERROR" || upper == "FAILURE" { return }
     let missing = requiredFieldsMissing(record)
+
+    // Evidence-based bond validation
+    let validation = BondValidationRules.validateBond(record: record)
+    record.validationWarnings = validation.warnings.isEmpty ? nil : validation.warnings
+    record.validationErrors = validation.hardErrors.isEmpty ? nil : validation.hardErrors
+
+    if !validation.hardErrors.isEmpty {
+        record.status = "REVIEW"
+        record.notes = "Validation: " + validation.hardErrors.joined(separator: "; ")
+        return
+    }
+
     if missing.isEmpty {
         record.status = "OK"
-        // Keep any informational notes that are not a missing-field warning.
-        if record.notes.hasPrefix("Missing or uncertain:") { record.notes = "" }
+        if !validation.warnings.isEmpty {
+            record.notes = "Warning: " + validation.warnings.joined(separator: "; ")
+        } else if record.notes.hasPrefix("Missing or uncertain:") || record.notes.hasPrefix("Validation:") {
+            record.notes = ""
+        }
     } else {
         record.status = "REVIEW"
         record.notes = "Missing or uncertain: " + missing.joined(separator: ", ")
+        if !validation.warnings.isEmpty {
+            record.notes += " | Warning: " + validation.warnings.joined(separator: "; ")
+        }
     }
 }
 
 func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord, contributingPhoto: String, contributingSource: String, captureId: String) -> [String] {
     var filled: [String] = []
+    let confirmedFields = Set(existing.userConfirmedFields ?? [])
+    func isUserConfirmed(_ key: String) -> Bool {
+        return confirmedFields.contains(key)
+    }
     func incomingHigh(_ key: String) -> Bool {
         return (incoming.fieldConfidence?[key] ?? "") == "high"
     }
@@ -261,6 +286,8 @@ func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord,
         return (existing.fieldConfidence?[key] ?? "") == "high"
     }
     func take(_ key: String, confidenceKey: String? = nil, current: String, incomingValue: String, set: (String) -> Void) {
+        // Requirement 5: Never silently replace user-confirmed values!
+        if isUserConfirmed(key) { return }
         let ckey = confidenceKey ?? key
         let incomingOK = !incomingValue.isEmpty
         let shouldReplaceUncertain = !current.isEmpty && incomingOK && incomingHigh(ckey) && !existingHigh(ckey)

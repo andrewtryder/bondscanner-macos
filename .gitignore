@@ -12,9 +12,12 @@ DerivedData/
 *.xcuserstate
 *.xcuserdatad
 
-# Temporary files, local data & bond photos (NEVER commit scan data)
+# Private Local Fixtures & Reports (NEVER commit real bond photos, manifests, or reports)
+/local-fixtures/
 .tmp-crops/
 tmp/
+
+# Data & image extensions
 *.tgz
 *.tar.gz
 *.zip
@@ -23,6 +26,7 @@ tmp/
 *.png
 *.csv
 *.json
+!local-fixtures.example.json
 
 # OS & Editor
 .DS_Store

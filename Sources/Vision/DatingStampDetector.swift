@@ -17,7 +17,7 @@ func extractIssueDateReading(_ lines: [OCRLine], series: String) -> FieldReading
             for match in matches {
                 guard let r1 = Range(match.range(at: 1), in: text), let r2 = Range(match.range(at: 2), in: text) else { continue }
                 let year = String(text[r2])
-                guard isPlausibleIssueYear(year, series: series) else { continue }
+                guard isPlausibleIssueYear(year, series: "") else { continue }
                 let month: String?
                 if namedMonth {
                     month = monthFromName(String(text[r1]))
@@ -49,7 +49,7 @@ func extractIssueDateReading(_ lines: [OCRLine], series: String) -> FieldReading
         for b in lines {
             if isRulerLikeText(b.text) { continue }
             let year = cleanAlnum(b.text)
-            if !isPlausibleIssueYear(year, series: series) { continue }
+            if !isPlausibleIssueYear(year, series: "") { continue }
             let dx = abs(b.box.midX - a.box.midX), dy = abs(b.box.midY - a.box.midY)
             if (dy < 0.18 && dx < 0.40) || (dx < 0.18 && dy < 0.18) {
                 var score = (a.box.midX > 0.55 ? 3 : 0) + (a.box.midY > 0.50 ? 3 : 0) + 3

@@ -103,12 +103,25 @@ func parseDeterministically(_ lines: [OCRLine]) -> BondRecord {
         issuingAgent: "", datingStamp: "", status: "REVIEW", notes: "",
         photo: "", sourcePhoto: "", rawOCR: full)
 
-    // Serial: accept an exact Series E/EE/I pattern (E allows 8–10 digits).
-    // A letter glued from a neighboring word (e.g. a name ending in S + digits)
-    // is leading junk and is kept only when the remainder itself is exact.
+    if upper.contains("SERIES EE") {
+        record.series = "EE"
+        setFieldReading("series", FieldReading(value: "EE", confidence: "high", source: "text"), on: &record)
+    } else if upper.contains("SERIES E") {
+        record.series = "E"
+        setFieldReading("series", FieldReading(value: "E", confidence: "high", source: "text"), on: &record)
+    } else if upper.contains("SERIES I") {
+        record.series = "I"
+        setFieldReading("series", FieldReading(value: "I", confidence: "high", source: "text"), on: &record)
+    }
+
+    // Serial: multi-pass extraction and candidate ranking
+    var candidateMap: [String: SerialCandidate] = [:]
+    let initialCandidates = SerialCandidateRanker.extractCandidates(from: lines, passName: "deterministic-base", expectedSeries: record.series)
+    SerialCandidateRanker.mergePassCandidates(into: &candidateMap, newCandidates: initialCandidates)
+
     var serialReadings: [(FieldReading, Int)] = []
     for (i, s) in compactLines.enumerated() {
-        let reading = validatedSerial(s, series: "")
+        let reading = validatedSerial(s, series: record.series)
         guard !reading.value.isEmpty else { continue }
         var score = 0
         if reading.isHigh { score += 8 }
@@ -117,31 +130,68 @@ func parseDeterministically(_ lines: [OCRLine]) -> BondRecord {
         if lines[i].box.midX > 0.52 && lines[i].box.midY < 0.38 { score += 4 }
         if lines[i].confidence > 0.5 { score += 1 }
         serialReadings.append((reading, score))
+
+        // Ensure re-tokenizing the same OCR line does not inflate agreement count (Audit Item 6)
+        let norm = reading.value
+        if candidateMap[norm] == nil {
+            let c = SerialCandidate(
+                rawText: lines[i].text,
+                normalized: reading.value,
+                prefix: String(reading.value.prefix(1)),
+                digits: String(reading.value.dropFirst().dropLast(reading.value.hasSuffix("EE") ? 2 : 1)),
+                suffix: reading.value.hasSuffix("EE") ? "EE" : String(reading.value.suffix(1)),
+                box: lines[i].box,
+                sourcePasses: ["deterministic-compact"],
+                visionConfidence: lines[i].confidence,
+                passAgreementCount: 1
+            )
+            candidateMap[norm] = c
+        }
     }
     // Also try the full compact blob so a serial split across short tokens can match.
-    let blobSerial = validatedSerial(compactLines.joined(), series: "")
+    let blobSerial = validatedSerial(compactLines.joined(), series: record.series)
     if blobSerial.isHigh {
         serialReadings.append((blobSerial, 7))
+        let blobNorm = blobSerial.value
+        if candidateMap[blobNorm] == nil {
+            let c = SerialCandidate(
+                rawText: compactLines.joined(),
+                normalized: blobSerial.value,
+                prefix: String(blobSerial.value.prefix(1)),
+                digits: String(blobSerial.value.dropFirst().dropLast(blobSerial.value.hasSuffix("EE") ? 2 : 1)),
+                suffix: blobSerial.value.hasSuffix("EE") ? "EE" : String(blobSerial.value.suffix(1)),
+                box: CGRect.zero,
+                sourcePasses: ["deterministic-blob"],
+                visionConfidence: 0.85,
+                passAgreementCount: 1
+            )
+            candidateMap[blobNorm] = c
+        }
     }
-    if let best = serialReadings.filter({ $0.0.isHigh }).max(by: { $0.1 < $1.1 })
+
+    let preliminaryRanked = SerialCandidateRanker.rankCandidates(Array(candidateMap.values), series: record.series)
+    let preliminaryBest = SerialCandidateRanker.selectBestSerial(from: preliminaryRanked, series: record.series)
+
+    if !preliminaryBest.value.isEmpty {
+        record.serial = preliminaryBest.value
+        setFieldReading("serial", preliminaryBest, on: &record)
+    } else if let best = serialReadings.filter({ $0.0.isHigh }).max(by: { $0.1 < $1.1 })
         ?? serialReadings.max(by: { $0.1 < $1.1 }) {
         record.serial = best.0.value
         setFieldReading("serial", best.0, on: &record)
     }
 
-    if upper.contains("SERIES EE") || record.serial.hasSuffix("EE") {
-        record.series = "EE"
-        setFieldReading("series", FieldReading(value: "EE", confidence: "high",
-                                               source: upper.contains("SERIES EE") ? "text" : "serial-suffix"), on: &record)
-    } else if upper.contains("SERIES E") || (record.serial.hasSuffix("E") && !record.serial.hasSuffix("EE") && fieldConfidenceIsHigh(record, "serial")) {
-        record.series = "E"
-        let src = upper.contains("SERIES E") ? "text" : "serial-suffix"
-        let conf = (upper.contains("SERIES E") || fieldConfidenceIsHigh(record, "serial")) ? "high" : "uncertain"
-        setFieldReading("series", FieldReading(value: "E", confidence: conf, source: src), on: &record)
-    } else if upper.contains("SERIES I") || (record.serial.hasSuffix("I") && fieldConfidenceIsHigh(record, "serial")) {
-        record.series = "I"
-        setFieldReading("series", FieldReading(value: "I", confidence: "high",
-                                               source: upper.contains("SERIES I") ? "text" : "serial-suffix"), on: &record)
+    if record.series.isEmpty {
+        if record.serial.hasSuffix("EE") {
+            record.series = "EE"
+            setFieldReading("series", FieldReading(value: "EE", confidence: "high", source: "serial-suffix"), on: &record)
+        } else if record.serial.hasSuffix("E") && fieldConfidenceIsHigh(record, "serial") {
+            record.series = "E"
+            setFieldReading("series", FieldReading(value: "E", confidence: "high", source: "serial-suffix"), on: &record)
+        } else if record.serial.hasSuffix("I") && fieldConfidenceIsHigh(record, "serial") {
+            record.series = "I"
+            setFieldReading("series", FieldReading(value: "I", confidence: "high", source: "serial-suffix"), on: &record)
+        }
     }
 
     let denom = extractDenominationReading(lines, series: record.series)
@@ -183,10 +233,7 @@ func scanImage(_ image: CGImage, focusIssueDate: Bool = false, recentIssueDates:
     if let cropped = fallbackBondCrop(image) {
         candidates.append((cropped, false, "center"))
     }
-    if candidates.isEmpty {
-        candidates.append((image, false, "full"))
-        ScanLog.shared.write("no bond crop available; using full frame")
-    }
+    candidates.append((image, false, "full"))
 
     var bestImage = image
     var bestScore = -1
@@ -275,9 +322,52 @@ func scanImage(_ image: CGImage, focusIssueDate: Bool = false, recentIssueDates:
             bestLabel += "/issue-date"
         }
     }
+    // Experimental MICR-line recognition on compatible photographs (Requirement 6)
+    let micrAnalysis = MICRLineDetector.detectMICR(
+        in: selectedImage,
+        series: result.series,
+        month: result.issueMonth,
+        year: result.issueYear
+    )
+    if micrAnalysis.micrLineFound {
+        result.micrData = micrAnalysis.maskedSummary
+        ScanLog.shared.write("experimental micr detection: \(micrAnalysis.maskedSummary)")
+    }
+
+    // Multi-pass serial candidate refinement and ranking (Requirements 3 & 4)
+    var multiPassCandidates: [String: SerialCandidate] = [:]
+    let baseCandidates = SerialCandidateRanker.extractCandidates(from: finalLines, passName: "final-lines", expectedSeries: result.series)
+    SerialCandidateRanker.mergePassCandidates(into: &multiPassCandidates, newCandidates: baseCandidates)
+
+    for (idx, corner) in cornerCrops(selectedImage).enumerated() {
+        let source = upscaledImage(corner, scale: 2.0) ?? corner
+        let cLines = textOCR(source, fast: false, alternateCount: 3)
+        let cCands = SerialCandidateRanker.extractCandidates(from: cLines, passName: "corner-crop-\(idx + 1)", expectedSeries: result.series)
+        SerialCandidateRanker.mergePassCandidates(into: &multiPassCandidates, newCandidates: cCands)
+    }
+
+    let rankedSerials = SerialCandidateRanker.rankCandidates(
+        Array(multiPassCandidates.values),
+        series: result.series,
+        denomination: result.denomination,
+        micrDigits: micrAnalysis.extractedSerialDigits
+    )
+    let bestRefinedSerial = SerialCandidateRanker.selectBestSerial(
+        from: rankedSerials,
+        series: result.series,
+        denomination: result.denomination
+    )
+    if !bestRefinedSerial.value.isEmpty {
+        let currentHigh = fieldConfidenceIsHigh(result, "serial")
+        if bestRefinedSerial.isHigh || !currentHigh || result.serial.isEmpty || bestRefinedSerial.source.contains("multi-pass") {
+            result.serial = bestRefinedSerial.value
+            setFieldReading("serial", bestRefinedSerial, on: &result)
+        }
+    }
+
     applyRequiredStatus(&result)
     let recognized = bondTextSignal(finalLines) || bondTextSignal(textOCR(bestImage, fast: true))
-    ScanLog.shared.write("scan candidates=\(candidates.count) best=\(bestLabel) hunt_score=\(bestScore) final_score=\(finalScore) ocr_lines=\(finalLines.count) rectified=\(bestRectified) bond_text=\(recognized) fields_complete=\(requiredFieldsComplete(result)) denom=\(result.denomination.isEmpty ? "none" : "set")")
+    ScanLog.shared.write("scan candidates=\(candidates.count) best=\(bestLabel) hunt_score=\(bestScore) final_score=\(finalScore) ocr_lines=\(finalLines.count) rectified=\(bestRectified) bond_text=\(recognized) fields_complete=\(requiredFieldsComplete(result)) denom=\(result.denomination.isEmpty ? "none" : "set") serial_conf=\(result.fieldConfidence?["serial"] ?? "none")")
     return OCRResult(record: result, image: selectedImage, originalImage: image,
                      huntScore: max(bestScore, finalScore), lineCount: finalLines.count,
                      rectified: bestRectified, bondTextFound: recognized)

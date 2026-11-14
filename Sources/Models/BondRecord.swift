@@ -31,4 +31,12 @@ struct BondRecord: Codable {
     var fieldSource: [String: String]?
     /// Previous extracted values kept when a later confident read corrects a field.
     var previousExtracted: [String: String]?
+    /// Fields explicitly confirmed by user. Never overwritten by automatic OCR passes.
+    var userConfirmedFields: [String]?
+    /// Evidence-based validation warnings (non-fatal historical anomalies or uncertainties).
+    var validationWarnings: [String]?
+    /// Evidence-based validation hard errors (strict statutory / format violations).
+    var validationErrors: [String]?
+    /// Experimental MICR recognition result if available on compatible photographs.
+    var micrData: String?
 }

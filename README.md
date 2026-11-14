@@ -37,17 +37,59 @@ This project uses [XcodeGen](https://github.com/yonaskolb/XcodeGen) to define a 
 
 ### Testing
 
-Run the test suite in Xcode with **Cmd+U** or from the terminal:
+Run the standard unit test suite in Xcode with **Cmd+U** or from the terminal:
 ```bash
 xcodebuild test -project BondScanner.xcodeproj -scheme BondScanner
 ```
 
-### CLI Build
+---
 
-You can also build the application directly via `xcodebuild`:
-```bash
-xcodebuild -project BondScanner.xcodeproj -scheme BondScanner -configuration Debug build
-```
+## Local-Only Private OCR Regression Testing
+
+This repository includes a local-only image regression framework (`Tests/BondScannerTests/PrivateOCRRegressionTests.swift`) designed to evaluate Vision OCR against real bond photographs without committing sensitive financial or personal information.
+
+### Strict Privacy Guarantee
+- The directories `local-fixtures/bonds/` and `local-fixtures/reports/`, along with any `local-fixtures/manifest.json`, are strictly ignored by `.gitignore`.
+- Fixture images, private manifests, and reports remain outside the `Sources/` and `Tests/` directories so XcodeGen will never bundle them into the application.
+- Public CI environments without private fixtures automatically skip these tests cleanly (`XCTSkip`).
+- Test assertion failures never print raw OCR, serial numbers, tax IDs, or owner names to test logs.
+
+### Setting Up Private Fixtures
+
+1. **Place your bond images in `local-fixtures/bonds/`:**
+   Use neutral filenames such as `sample-01.jpg` through `sample-07.jpg`:
+   ```bash
+   mkdir -p local-fixtures/bonds local-fixtures/reports
+   cp /path/to/my-bonds/*.jpg local-fixtures/bonds/
+   ```
+
+2. **Create your private manifest (`local-fixtures/manifest.json`):**
+   Copy the provided public template `local-fixtures.example.json`:
+   ```bash
+   cp local-fixtures.example.json local-fixtures/manifest.json
+   ```
+   Open `local-fixtures/manifest.json` and adjust the ground-truth values (`series`, `denomination`, `serial`, `issueMonth`, `issueYear`, `datingStamp`) to match your physical documents. Any omitted field is treated as "not evaluated".
+
+3. **Verify Git ignores the private fixtures:**
+   Confirm no private files or images are tracked by Git before testing:
+   ```bash
+   git check-ignore -v local-fixtures/bonds/*.jpg
+   git check-ignore -v local-fixtures/manifest.json
+   git ls-files -- local-fixtures/
+   git status --short
+   ```
+   *(Ensure `git ls-files -- local-fixtures/` returns zero output).*
+
+4. **Run the regression tests:**
+   ```bash
+   xcodebuild test -project BondScanner.xcodeproj -scheme BondScanner
+   ```
+
+5. **Review Quality Metrics & Reports:**
+   Each test run writes privacy-safe aggregate metrics to `local-fixtures/reports/`:
+   - `local-fixtures/reports/latest.txt`: Human-readable summary table with accuracy percentages, false high-confidence field warnings, status checks, and timings.
+   - `local-fixtures/reports/latest.json`: Structured machine-readable metrics.
+   - `local-fixtures/reports/report-<timestamp>.txt` / `.json`: Historical runs.
 
 ---
 

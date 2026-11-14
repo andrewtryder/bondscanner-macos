@@ -1,0 +1,176 @@
+[
+  {
+    "datingStamp" : "12 AUG 1966",
+    "denomination" : "25",
+    "expectedConfidence" : {
+      "denomination" : "high",
+      "serial" : "high"
+    },
+    "expectedStatus" : "OK",
+    "filename" : "sample-01.jpg",
+    "id" : "sample-01",
+    "issueMonth" : "07",
+    "issueYear" : "1966",
+    "notes" : "Synthetic example: upside-down orientation, 10-digit Series E serial with high-confidence expected",
+    "scenario" : "$25 Series E, upside-down image",
+    "serial" : "Q0000000000E",
+    "series" : "E"
+  },
+  {
+    "datingStamp" : "24 MAR 1972",
+    "denomination" : "50",
+    "expectedConfidence" : {
+      "denomination" : "high",
+      "serial" : "high"
+    },
+    "expectedStatus" : "OK",
+    "filename" : "sample-02.jpg",
+    "id" : "sample-02",
+    "issueMonth" : "03",
+    "issueYear" : "1972",
+    "notes" : "Synthetic example: upside-down 9-digit Series E serial",
+    "scenario" : "$50 Series E, upside-down image",
+    "serial" : "L000000000E",
+    "series" : "E"
+  },
+  {
+    "denomination" : "100",
+    "expectedConfidence" : {
+      "denomination" : "high",
+      "serial" : "high"
+    },
+    "expectedStatus" : "OK",
+    "filename" : "sample-03.jpg",
+    "id" : "sample-03",
+    "issueMonth" : "11",
+    "issueYear" : "1975",
+    "notes" : "Synthetic example: standard landscape orientation, clear serial",
+    "scenario" : "$100 Series E, landscape image",
+    "serial" : "C000000000E",
+    "series" : "E"
+  },
+  {
+    "denomination" : "100",
+    "expectedConfidence" : {
+      "serial" : "high"
+    },
+    "expectedStatus" : "OK",
+    "filename" : "sample-04.jpg",
+    "id" : "sample-04",
+    "issueMonth" : "05",
+    "issueYear" : "1978",
+    "notes" : "Synthetic example: $100 Series E clear serial",
+    "scenario" : "$100 Series E, landscape image",
+    "serial" : "C000000001E",
+    "series" : "E"
+  },
+  {
+    "denomination" : "100",
+    "expectedConfidence" : {
+      "denomination" : "high",
+      "serial" : "high"
+    },
+    "expectedStatus" : "OK",
+    "filename" : "sample-05.jpg",
+    "id" : "sample-05",
+    "issueMonth" : "08",
+    "issueYear" : "1992",
+    "notes" : "Synthetic example: Series EE 10-digit serial",
+    "scenario" : "$100 Series EE, landscape image",
+    "serial" : "C0000000000EE",
+    "series" : "EE"
+  },
+  {
+    "denomination" : "100",
+    "expectedConfidence" : {
+      "serial" : "high"
+    },
+    "expectedStatus" : "OK",
+    "filename" : "sample-06.jpg",
+    "id" : "sample-06",
+    "issueMonth" : "10",
+    "issueYear" : "1995",
+    "notes" : "Synthetic example: Series EE with stamp",
+    "scenario" : "$100 Series EE with dating stamp",
+    "serial" : "C0000000001EE",
+    "series" : "EE"
+  },
+  {
+    "denomination" : "100",
+    "expectedConfidence" : {
+      "denomination" : "high",
+      "serial" : "high"
+    },
+    "expectedStatus" : "OK",
+    "filename" : "sample-07.jpg",
+    "id" : "sample-07",
+    "issueMonth" : "04",
+    "issueYear" : "1999",
+    "notes" : "Synthetic example: standard landscape orientation Series EE",
+    "scenario" : "$100 Series EE, landscape image",
+    "serial" : "C0000000002EE",
+    "series" : "EE"
+  },
+  {
+    "denomination" : "100",
+    "expectedStatus" : "REVIEW",
+    "filename" : "sample-neg-01.jpg",
+    "id" : "sample-neg-01",
+    "issueMonth" : "05",
+    "issueYear" : "1972",
+    "notes" : "Series E requires suffix E. Serial ending in EE must be flagged for REVIEW",
+    "scenario" : "Negative: Series E bond with invalid EE serial suffix",
+    "series" : "E"
+  },
+  {
+    "denomination" : "100",
+    "expectedStatus" : "REVIEW",
+    "filename" : "sample-neg-02.jpg",
+    "id" : "sample-neg-02",
+    "issueMonth" : "04",
+    "issueYear" : "1974",
+    "notes" : "Series EE was introduced in 1980. Issue date 1974 violates historical offering era",
+    "scenario" : "Negative: Series EE bond with impossible pre-1980 issue year (1974)",
+    "serial" : "C0000000000EE",
+    "series" : "EE"
+  },
+  {
+    "denomination" : "100",
+    "expectedStatus" : "REVIEW",
+    "filename" : "sample-neg-03.jpg",
+    "id" : "sample-neg-03",
+    "issueMonth" : "08",
+    "issueYear" : "1994",
+    "notes" : "Missing digits are never invented. Truncated serial must fail syntactic validation",
+    "scenario" : "Negative: Truncated 7-digit serial on Series EE",
+    "series" : "EE"
+  },
+  {
+    "denomination" : "50",
+    "expectedStatus" : "OK",
+    "filename" : "sample-amb-01.jpg",
+    "id" : "sample-amb-01",
+    "issueMonth" : "06",
+    "issueYear" : "1993",
+    "notes" : "Prefix\/denomination inconsistency warning; non-fatal historical anomaly flagged for REVIEW",
+    "scenario" : "Ambiguous: Prefix C ($100 expected) on $50 denomination",
+    "serial" : "C0000000000EE",
+    "series" : "EE"
+  },
+  {
+    "denomination" : "100",
+    "expectedConfidence" : {
+      "denomination" : "high",
+      "serial" : "high"
+    },
+    "expectedStatus" : "OK",
+    "filename" : "sample-amb-02.jpg",
+    "id" : "sample-amb-02",
+    "issueMonth" : "05",
+    "issueYear" : "1990",
+    "notes" : "Validates independent bottom-band MICR line routing number (000090007) and serial corroboration",
+    "scenario" : "Experimental MICR: Post-March 1985 Series EE with machine-readable bottom clear band",
+    "serial" : "C0000000000EE",
+    "series" : "EE"
+  }
+]
