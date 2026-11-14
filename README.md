@@ -20,11 +20,9 @@ All processing occurs 100% locally on your Mac. No images, personal names, tax I
 
 ## Building and Running
 
-You can build and run Bond Scanner either via Xcode or directly from the Terminal.
+This project uses [XcodeGen](https://github.com/yonaskolb/XcodeGen) to define a clean, reproducible Xcode project structure (`project.yml`).
 
-### Option A: Using Xcode (Recommended for Development)
-
-This project uses [XcodeGen](https://github.com/yonaskolb/XcodeGen) to maintain a clean, declarative project configuration (`project.yml`).
+### Quick Start
 
 1. Install XcodeGen (if not already installed):
    ```bash
@@ -34,26 +32,22 @@ This project uses [XcodeGen](https://github.com/yonaskolb/XcodeGen) to maintain 
    ```bash
    xcodegen generate
    ```
-3. Open `BondScanner.xcodeproj` in Xcode and hit **Cmd+R** to run.
+3. Open `BondScanner.xcodeproj` in Xcode and press **Cmd+R** to build and run.
    *The project is pre-configured with local ad-hoc code signing ("Sign to Run Locally"), so no paid Apple Developer team certificate is required.*
 
-4. Run unit tests in Xcode with **Cmd+U** or via the CLI:
-   ```bash
-   xcodebuild test -project BondScanner.xcodeproj -scheme BondScanner
-   ```
+### Testing
 
-### Option B: Using Terminal (No Xcode IDE required)
+Run the test suite in Xcode with **Cmd+U** or from the terminal:
+```bash
+xcodebuild test -project BondScanner.xcodeproj -scheme BondScanner
+```
 
-You only need macOS with Apple Command Line Tools installed (`xcode-select --install`).
+### CLI Build
 
-- **Staging Build**:
-  ```bash
-  ./build.sh --staging
-  ```
-- **Launch Application**:
-  ```bash
-  ./bondscan.command
-  ```
+You can also build the application directly via `xcodebuild`:
+```bash
+xcodebuild -project BondScanner.xcodeproj -scheme BondScanner -configuration Debug build
+```
 
 ---
 
