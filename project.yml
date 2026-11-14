@@ -1,0 +1,78 @@
+name: BondScanner
+options:
+  bundleIdPrefix: local.bondscanner
+  deploymentTarget:
+    macOS: "13.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    SWIFT_VERSION: "5.0"
+    COMBINE_HIDPI_IMAGES: YES
+  configs:
+    Debug:
+      ENABLE_TESTABILITY: YES
+
+targets:
+  BondScanner:
+    type: application
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_NAME: BondScanner
+        PRODUCT_BUNDLE_IDENTIFIER: local.bondscanner.NativeApp
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/ExceptionCatcher.h
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: YES
+        ENABLE_HARDENED_RUNTIME: NO
+    dependencies:
+      - sdk: AppKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: Vision.framework
+      - sdk: CoreImage.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: QuartzCore.framework
+      - sdk: ImageIO.framework
+      - sdk: AudioToolbox.framework
+      - sdk: UniformTypeIdentifiers.framework
+
+  BondScannerTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: Tests
+    dependencies:
+      - target: BondScanner
+    settings:
+      base:
+        PRODUCT_NAME: BondScannerTests
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSCameraUsageDescription: "Camera tests"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: YES
+
+schemes:
+  BondScanner:
+    build:
+      targets:
+        BondScanner: all
+        BondScannerTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - BondScannerTests

@@ -1,9 +1,31 @@
+# Build outputs
 /build/
 /build.log
+/compile-log.txt
+*.o
+*.obj
+
+# Xcode & DerivedData
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+*.xcuserstate
+*.xcuserdatad
+
+# Temporary files, local data & bond photos (NEVER commit scan data)
+.tmp-crops/
+tmp/
+*.tgz
+*.tar.gz
+*.zip
+*.jpg
+*.jpeg
+*.png
+*.csv
+*.json
+
+# OS & Editor
 .DS_Store
 *.swp
 .idea/
-/compile-log.txt
-/build/ocr-harness
-/build/compile-check/
-.tmp-crops/
+.vscode/

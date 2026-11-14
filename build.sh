@@ -26,7 +26,10 @@ if ! xcrun --find swiftc >/dev/null 2>&1; then
 fi
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-SRC="$ROOT/Sources/BondScanner.swift"
+SWIFT_SRCS=()
+while IFS= read -r f; do
+    SWIFT_SRCS+=("$f")
+done < <(find "$ROOT/Sources" -name "*.swift")
 PLIST="$ROOT/Info.plist"
 SUMMARY="$ROOT/compile-log.txt"
 TMPLOG="$(mktemp -t bondscanner-compile)"
@@ -60,8 +63,8 @@ fi
 CONTENTS="$APP/Contents"
 EXEC="$CONTENTS/MacOS/BondScanner"
 
-if [[ ! -f "$SRC" ]]; then
-    echo "Missing source: $SRC" >&2
+if [[ ${#SWIFT_SRCS[@]} -eq 0 ]]; then
+    echo "Missing Swift sources in $ROOT/Sources" >&2
     exit 1
 fi
 if [[ ! -f "$PLIST" ]]; then
@@ -73,7 +76,7 @@ mkdir -p "$CONTENTS/MacOS"
 
 cp "$PLIST" "$CONTENTS/Info.plist"
 
-echo "Building Bond Scanner ($MODE) from $SRC"
+echo "Building Bond Scanner ($MODE) from ${#SWIFT_SRCS[@]} Swift source(s)"
 echo "Output: $APP"
 
 OBJC_SRC="$ROOT/Sources/ExceptionCatcher.m"
@@ -102,7 +105,7 @@ xcrun swiftc -swift-version 5 -o "$EXEC" \
     -framework QuartzCore -framework ImageIO \
     -framework AudioToolbox -framework UniformTypeIdentifiers \
     -framework Foundation \
-    "$SRC" "$OBJC_OBJ" >"$TMPLOG" 2>&1
+    "${SWIFT_SRCS[@]}" "$OBJC_OBJ" >"$TMPLOG" 2>&1
 SWIFTC_STATUS=$?
 set -e
 

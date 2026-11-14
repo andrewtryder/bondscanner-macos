@@ -1,6 +1,6 @@
 #!/bin/bash
 # Bond Scanner project launcher (staging).
-# Builds to ~/BondScannerProject/build/BondScanner.app and opens that copy.
+# Builds to build/BondScanner.app and opens that copy.
 # Does not overwrite ~/Applications/BondScanner.app.
 # Does not extract or overwrite Application Support source.
 # Does not run ~/Downloads/bondscan_v2.command.
