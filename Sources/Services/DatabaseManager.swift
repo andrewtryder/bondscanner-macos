@@ -24,14 +24,31 @@ enum DatabaseError: Error, LocalizedError {
 /// Stores both indexed relational columns (for O(1) duplicate serial lookup and
 /// resumable processing queries) and lossless JSON representations of every record.
 final class DatabaseManager {
+    static let schemaVersion: Int32 = 1
+
     static let shared: DatabaseManager = {
         do {
             return try DatabaseManager(url: databaseURL)
         } catch {
-            fatalError("Failed to initialize shared BondScanner database: \(error.localizedDescription)")
+            ScanLog.shared.write("database primary init failed: \(error.localizedDescription), attempting recovery")
+            if let recovered = try? DatabaseManager.recoverDatabase(at: databaseURL) {
+                return recovered
+            }
+            let fallbackURL = FileManager.default.temporaryDirectory.appendingPathComponent("bonds_fallback_\(UUID().uuidString).sqlite3")
+            if let fallback = try? DatabaseManager(url: fallbackURL) {
+                ScanLog.shared.write("database initialized with temporary fallback: \(fallbackURL.path)")
+                return fallback
+            }
+            let inMemoryURL = URL(fileURLWithPath: ":memory:")
+            if let inMemory = try? DatabaseManager(url: inMemoryURL) {
+                ScanLog.shared.write("database initialized with in-memory fallback")
+                return inMemory
+            }
+            fatalError("Unrecoverable SQLite database failure: \(error.localizedDescription)")
         }
     }()
 
+    private(set) var currentURL: URL
     private var db: OpaquePointer?
     private let lock = NSRecursiveLock()
     private let encoder: JSONEncoder = {
@@ -43,8 +60,11 @@ final class DatabaseManager {
     private let timestampFormatter = ISO8601DateFormatter()
 
     init(url: URL) throws {
-        let dir = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        self.currentURL = url
+        if url.path != ":memory:" {
+            let dir = url.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
 
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
@@ -68,43 +88,83 @@ final class DatabaseManager {
         lock.unlock()
     }
 
+    static func recoverDatabase(at url: URL) throws -> DatabaseManager {
+        let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let corruptBackup = url.deletingLastPathComponent().appendingPathComponent("bonds_corrupt_\(timestamp).sqlite3")
+        let walURL = URL(fileURLWithPath: url.path + "-wal")
+        let shmURL = URL(fileURLWithPath: url.path + "-shm")
+
+        if FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.moveItem(at: url, to: corruptBackup)
+        }
+        if FileManager.default.fileExists(atPath: walURL.path) {
+            let corruptWal = URL(fileURLWithPath: corruptBackup.path + "-wal")
+            try? FileManager.default.moveItem(at: walURL, to: corruptWal)
+        }
+        if FileManager.default.fileExists(atPath: shmURL.path) {
+            let corruptShm = URL(fileURLWithPath: corruptBackup.path + "-shm")
+            try? FileManager.default.moveItem(at: shmURL, to: corruptShm)
+        }
+        ScanLog.shared.write("corrupted database moved to \(corruptBackup.lastPathComponent); initializing clean database")
+        return try DatabaseManager(url: url)
+    }
+
+    func currentSchemaVersion() throws -> Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        let stmt = try prepare("PRAGMA user_version;")
+        defer { sqlite3_finalize(stmt) }
+        let step = sqlite3_step(stmt)
+        guard step == SQLITE_ROW else {
+            throw sqliteError(code: step, context: "currentSchemaVersion")
+        }
+        return sqlite3_column_int(stmt, 0)
+    }
+
     private func configurePragmasAndSchema() throws {
         try execute("PRAGMA journal_mode = WAL;")
         try execute("PRAGMA synchronous = NORMAL;")
         try execute("PRAGMA foreign_keys = ON;")
 
-        let schemaSQL = """
-        CREATE TABLE IF NOT EXISTS bonds (
-            id TEXT PRIMARY KEY,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            captured_at TEXT NOT NULL,
-            series TEXT NOT NULL DEFAULT '',
-            serial_number TEXT NOT NULL DEFAULT '',
-            normalized_serial TEXT NOT NULL DEFAULT '',
-            issue_month TEXT NOT NULL DEFAULT '',
-            issue_year TEXT NOT NULL DEFAULT '',
-            denomination TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT '',
-            registered_owner TEXT NOT NULL DEFAULT '',
-            second_name TEXT NOT NULL DEFAULT '',
-            second_role TEXT NOT NULL DEFAULT '',
-            address TEXT NOT NULL DEFAULT '',
-            tax_id TEXT NOT NULL DEFAULT '',
-            issuing_agent TEXT NOT NULL DEFAULT '',
-            dating_stamp TEXT NOT NULL DEFAULT '',
-            notes TEXT NOT NULL DEFAULT '',
-            photo_path TEXT NOT NULL DEFAULT '',
-            source_photo_path TEXT NOT NULL DEFAULT '',
-            raw_ocr TEXT NOT NULL DEFAULT '',
-            record_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_bonds_normalized_serial ON bonds(normalized_serial);
-        CREATE INDEX IF NOT EXISTS idx_bonds_status ON bonds(status);
-        CREATE INDEX IF NOT EXISTS idx_bonds_captured_at ON bonds(captured_at);
-        CREATE INDEX IF NOT EXISTS idx_bonds_sort_order ON bonds(sort_order);
-        """
-        try execute(schemaSQL)
+        let currentVersion = try currentSchemaVersion()
+        if currentVersion == 0 {
+            let schemaSQL = """
+            CREATE TABLE IF NOT EXISTS bonds (
+                id TEXT PRIMARY KEY,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                captured_at TEXT NOT NULL,
+                series TEXT NOT NULL DEFAULT '',
+                serial_number TEXT NOT NULL DEFAULT '',
+                normalized_serial TEXT NOT NULL DEFAULT '',
+                issue_month TEXT NOT NULL DEFAULT '',
+                issue_year TEXT NOT NULL DEFAULT '',
+                denomination TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                registered_owner TEXT NOT NULL DEFAULT '',
+                second_name TEXT NOT NULL DEFAULT '',
+                second_role TEXT NOT NULL DEFAULT '',
+                address TEXT NOT NULL DEFAULT '',
+                tax_id TEXT NOT NULL DEFAULT '',
+                issuing_agent TEXT NOT NULL DEFAULT '',
+                dating_stamp TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                photo_path TEXT NOT NULL DEFAULT '',
+                source_photo_path TEXT NOT NULL DEFAULT '',
+                raw_ocr TEXT NOT NULL DEFAULT '',
+                record_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bonds_normalized_serial ON bonds(normalized_serial);
+            CREATE INDEX IF NOT EXISTS idx_bonds_status ON bonds(status);
+            CREATE INDEX IF NOT EXISTS idx_bonds_captured_at ON bonds(captured_at);
+            CREATE INDEX IF NOT EXISTS idx_bonds_sort_order ON bonds(sort_order);
+            """
+            try execute(schemaSQL)
+            try execute("PRAGMA user_version = \(DatabaseManager.schemaVersion);")
+        } else if currentVersion < DatabaseManager.schemaVersion {
+            // Future schema migrations can be placed here incrementally
+            try execute("PRAGMA user_version = \(DatabaseManager.schemaVersion);")
+        }
     }
 
     private func sqliteError(code: Int32, context: String) -> DatabaseError {
@@ -333,6 +393,82 @@ final class DatabaseManager {
         lock.lock()
         defer { lock.unlock() }
         try deleteRecordInternal(id: id)
+    }
+
+    /// Atomically deletes an old record and updates/upserts a consolidated record within
+    /// a single SQLite transaction. Either both changes commit, or all roll back.
+    func atomicMerge(deleteId: String, updatedRecord: BondRecord, sortOrder: Int? = nil) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try execute("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            try deleteRecordInternal(id: deleteId)
+            try upsertRecordInternal(updatedRecord, sortOrder: sortOrder)
+            try execute("COMMIT;")
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Creates an atomic online backup of the SQLite database to `destinationURL`.
+    func backupDatabase(to destinationURL: URL) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        let destDir = destinationURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
+        }
+        let escapedPath = destinationURL.path.replacingOccurrences(of: "'", with: "''")
+        try execute("VACUUM INTO '\(escapedPath)';")
+    }
+
+    /// Restores the database from a verified backup file at `backupURL`.
+    func restoreDatabase(from backupURL: URL) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard FileManager.default.fileExists(atPath: backupURL.path) else {
+            throw DatabaseError.statementFailed("Backup file does not exist at \(backupURL.path)")
+        }
+
+        // Verify the backup can be read as a valid database
+        var testHandle: OpaquePointer?
+        let rc = sqlite3_open_v2(backupURL.path, &testHandle, SQLITE_OPEN_READONLY, nil)
+        guard rc == SQLITE_OK, let testDb = testHandle else {
+            if let testHandle = testHandle { sqlite3_close_v2(testHandle) }
+            throw DatabaseError.openFailed("Invalid backup file at \(backupURL.path)")
+        }
+        sqlite3_close_v2(testDb)
+
+        // Close current connection
+        if let currentDb = db {
+            sqlite3_close_v2(currentDb)
+            self.db = nil
+        }
+
+        let walURL = URL(fileURLWithPath: currentURL.path + "-wal")
+        let shmURL = URL(fileURLWithPath: currentURL.path + "-shm")
+        try? FileManager.default.removeItem(at: walURL)
+        try? FileManager.default.removeItem(at: shmURL)
+        if FileManager.default.fileExists(atPath: currentURL.path) {
+            try FileManager.default.removeItem(at: currentURL)
+        }
+
+        try FileManager.default.copyItem(at: backupURL, to: currentURL)
+
+        // Reopen database
+        var handle: OpaquePointer?
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        let openRc = sqlite3_open_v2(currentURL.path, &handle, flags, nil)
+        guard openRc == SQLITE_OK, let opened = handle else {
+            let msg = handle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "code \(openRc)"
+            if let handle = handle { sqlite3_close_v2(handle) }
+            throw DatabaseError.openFailed(msg)
+        }
+        self.db = opened
+        try configurePragmasAndSchema()
     }
 
     func findRecordsByNormalizedSerial(_ rawSerial: String, excludingId: String? = nil) throws -> [BondRecord] {

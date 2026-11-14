@@ -140,6 +140,108 @@ func computeAutoContrastParameters(_ image: CGImage, region: CGRect? = nil) -> (
     return (contrast, brightness)
 }
 
+struct ImageQualityReport {
+    let sharpnessScore: Float
+    let meanLuminance: Float
+    let dynamicRange: Float
+    let isSharp: Bool
+    let isProperlyExposed: Bool
+    let warning: String?
+
+    var isBlurry: Bool { !isSharp }
+    var isUnderExposed: Bool { meanLuminance < 0.22 }
+    var isOverExposed: Bool { meanLuminance > 0.85 }
+}
+
+func evaluateImageQuality(_ image: CGImage, region: CGRect? = nil) -> ImageQualityReport {
+    let ciImage = CIImage(cgImage: image)
+    let fullExtent = ciImage.extent
+    guard !fullExtent.isEmpty else {
+        return ImageQualityReport(sharpnessScore: 0, meanLuminance: 0.5, dynamicRange: 0, isSharp: false, isProperlyExposed: false, warning: "Empty image")
+    }
+    let sampleExtent = resolvedSampleExtent(for: fullExtent, region: region)
+    let extentVector = CIVector(cgRect: sampleExtent)
+
+    var lAvg: Float = 0.5
+    var lMin: Float = 0.0
+    var lMax: Float = 1.0
+
+    if let minMaxFilter = CIFilter(name: "CIAreaMinMax", parameters: [
+        kCIInputImageKey: ciImage,
+        kCIInputExtentKey: extentVector
+    ]),
+    let minMaxOut = minMaxFilter.outputImage,
+    let avgFilter = CIFilter(name: "CIAreaAverage", parameters: [
+        kCIInputImageKey: ciImage,
+        kCIInputExtentKey: extentVector
+    ]),
+    let avgOut = avgFilter.outputImage {
+        let rgb = CGColorSpaceCreateDeviceRGB()
+        var minMaxBuf = [UInt8](repeating: 0, count: 8)
+        minMaxBuf.withUnsafeMutableBytes { rawPtr in
+            if let base = rawPtr.baseAddress {
+                ciContext.render(minMaxOut, toBitmap: base, rowBytes: 8, bounds: CGRect(x: 0, y: 0, width: 2, height: 1), format: .RGBA8, colorSpace: rgb)
+            }
+        }
+        var avgBuf = [UInt8](repeating: 0, count: 4)
+        avgBuf.withUnsafeMutableBytes { rawPtr in
+            if let base = rawPtr.baseAddress {
+                ciContext.render(avgOut, toBitmap: base, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBA8, colorSpace: rgb)
+            }
+        }
+        lMin = (0.299 * Float(minMaxBuf[0]) + 0.587 * Float(minMaxBuf[1]) + 0.114 * Float(minMaxBuf[2])) / 255.0
+        lMax = (0.299 * Float(minMaxBuf[4]) + 0.587 * Float(minMaxBuf[5]) + 0.114 * Float(minMaxBuf[6])) / 255.0
+        lAvg = (0.299 * Float(avgBuf[0]) + 0.587 * Float(avgBuf[1]) + 0.114 * Float(avgBuf[2])) / 255.0
+    }
+
+    let dynamicRange = max(0, lMax - lMin)
+
+    var sharpness: Float = 0.5
+    if let edgesFilter = CIFilter(name: "CIEdges", parameters: [
+        kCIInputImageKey: ciImage,
+        "inputIntensity": NSNumber(value: 2.0)
+    ]),
+    let edgesOut = edgesFilter.outputImage,
+    let edgeAvgFilter = CIFilter(name: "CIAreaAverage", parameters: [
+        kCIInputImageKey: edgesOut,
+        kCIInputExtentKey: extentVector
+    ]),
+    let edgeAvgOut = edgeAvgFilter.outputImage {
+        var edgeBuf = [UInt8](repeating: 0, count: 4)
+        edgeBuf.withUnsafeMutableBytes { rawPtr in
+            if let base = rawPtr.baseAddress {
+                ciContext.render(edgeAvgOut, toBitmap: base, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
+            }
+        }
+        sharpness = (Float(edgeBuf[0]) + Float(edgeBuf[1]) + Float(edgeBuf[2])) / (3.0 * 255.0)
+    }
+
+    let isSharp = sharpness >= 0.015
+    let isProperlyExposed = lAvg >= 0.18 && lAvg <= 0.88 && dynamicRange >= 0.20
+
+    var warning: String?
+    if !isProperlyExposed {
+        if lAvg < 0.18 {
+            warning = "Lighting too dark - increase illumination"
+        } else if lAvg > 0.88 {
+            warning = "Image washed out - reduce direct glare"
+        } else if dynamicRange < 0.20 {
+            warning = "Low contrast - adjust lighting angle"
+        }
+    } else if !isSharp {
+        warning = "Image blurry - hold camera steady"
+    }
+
+    return ImageQualityReport(
+        sharpnessScore: sharpness,
+        meanLuminance: lAvg,
+        dynamicRange: dynamicRange,
+        isSharp: isSharp,
+        isProperlyExposed: isProperlyExposed,
+        warning: warning
+    )
+}
+
 func autoContrastAdjustedImage(_ image: CGImage, region: CGRect? = nil) -> CGImage? {
     let params = computeAutoContrastParameters(image, region: region)
     let sharpness = EnhancementController.shared.settings.manualSharpness

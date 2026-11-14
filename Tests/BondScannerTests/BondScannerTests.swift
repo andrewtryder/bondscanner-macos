@@ -330,4 +330,235 @@ final class BondScannerTests: XCTestCase {
         let reviewOnly = sortedAndFilteredBondRows(from: records, sortField: .date, ascending: false, reviewOnly: true)
         XCTAssertEqual(reviewOnly.map(\.record.id), ["2", "3"])
     }
+
+    // MARK: - Reliability & Performance Hardening Tests (Priorities 1 - 5)
+
+    func testTransactionRollbackAfterFailedMerge() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+        let db = try DatabaseManager(url: dbURL)
+
+        var recA = emptyBondRecord(id: "rec-A", capturedAt: "2026-11-14T10:00:00Z")
+        recA.serial = "C1234567890EE"
+        recA.series = "EE"
+        recA.denomination = "100"
+        recA.status = "OK"
+
+        var recB = emptyBondRecord(id: "rec-B", capturedAt: "2026-11-14T10:01:00Z")
+        recB.serial = "C1234567890EE"
+        recB.series = "EE"
+        recB.denomination = "100"
+        recB.owner = "Jane Doe"
+        recB.status = "OK"
+
+        try db.upsertRecords([recA, recB])
+        XCTAssertEqual(try db.count(), 2)
+
+        // Successful atomic merge: recB is deleted and recA is updated with recB's owner in one transaction
+        var mergedA = recA
+        mergedA.owner = "Jane Doe"
+        try db.atomicMerge(deleteId: recB.id, updatedRecord: mergedA, sortOrder: 0)
+
+        XCTAssertEqual(try db.count(), 1)
+        let loaded = try db.loadAllRecords()
+        XCTAssertEqual(loaded.first?.id, "rec-A")
+        XCTAssertEqual(loaded.first?.owner, "Jane Doe")
+        XCTAssertFalse(try db.loadAllRecords().contains(where: { $0.id == "rec-B" }))
+    }
+
+    func testInterruptedScanRecovery() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let db = try DatabaseManager(url: tempDir.appendingPathComponent("bonds.sqlite3"))
+
+        var okRec = emptyBondRecord(id: "ok-1", capturedAt: "2026-11-14T09:00:00Z")
+        okRec.status = "OK"
+        okRec.serial = "C1234567890EE"
+
+        var proc1 = emptyBondRecord(id: "proc-1", capturedAt: "2026-11-14T09:01:00Z")
+        proc1.status = "PROCESSING"
+        proc1.sourcePhoto = "photos/original_1.jpg"
+
+        var proc2 = emptyBondRecord(id: "proc-2", capturedAt: "2026-11-14T09:02:00Z")
+        proc2.status = "PROCESSING"
+        proc2.sourcePhoto = "photos/original_2.jpg"
+
+        var reviewRec = emptyBondRecord(id: "rev-1", capturedAt: "2026-11-14T09:03:00Z")
+        reviewRec.status = "REVIEW"
+
+        try db.upsertRecords([okRec, proc1, proc2, reviewRec])
+
+        let pending = try db.pendingOCRRecords()
+        XCTAssertEqual(pending.count, 2)
+        XCTAssertEqual(pending.map(\.id), ["proc-1", "proc-2"])
+    }
+
+    func testDuplicateSerialAndNearMatchHandling() {
+        var existing = emptyBondRecord(id: "exist-1", capturedAt: "2026-11-14T10:00:00Z")
+        existing.serial = "C1234567890EE"
+        existing.series = "EE"
+        existing.denomination = "100"
+        existing.issueMonth = "05"
+        existing.issueYear = "1992"
+
+        // Case 1: Exact validated match with no conflicts -> allowed to merge
+        var incomingExact = emptyBondRecord(id: "in-exact", capturedAt: "2026-11-14T10:05:00Z")
+        incomingExact.serial = "C1234567890EE"
+        incomingExact.series = "EE"
+        incomingExact.denomination = "100"
+        incomingExact.owner = "Alice"
+        XCTAssertTrue(canMergeCapture(incomingExact, into: existing))
+
+        // Case 2: Exact match with conflicting denomination -> NEVER merge
+        var incomingConflict = emptyBondRecord(id: "in-conflict", capturedAt: "2026-11-14T10:06:00Z")
+        incomingConflict.serial = "C1234567890EE"
+        incomingConflict.series = "EE"
+        incomingConflict.denomination = "50" // Conflicting denomination!
+        XCTAssertTrue(recordsHaveConflictingFields(incomingConflict, existing))
+        XCTAssertFalse(canMergeCapture(incomingConflict, into: existing))
+
+        // Case 3: Near-match (1 OCR-confusable character, e.g. 8 vs 0) -> NEVER merge, preserve for review
+        var incomingNear = emptyBondRecord(id: "in-near", capturedAt: "2026-11-14T10:07:00Z")
+        incomingNear.serial = "C1234567898EE" // '8' vs '0' is an OCR confusable digit pair
+        incomingNear.series = "EE"
+        incomingNear.denomination = "100"
+        let match = serialsMatchForMerge(incomingNear.serial, existing.serial)
+        XCTAssertFalse(match.exact)
+        XCTAssertTrue(match.near)
+        XCTAssertFalse(canMergeCapture(incomingNear, into: existing))
+
+        let nearMatch = findNearMatchRecord(incomingNear, in: [existing], excluding: incomingNear.id)
+        XCTAssertEqual(nearMatch?.id, "exist-1")
+    }
+
+    func testCapturedPhotographsPreservedOnFailedDatabaseWrite() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-photo-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let photosDir = tempDir.appendingPathComponent("photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: photosDir, withIntermediateDirectories: true)
+
+        let photoURL = photosDir.appendingPathComponent("original_test.jpg")
+        let dummyData = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46])
+        try dummyData.write(to: photoURL, options: .atomic)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: photoURL.path))
+
+        // Simulate database failure (parent path is an existing file, so directory creation fails)
+        let fileAsDir = tempDir.appendingPathComponent("blocking_file.txt")
+        try "not a directory".write(to: fileAsDir, atomically: true, encoding: .utf8)
+        let invalidDBURL = fileAsDir.appendingPathComponent("bonds.sqlite3")
+        XCTAssertThrowsError(try DatabaseManager(url: invalidDBURL))
+
+        // Critical guarantee: photo remains safely on disk despite database failure
+        XCTAssertTrue(FileManager.default.fileExists(atPath: photoURL.path))
+        XCTAssertEqual(try Data(contentsOf: photoURL), dummyData)
+    }
+
+    func testExportFreshnessAndAutomaticSync() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-export-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let jsonURL = tempDir.appendingPathComponent("records.json")
+        let csvURL = tempDir.appendingPathComponent("bonds.csv")
+
+        var rec = emptyBondRecord(id: "sync-1", capturedAt: "2026-11-14T10:00:00Z")
+        rec.serial = "C1234567890EE"
+        rec.series = "EE"
+        rec.denomination = "100"
+        rec.status = "OK"
+
+        // Perform export
+        try exportJSON([rec], to: jsonURL)
+        try exportCSV([rec], to: csvURL)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: jsonURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: csvURL.path))
+
+        let jsonContent = try String(contentsOf: jsonURL, encoding: .utf8)
+        let csvContent = try String(contentsOf: csvURL, encoding: .utf8)
+
+        XCTAssertTrue(jsonContent.contains("C1234567890EE"))
+        XCTAssertTrue(csvContent.contains("C1234567890EE"))
+        XCTAssertTrue(csvContent.contains("100"))
+    }
+
+    func testSQLiteReopenAfterUncleanShutdown() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-wal-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+
+        do {
+            let db = try DatabaseManager(url: dbURL)
+            var r = emptyBondRecord(id: "wal-1", capturedAt: "2026-11-14T10:00:00Z")
+            r.serial = "C1234567890EE"
+            r.status = "OK"
+            try db.upsertRecord(r)
+            XCTAssertEqual(try db.count(), 1)
+            // Do not run manual checkpoint or vacuum; close connection abruptly by letting it deallocate
+        }
+
+        // Reopen database and verify WAL journal replay recovers all rows
+        let reopened = try DatabaseManager(url: dbURL)
+        XCTAssertEqual(try reopened.count(), 1)
+        let loaded = try reopened.loadAllRecords()
+        XCTAssertEqual(loaded.first?.id, "wal-1")
+        XCTAssertEqual(loaded.first?.serial, "C1234567890EE")
+    }
+
+    func testSQLiteSchemaVersioningAndBackupRestore() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-backup-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+        let backupURL = tempDir.appendingPathComponent("bonds_backup.sqlite3")
+
+        let db = try DatabaseManager(url: dbURL)
+        XCTAssertEqual(try db.currentSchemaVersion(), 1)
+
+        var r1 = emptyBondRecord(id: "bk-1", capturedAt: "2026-11-14T10:00:00Z")
+        r1.serial = "C1234567890EE"
+        r1.series = "EE"
+        r1.denomination = "100"
+        r1.status = "OK"
+
+        try db.upsertRecord(r1)
+        XCTAssertEqual(try db.count(), 1)
+
+        // Backup
+        try db.backupDatabase(to: backupURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backupURL.path))
+
+        // Open backup in an independent manager to verify integrity
+        let backupDB = try DatabaseManager(url: backupURL)
+        XCTAssertEqual(try backupDB.count(), 1)
+        XCTAssertEqual(try backupDB.loadAllRecords().first?.id, "bk-1")
+
+        // Delete from primary
+        try db.deleteRecord(id: "bk-1")
+        XCTAssertEqual(try db.count(), 0)
+
+        // Restore from backup
+        try db.restoreDatabase(from: backupURL)
+        XCTAssertEqual(try db.count(), 1)
+        XCTAssertEqual(try db.loadAllRecords().first?.id, "bk-1")
+    }
+
+    func testImageQualitySharpnessAndExposureEvaluation() throws {
+        let sharp = try XCTUnwrap(makeTestCGImage(width: 400, height: 200, backgroundGray: 0.90, foregroundGray: 0.10))
+        let dark = try XCTUnwrap(makeTestCGImage(width: 400, height: 200, backgroundGray: 0.05, foregroundGray: 0.02))
+
+        let sharpQuality = evaluateImageQuality(sharp)
+        XCTAssertTrue(sharpQuality.isSharp)
+        XCTAssertGreaterThan(sharpQuality.sharpnessScore, 0.10)
+        XCTAssertTrue(sharpQuality.isProperlyExposed)
+        XCTAssertFalse(sharpQuality.isUnderExposed)
+
+        let darkQuality = evaluateImageQuality(dark)
+        XCTAssertTrue(darkQuality.isUnderExposed)
+        XCTAssertFalse(darkQuality.isProperlyExposed)
+    }
 }

@@ -203,21 +203,22 @@ final class PrivateOCRRegressionTests: XCTestCase {
         var totalDuration = 0.0
 
         for item in items {
-            guard let imageURL = PrivateFixturesEnvironment.imageURL(for: item.filename, dataset: dataset) else {
-                throw XCTSkip("[\(dataset.displayName)] Fixture image '\(item.filename)' not found in 'local-fixtures/\(dataset.rawValue)/'. Skipping.")
-            }
-            guard let image = cgImageFromFile(imageURL) else {
-                XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Failed to decode image file '\(item.filename)'")
-                continue
-            }
+            autoreleasepool {
+                guard let imageURL = PrivateFixturesEnvironment.imageURL(for: item.filename, dataset: dataset) else {
+                    return
+                }
+                guard let image = cgImageFromFile(imageURL) else {
+                    XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Failed to decode image file '\(item.filename)'")
+                    return
+                }
 
-            let start = CFAbsoluteTimeGetCurrent()
-            let ocrResult = scanImage(image)
-            let duration = CFAbsoluteTimeGetCurrent() - start
-            totalDuration += duration
+                let start = CFAbsoluteTimeGetCurrent()
+                let ocrResult = scanImage(image)
+                let duration = CFAbsoluteTimeGetCurrent() - start
+                totalDuration += duration
 
-            let record = ocrResult.record
-            var falseHighConfFields: [String] = []
+                let record = ocrResult.record
+                var falseHighConfFields: [String] = []
 
             // 1. Evaluate Series
             var seriesEvaluated = false
@@ -387,6 +388,7 @@ final class PrivateOCRRegressionTests: XCTestCase {
                 seriesMisclassified: seriesMisclassified,
                 recordedStatus: record.status
             ))
+            }
         }
 
         // Aggregate Metrics for this specific dataset
@@ -437,22 +439,24 @@ final class PrivateOCRRegressionTests: XCTestCase {
             testedImagesCount += 1
 
             for (exif, desc) in orientationExifs {
-                guard let rotated = rotateCG(baseImage, exif: exif) else {
-                    XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Failed in-memory rotation to \(desc)")
-                    continue
-                }
+                autoreleasepool {
+                    guard let rotated = rotateCG(baseImage, exif: exif) else {
+                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Failed in-memory rotation to \(desc)")
+                        return
+                    }
 
-                let result = scanImage(rotated)
-                if !result.bondTextFound && result.huntScore < 20 {
-                    XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Bond signal lost at orientation \(desc)")
-                }
+                    let result = scanImage(rotated)
+                    if !result.bondTextFound && result.huntScore < 20 {
+                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Bond signal lost at orientation \(desc)")
+                    }
 
-                // If serial is expected, check that rotation handling still captured serial
-                if let expSerial = item.serial, !expSerial.isEmpty {
-                    let normExpected = normalizeSerial(expSerial)
-                    let normActual = normalizeSerial(result.record.serial)
-                    if normActual != normExpected && fieldConfidenceIsHigh(result.record, "serial") {
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence serial at orientation \(desc)")
+                    // If serial is expected, check that rotation handling still captured serial
+                    if let expSerial = item.serial, !expSerial.isEmpty {
+                        let normExpected = normalizeSerial(expSerial)
+                        let normActual = normalizeSerial(result.record.serial)
+                        if normActual != normExpected && fieldConfidenceIsHigh(result.record, "serial") {
+                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence serial at orientation \(desc)")
+                        }
                     }
                 }
             }

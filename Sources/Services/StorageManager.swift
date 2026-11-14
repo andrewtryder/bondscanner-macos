@@ -45,16 +45,65 @@ func exportJSON(_ records: [BondRecord], to url: URL = recordsURL) throws {
     try jsonData.write(to: url, options: .atomic)
 }
 
+// MARK: - Automatic Mirror Exports (Debounced Live Sync)
+
+private let exportSyncQueue = DispatchQueue(label: "bondscanner.export-sync", qos: .utility)
+private var pendingExportWorkItem: DispatchWorkItem?
+private let exportLock = NSLock()
+
+/// Automatically synchronizes the authoritative record collection to `records.json` and `bonds.csv`.
+/// Uses a short debounce delay to coalesce rapid sequential updates into a single atomic write.
+func scheduleAutomaticExports(records: [BondRecord], delay: TimeInterval = 0.35) {
+    exportLock.lock()
+    defer { exportLock.unlock() }
+    pendingExportWorkItem?.cancel()
+    let snapshot = records
+    let item = DispatchWorkItem {
+        do {
+            try exportJSON(snapshot)
+            try exportCSV(snapshot)
+            ScanLog.shared.write("automatic export synced count=\(snapshot.count)")
+        } catch {
+            ScanLog.shared.write("automatic export failed: \(error.localizedDescription)")
+        }
+    }
+    pendingExportWorkItem = item
+    exportSyncQueue.asyncAfter(deadline: .now() + delay, execute: item)
+}
+
+/// Flushes any pending automatic export synchronously (e.g. before application termination).
+func flushAutomaticExports(records: [BondRecord]) {
+    exportLock.lock()
+    pendingExportWorkItem?.cancel()
+    pendingExportWorkItem = nil
+    exportLock.unlock()
+    do {
+        try exportJSON(records)
+        try exportCSV(records)
+        ScanLog.shared.write("flush export synced count=\(records.count)")
+    } catch {
+        ScanLog.shared.write("flush export failed: \(error.localizedDescription)")
+    }
+}
+
 func saveRecordLive(_ record: BondRecord, allRecords: [BondRecord], sortOrder: Int? = nil) throws {
     try DatabaseManager.shared.upsertRecord(record, sortOrder: sortOrder)
+    scheduleAutomaticExports(records: allRecords)
 }
 
 func deleteRecordLive(id: String, allRecords: [BondRecord]) throws {
     try DatabaseManager.shared.deleteRecord(id: id)
+    scheduleAutomaticExports(records: allRecords)
+}
+
+func mergeRecordLive(deleteId: String, updatedRecord: BondRecord, allRecords: [BondRecord], sortOrder: Int? = nil) throws {
+    try DatabaseManager.shared.atomicMerge(deleteId: deleteId, updatedRecord: updatedRecord, sortOrder: sortOrder)
+    scheduleAutomaticExports(records: allRecords)
 }
 
 func writeRecords(_ records: [BondRecord]) throws {
     try DatabaseManager.shared.upsertRecords(records)
+    scheduleAutomaticExports(records: records)
 }
 
 func jpegData(_ image: CGImage) -> Data? {

@@ -106,12 +106,32 @@ This repository includes a local-only image regression framework (`Tests/BondSca
 
 ## Architecture
 
-- **`Sources/Models/`**: `BondRecord` and OCR parsing types.
-- **`Sources/Vision/`**: OCR extraction algorithms, denomination parsers, and dating stamp detectors.
+- **`Sources/Models/`**: `BondRecord`, schema definitions, and OCR parsing types.
+- **`Sources/Vision/`**: OCR extraction algorithms, denomination parsers, dating stamp detectors, and image quality evaluation.
 - **`Sources/Camera/`**: Camera discovery, format negotiation (4K/1080p), and frame capture.
-- **`Sources/Services/`**: Local persistence (`~/Bondscans/`), CSV sanitizer, and operational logging.
+- **`Sources/Services/`**: SQLite persistence engine (`DatabaseManager`), automated JSON/CSV exporter (`StorageManager`), and operational logging.
 - **`Sources/UI/`**: AppKit preview overlays, window controller, and review table.
-- **`Tests/`**: Unit tests verifying serial number patterns, denominations, and date algorithms without requiring a webcam.
+- **`Tests/`**: Unit tests verifying serial number patterns, denominations, date algorithms, database transactions, and orientation invariance.
+
+---
+
+## Data Integrity, Exports & Backup
+
+### Storage Architecture
+- **Primary Store**: `~/BondScans/bonds.sqlite3` is the authoritative, WAL-backed, crash-resilient SQLite database.
+- **Schema Versioning**: Managed via `PRAGMA user_version` (Version 1) with forward migration support.
+- **Automatic Live Exports**: Every scan capture, edit, merge, or deletion automatically schedules a debounced background export to both `~/BondScans/records.json` and `~/BondScans/bonds.csv`. Exports are synchronously flushed on application termination.
+- **Manual CSV Export**: Users can export a custom CSV snapshot at any time via the toolbar "Export CSV…" button. Formula characters (`=`, `+`, `-`, `@`) are automatically sanitized to prevent CSV injection.
+
+### Photograph Preservation & Duplicate Safety
+- **Zero Data Loss**: High-resolution original photographs (`photos/original_*.jpg`) are written and flushed to disk *before* database records are inserted.
+- **Photo Preservation on DB Failure**: If a database write throws an error, the original photo remains untouched on disk.
+- **Atomic Duplicate Consolidations**: Multi-record merges execute inside an immediate SQLite transaction. Duplicate captures only consolidate when serials are exact validated matches with zero conflicting fields. Near-matches are preserved as separate records for user review. Original photographs are never trashed during duplicate merges.
+
+### Backup and Disaster Recovery
+- **Online Backup**: Consistent point-in-time snapshots can be created safely using SQLite's native `VACUUM INTO` (`DatabaseManager.shared.backupDatabase(to:)`).
+- **Restoration**: Restores verify foreign keys and database integrity before replacing live data.
+- **Self-Healing Initialization**: If SQLite encounters unrecoverable disk corruption, the corrupted database file is safely archived to `~/BondScans_backups/corrupt_<timestamp>.sqlite3`, allowing a fresh database to initialize without crashing the application or losing photos.
 
 ---
 

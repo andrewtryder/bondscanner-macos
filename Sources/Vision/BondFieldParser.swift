@@ -77,25 +77,59 @@ func serialsMatchForMerge(_ incomingRaw: String, _ existingRaw: String) -> (exac
 
 /// Other required fields that both sides actually read must be identical.
 func otherRequiredFieldsAgree(_ incoming: BondRecord, _ existing: BondRecord) -> Bool {
-    func agree(_ a: String, _ b: String) -> Bool {
-        if a.isEmpty || b.isEmpty { return true }
-        return a == b
-    }
-    return agree(incoming.series, existing.series)
-        && agree(incoming.denomination, existing.denomination)
-        && agree(incoming.issueMonth, existing.issueMonth)
-        && agree(incoming.issueYear, existing.issueYear)
+    return !recordsHaveConflictingFields(incoming, existing)
 }
 
-/// A capture may merge into an existing record only when the capture's OWN
-/// serial was read and matches the record's serial exactly, or within a
-/// strict 1-character OCR-confusion tolerance with every other read field
-/// agreeing. "Retry in progress" or "bond still in view" is never enough.
+/// Identifies whether an incoming record is an OCR-confusable near-match with an existing record.
+/// Used to preserve ambiguous captures as separate records for user review rather than auto-merging.
+func findNearMatchRecord(_ incoming: BondRecord, in records: [BondRecord], excluding id: String? = nil) -> BondRecord? {
+    let incomingSerial = normalizeSerial(incoming.serial)
+    guard !incomingSerial.isEmpty, !validatedSerial(incoming.serial, series: incoming.series).value.isEmpty else { return nil }
+    for existing in records {
+        if let id = id, existing.id == id { continue }
+        if existing.id == incoming.id { continue }
+        let existingSerial = normalizeSerial(existing.serial)
+        guard !existingSerial.isEmpty, !validatedSerial(existing.serial, series: existing.series).value.isEmpty else { continue }
+        let match = serialsMatchForMerge(incoming.serial, existing.serial)
+        if match.near {
+            return existing
+        }
+    }
+    return nil
+}
+
+/// Checks whether two records have conflicting non-empty fields.
+func recordsHaveConflictingFields(_ a: BondRecord, _ b: BondRecord) -> Bool {
+    func conflict(_ v1: String, _ v2: String) -> Bool {
+        let t1 = v1.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t2 = v2.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t1.isEmpty || t2.isEmpty { return false }
+        return t1.caseInsensitiveCompare(t2) != .orderedSame
+    }
+    if conflict(a.series, b.series) { return true }
+    if conflict(a.denomination, b.denomination) { return true }
+    if conflict(a.issueMonth, b.issueMonth) { return true }
+    if conflict(a.issueYear, b.issueYear) { return true }
+    if conflict(a.owner, b.owner) { return true }
+    if conflict(a.secondName, b.secondName) { return true }
+    if conflict(a.taxID, b.taxID) { return true }
+    return false
+}
+
+/// A capture may automatically merge into an existing record ONLY for exact,
+/// validated serial matches with no conflicting fields.
+/// OCR-confusable near-matches and conflicting fields are NEVER automatically merged.
 func canMergeCapture(_ incoming: BondRecord, into existing: BondRecord) -> Bool {
     let match = serialsMatchForMerge(incoming.serial, existing.serial)
-    if match.exact { return true }
-    if match.near && otherRequiredFieldsAgree(incoming, existing) { return true }
-    return false
+    guard match.exact else { return false }
+
+    guard !recordsHaveConflictingFields(incoming, existing) else { return false }
+
+    let vIncoming = validatedSerial(incoming.serial, series: incoming.series)
+    let vExisting = validatedSerial(existing.serial, series: existing.series)
+    guard !vIncoming.value.isEmpty && !vExisting.value.isEmpty else { return false }
+
+    return true
 }
 
 func rectangleChangedForScene(_ a: CGRect, _ b: CGRect) -> Bool {
