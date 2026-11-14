@@ -16,11 +16,7 @@ func sanitizeCSV(_ value: String) -> String {
     return "\"" + v.replacingOccurrences(of: "\"", with: "\"\"") + "\""
 }
 
-func writeRecords(_ records: [BondRecord]) throws {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    let jsonData = try encoder.encode(records)
-    try jsonData.write(to: recordsURL, options: .atomic)
+func formatCSV(for records: [BondRecord]) -> String {
     let cols = ["id", "captured_at", "series", "serial_number", "issue_month", "issue_year", "date_check",
                 "face_value_usd", "registered_owner", "second_name", "second_role",
                 "address", "tax_id", "issuing_agent", "dating_stamp", "status", "notes", "photo", "source_photo", "raw_ocr"]
@@ -30,10 +26,35 @@ func writeRecords(_ records: [BondRecord]) throws {
          r.address, r.taxID, r.issuingAgent, r.datingStamp,
          r.status, r.notes, r.photo, r.sourcePhoto, r.rawOCR]
     }
-    let csv = ([cols.map(sanitizeCSV).joined(separator: ",")] + rows.map {
+    return ([cols.map(sanitizeCSV).joined(separator: ",")] + rows.map {
         $0.map(sanitizeCSV).joined(separator: ",")
     }).joined(separator: "\r\n") + "\r\n"
-    try csv.write(to: csvURL, atomically: true, encoding: .utf8)
+}
+
+func exportCSV(_ records: [BondRecord], to url: URL = csvURL) throws {
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let csv = formatCSV(for: records)
+    try csv.write(to: url, atomically: true, encoding: .utf8)
+}
+
+func exportJSON(_ records: [BondRecord], to url: URL = recordsURL) throws {
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let jsonData = try encoder.encode(records)
+    try jsonData.write(to: url, options: .atomic)
+}
+
+func saveRecordLive(_ record: BondRecord, allRecords: [BondRecord], sortOrder: Int? = nil) throws {
+    try DatabaseManager.shared.upsertRecord(record, sortOrder: sortOrder)
+}
+
+func deleteRecordLive(id: String, allRecords: [BondRecord]) throws {
+    try DatabaseManager.shared.deleteRecord(id: id)
+}
+
+func writeRecords(_ records: [BondRecord]) throws {
+    try DatabaseManager.shared.upsertRecords(records)
 }
 
 func jpegData(_ image: CGImage) -> Data? {

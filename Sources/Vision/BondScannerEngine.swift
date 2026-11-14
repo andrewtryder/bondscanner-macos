@@ -81,6 +81,9 @@ func denominationVariantLines(_ image: CGImage) -> [OCRLine] {
     if let faint = adjustedForFaintPrinting(image), let up = upscaledImage(faint, scale: 2.0) {
         lines += textOCR(up, fast: false)
     }
+    if let auto = effectiveEnhancedImage(image, region: nil), let up = upscaledImage(auto, scale: 2.0) {
+        lines += textOCR(up, fast: false)
+    }
     if let band = centerBandCrop(image) {
         let source = upscaledImage(band, scale: 2.2) ?? adjustedForFaintPrinting(band) ?? band
         lines += textOCR(source, fast: false)
@@ -256,6 +259,25 @@ func scanImage(_ image: CGImage, focusIssueDate: Bool = false, recentIssueDates:
     var selectedImage = bestImage
     var finalLines = textOCR(bestImage, fast: false)
     var finalScore = orientationScore(finalLines)
+    let adaptiveImage = effectiveEnhancedImage(bestImage, region: detectBond(bestImage)) ?? autoContrastAdjustedImage(bestImage, region: nil)
+    let adaptiveLines = adaptiveImage.map { textOCR($0, fast: false) } ?? []
+    if let adaptive = adaptiveImage {
+        let adaptiveScore = orientationScore(adaptiveLines)
+        var shouldPromote = adaptiveScore > finalScore
+        if !shouldPromote && adaptiveScore == finalScore {
+            let baseRec = parseDeterministically(finalLines)
+            let adaptRec = parseDeterministically(adaptiveLines)
+            let baseCount = [baseRec.series, baseRec.serial, baseRec.issueMonth, baseRec.issueYear, baseRec.denomination].filter { !$0.isEmpty }.count
+            let adaptCount = [adaptRec.series, adaptRec.serial, adaptRec.issueMonth, adaptRec.issueYear, adaptRec.denomination].filter { !$0.isEmpty }.count
+            shouldPromote = adaptCount > baseCount
+        }
+        if shouldPromote {
+            selectedImage = adaptive
+            finalLines = adaptiveLines
+            finalScore = adaptiveScore
+            bestLabel += "/auto-contrast"
+        }
+    }
     if let enhanced = adjustedForFaintPrinting(bestImage) {
         let enhancedLines = textOCR(enhanced, fast: false)
         let enhancedScore = orientationScore(enhancedLines)
@@ -338,6 +360,10 @@ func scanImage(_ image: CGImage, focusIssueDate: Bool = false, recentIssueDates:
     var multiPassCandidates: [String: SerialCandidate] = [:]
     let baseCandidates = SerialCandidateRanker.extractCandidates(from: finalLines, passName: "final-lines", expectedSeries: result.series)
     SerialCandidateRanker.mergePassCandidates(into: &multiPassCandidates, newCandidates: baseCandidates)
+    if !adaptiveLines.isEmpty {
+        let adaptiveCandidates = SerialCandidateRanker.extractCandidates(from: adaptiveLines, passName: "auto-contrast", expectedSeries: result.series)
+        SerialCandidateRanker.mergePassCandidates(into: &multiPassCandidates, newCandidates: adaptiveCandidates)
+    }
 
     for (idx, corner) in cornerCrops(selectedImage).enumerated() {
         let source = upscaledImage(corner, scale: 2.0) ?? corner

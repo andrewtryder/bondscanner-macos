@@ -20,6 +20,11 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var countLabel: NSTextField!
     private var lastLabel: NSTextField!
     private var autoButton: NSButton!
+    private var fastButton: NSButton!
+    private var drawerButton: NSButton!
+    private var bondsDrawer: BondsDrawerView!
+    private var drawerWidthConstraint: NSLayoutConstraint!
+    private var drawerVisible = true
     private var aiLabel: NSTextField!
     private var focusLabel: NSTextField!
     private var focusInfo = "Focus: awaiting camera"
@@ -47,7 +52,14 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var records: [BondRecord] = []
     private var isProcessing = false
     private var automatic = true
+    private var fastScanEnabled = true
     private var lockedAfterCapture = false
+    private var frameAnalysisInterval: TimeInterval { fastScanEnabled ? 0.25 : 0.55 }
+    private var textHuntInterval: TimeInterval { fastScanEnabled ? 0.75 : 1.40 }
+    private var requiredHuntHits: Int { fastScanEnabled ? 1 : 2 }
+    private var emptyRearmFramesThreshold: Int { fastScanEnabled ? 3 : 6 }
+    private var retryCooldownInterval: TimeInterval { fastScanEnabled ? 0.45 : 1.20 }
+    private var rejectCooldownInterval: TimeInterval { fastScanEnabled ? 1.20 : 3.00 }
     /// Normalized serial of the most recently captured bond. Never logged.
     private var lastCapturedSerial = ""
     /// True after a photograph is saved and before OCR has reported its serial.
@@ -77,9 +89,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         }
         do {
             try FileManager.default.createDirectory(at: photosRoot, withIntermediateDirectories: true)
-            if FileManager.default.fileExists(atPath: recordsURL.path) {
-                records = try JSONDecoder().decode([BondRecord].self, from: Data(contentsOf: recordsURL))
-            }
+            records = try DatabaseManager.shared.migrateFromJSONIfNeeded(jsonURL: recordsURL)
             for i in records.indices { applyRequiredStatus(&records[i]) }
             if let latest = records.max(by: { $0.capturedAt < $1.capturedAt }) {
                 let serial = normalizeSerial(latest.serial)
@@ -125,6 +135,13 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         appMenu.addItem(quit)
         appItem.submenu = appMenu
         bar.addItem(appItem)
+        let fileItem = NSMenuItem()
+        let fileMenu = NSMenu(title: "File")
+        let exportCSVMenuItem = NSMenuItem(title: "Export CSV…", action: #selector(exportCSVAction), keyEquivalent: "e")
+        exportCSVMenuItem.target = self
+        fileMenu.addItem(exportCSVMenuItem)
+        fileItem.submenu = fileMenu
+        bar.addItem(fileItem)
         let debugItem = NSMenuItem()
         let debugMenu = NSMenu(title: "Debug")
         let open = NSMenuItem(title: "Open Debug Log", action: #selector(openDebugLog), keyEquivalent: "")
@@ -167,6 +184,52 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             status("Could not request focus from the webcam.")
         }
     }
+
+    private func setAutoContrast(enabled: Bool) {
+        EnhancementController.shared.update { $0.autoContrastEnabled = enabled }
+        ScanLog.shared.write("auto contrast toggled to \(enabled)")
+        if enabled {
+            if let frame = latestImage {
+                let autoParams = computeAutoContrastParameters(frame, region: priorRect)
+                preview.reflectAutoContrast(contrast: autoParams.contrast, brightness: autoParams.brightness)
+            }
+            status("Auto-Contrast enabled.")
+        } else {
+            status("Manual brightness/contrast override active.")
+        }
+    }
+
+    private func applyManualContrastBrightness(contrast: Float, brightness: Float) {
+        EnhancementController.shared.update {
+            $0.autoContrastEnabled = false
+            $0.manualContrast = contrast
+            $0.manualBrightness = brightness
+        }
+    }
+
+    private func applyManualFocusPosition(_ position: Float) {
+        EnhancementController.shared.update { $0.manualSharpness = position }
+        if let camera = captureDevice {
+            var lockedHardware = false
+            bondScanTry("lock camera focus") {
+                if camera.isFocusModeSupported(.locked) {
+                    do {
+                        try camera.lockForConfiguration()
+                        camera.focusMode = .locked
+                        camera.unlockForConfiguration()
+                        lockedHardware = true
+                    } catch {
+                        lockedHardware = false
+                    }
+                }
+            }
+            if lockedHardware {
+                focusInfo = "Focus: locked for fixed stand (edge assist \(String(format: "%.2f", position)))"
+                focusLabel?.stringValue = focusInfo + "  |  Debug: ~/BondScans/scan-debug.log"
+            }
+        }
+    }
+
     @objc private func openDebugLog() {
         ScanLog.shared.write("user opened debug log")
         NSWorkspace.shared.open(debugURL)
@@ -188,7 +251,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     private func makeWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1200, height: 880),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1360, height: 880),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
         window.title = "Bond Scanner — 100% Local"
@@ -197,25 +260,46 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         let root = NSView(frame: window.contentView!.bounds)
         root.autoresizingMask = [.width, .height]
         window.contentView = root
+
+        bondsDrawer = BondsDrawerView(frame: .zero)
+        bondsDrawer.translatesAutoresizingMaskIntoConstraints = false
+        bondsDrawer.onCollapseRequested = { [weak self] in self?.toggleDrawer() }
+        bondsDrawer.onOpenPhotoRequested = { [weak self] record in self?.openBondPhoto(record) }
+        root.addSubview(bondsDrawer)
+        drawerWidthConstraint = bondsDrawer.widthAnchor.constraint(equalToConstant: 420)
+
         preview = PreviewView(frame: .zero)
         preview.translatesAutoresizingMaskIntoConstraints = false
         preview.videoLayer.session = session
+        preview.onAutoContrastChanged = { [weak self] enabled in self?.setAutoContrast(enabled: enabled) }
+        preview.onManualAdjustmentsChanged = { [weak self] contrast, brightness in self?.applyManualContrastBrightness(contrast: contrast, brightness: brightness) }
+        preview.onFocusSliderChanged = { [weak self] position in self?.applyManualFocusPosition(position) }
+        preview.onAutoFocusRequested = { [weak self] in self?.refocusCamera() }
+        let initialSettings = EnhancementController.shared.settings
+        preview.applyVideoLayerFilter(
+            contrast: initialSettings.manualContrast,
+            brightness: initialSettings.manualBrightness,
+            sharpness: initialSettings.manualSharpness
+        )
         root.addSubview(preview)
 
         let toolbar = NSStackView()
         toolbar.orientation = .horizontal
         toolbar.alignment = .centerY
-        toolbar.spacing = 10
+        toolbar.spacing = 8
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         let scanButton = makeButton("Scan now (Space)", action: #selector(scanNow))
         autoButton = makeButton("Auto: ON", action: #selector(toggleAuto))
-        let importButton = makeButton("Import photos…", action: #selector(importPhotos))
-        let folderButton = makeButton("Open output folder", action: #selector(openFolder))
+        fastButton = makeButton("Fast: ON", action: #selector(toggleFastScan))
+        let importButton = makeButton("Import…", action: #selector(importPhotos))
+        let exportButton = makeButton("Export CSV…", action: #selector(exportCSVAction))
+        let folderButton = makeButton("Open folder", action: #selector(openFolder))
         let undoButton = makeButton("Undo last", action: #selector(undoLast))
         let resetButton = makeButton("Re-arm", action: #selector(rearm))
-        let logButton = makeButton("Debug log", action: #selector(openDebugLog))
+        let logButton = makeButton("Log", action: #selector(openDebugLog))
+        drawerButton = makeButton("Bonds: ON", action: #selector(toggleDrawer))
         let quitButton = makeButton("Quit", action: #selector(quitApp))
-        for b in [scanButton, autoButton!, resetButton, importButton, folderButton, undoButton, logButton, quitButton] { toolbar.addArrangedSubview(b) }
+        for b in [scanButton, autoButton!, fastButton!, resetButton, importButton, exportButton, folderButton, undoButton, logButton, drawerButton!, quitButton] { toolbar.addArrangedSubview(b) }
         root.addSubview(toolbar)
 
         countLabel = label("0 scanned", size: 21, bold: true)
@@ -228,21 +312,26 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             root.addSubview(v)
         }
         NSLayoutConstraint.activate([
+            bondsDrawer.topAnchor.constraint(equalTo: root.topAnchor),
+            bondsDrawer.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            bondsDrawer.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            drawerWidthConstraint,
+
             toolbar.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            toolbar.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -16),
+            toolbar.trailingAnchor.constraint(lessThanOrEqualTo: bondsDrawer.leadingAnchor, constant: -16),
             toolbar.heightAnchor.constraint(equalToConstant: 32),
             preview.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 12),
             preview.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 15),
-            preview.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -15),
+            preview.trailingAnchor.constraint(equalTo: bondsDrawer.leadingAnchor, constant: -15),
             preview.bottomAnchor.constraint(equalTo: countLabel.topAnchor, constant: -14),
             countLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
             countLabel.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -6),
             statusLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
-            statusLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
+            statusLabel.trailingAnchor.constraint(equalTo: bondsDrawer.leadingAnchor, constant: -20),
             statusLabel.bottomAnchor.constraint(equalTo: lastLabel.topAnchor, constant: -5),
             lastLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
-            lastLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
+            lastLabel.trailingAnchor.constraint(equalTo: bondsDrawer.leadingAnchor, constant: -20),
             lastLabel.bottomAnchor.constraint(equalTo: aiLabel.topAnchor, constant: -5),
             aiLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
             aiLabel.bottomAnchor.constraint(equalTo: focusLabel.topAnchor, constant: -4),
@@ -587,7 +676,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixel = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let now = Date().timeIntervalSince1970
-        guard now - lastAnalyzeAt > 0.80 else { return }
+        guard now - lastAnalyzeAt > frameAnalysisInterval else { return }
         lastAnalyzeAt = now
         let image = CIImage(cvPixelBuffer: pixel)
         guard let cg = ciContext.createCGImage(image, from: image.extent) else { return }
@@ -611,10 +700,23 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             ScanLog.shared.write("receiving video frames=\(cg.width)x\(cg.height) auto=\(automatic)")
             lastVideoLogAt = now
         }
-        DispatchQueue.main.async { [weak self] in self?.latestImage = cg }
-        guard automatic else { return }
         let rect = detectBond(cg)
-        DispatchQueue.main.async { [weak self] in self?.handleRectangle(rect, frame: cg) }
+        let autoContrastParams: (contrast: Float, brightness: Float)? = EnhancementController.shared.settings.autoContrastEnabled
+            ? computeAutoContrastParameters(cg, region: rect)
+            : nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.latestImage = cg
+            if let auto = autoContrastParams {
+                self.preview.reflectAutoContrast(contrast: auto.contrast, brightness: auto.brightness)
+            }
+            if self.automatic {
+                self.handleRectangle(rect, frame: cg)
+            } else {
+                self.preview.sourceSize = CGSize(width: CGFloat(cg.width), height: CGFloat(cg.height))
+                self.preview.showDetected(rect)
+            }
+        }
     }
 
     private func handleRectangle(_ rect: CGRect?, frame: CGImage) {
@@ -644,17 +746,38 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         }
         if lockedAfterCapture {
             // The bond is still in view if a paper outline is visible — do not re-arm.
-            if rect != nil { noBondChecks = 0 }
+            if rect != nil {
+                emptyFrames = 0
+                noBondChecks = 0
+            } else {
+                emptyFrames += 1
+                if fastScanEnabled && emptyFrames >= emptyRearmFramesThreshold && !isProcessing {
+                    lockedAfterCapture = false
+                    emptyFrames = 0
+                    noBondChecks = 0
+                    huntHits = 0
+                    priorRect = nil
+                    autoFillRecordId = nil
+                    autoFillAttempts = 0
+                    autoFillRect = nil
+                    autoFillGoneFrames = 0
+                    status("Ready for next bond. Slide the next bond in…")
+                    ScanLog.shared.write("re-armed after bond removed (fast outline clear)")
+                    return
+                }
+            }
             scheduleTextHunt(frame, forRearm: true, rectangleVisible: rect != nil)
             return
         }
         guard automatic && !isProcessing && now >= nextAutoAllowedAt else { return }
         if let rect = rect {
+            let maxShift: CGFloat = fastScanEnabled ? 0.025 : 0.05
+            let maxScale: CGFloat = fastScanEnabled ? 0.04 : 0.075
             if let prior = priorRect,
-               abs(rect.midX - prior.midX) < 0.05,
-               abs(rect.midY - prior.midY) < 0.05,
-               abs(rect.width - prior.width) < 0.075,
-               abs(rect.height - prior.height) < 0.075 {
+               abs(rect.midX - prior.midX) < maxShift,
+               abs(rect.midY - prior.midY) < maxShift,
+               abs(rect.width - prior.width) < maxScale,
+               abs(rect.height - prior.height) < maxScale {
                 stableFrames += 1
             } else { stableFrames = 1 }
             priorRect = rect
@@ -678,7 +801,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
 
     private func scheduleTextHunt(_ frame: CGImage, forRearm: Bool, rectangleVisible: Bool = false) {
         let now = Date().timeIntervalSince1970
-        guard !huntRunning && !isProcessing && now - lastHuntAt > 1.8 else { return }
+        guard !huntRunning && !isProcessing && now - lastHuntAt > textHuntInterval else { return }
         lastHuntAt = now
         huntRunning = true
         if !forRearm { status("Hunting for the bond: checking text and all four rotations…") }
@@ -709,9 +832,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                         self.autoFillAttempts = 0
                         self.autoFillRect = nil
                         self.autoFillGoneFrames = 0
-                        self.status("New bond detected. Capturing…")
+                        self.status("New bond detected — holding for focus…")
                         ScanLog.shared.write("re-armed: serial in view is not the last captured bond")
-                        self.performScan(frame, automaticScan: true)
                         return
                     }
                     if stillPresent { self.noBondChecks = 0 }
@@ -741,8 +863,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 guard !self.lockedAfterCapture && !self.isProcessing && self.automatic else { return }
                 if hasBond {
                     self.huntHits += 1
-                    self.status("Bond text found (\(self.huntHits)/2). Hold steady…")
-                    if self.huntHits >= 2 {
+                    self.status("Bond text found (\(self.huntHits)/\(self.requiredHuntHits)). Hold steady…")
+                    if self.huntHits >= self.requiredHuntHits {
                         self.huntHits = 0
                         ScanLog.shared.write("auto capture: fallback OCR detected bond without stable outline")
                         self.performScan(frame, automaticScan: true)
@@ -862,7 +984,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
 
     private func finishCapture(image: CGImage, jpegBytes: Data?, automatic: Bool) {
 
-        if automatic {
+        if automatic && !fastScanEnabled {
             ScanLog.shared.write("scan started mode=auto frame=\(image.width)x\(image.height)")
             status("Reading bond with local Apple Vision OCR…")
             let focus = self.shouldFocusIssueDate()
@@ -889,6 +1011,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             guard let self = self else { return }
             guard let data = jpegBytes ?? jpegData(image) else {
                 DispatchQueue.main.async {
+                    self.isProcessing = false
                     self.status("SAVE FAILED: could not encode the photograph.")
                     self.preview.captureFlash(color: .systemRed)
                     NSSound.beep()
@@ -901,6 +1024,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 try data.write(to: originalURL, options: .atomic)
             } catch {
                 DispatchQueue.main.async {
+                    self.isProcessing = false
                     self.status("SAVE FAILED: \(error.localizedDescription)")
                     self.preview.captureFlash(color: .systemRed)
                     NSSound.beep()
@@ -914,8 +1038,9 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 record.sourcePhoto = originalRel
                 let previous = self.records
                 self.records.append(record)
-                do { try writeRecords(self.records) }
+                do { try saveRecordLive(record, allRecords: self.records, sortOrder: self.records.count - 1) }
                 catch {
+                    self.isProcessing = false
                     self.records = previous
                     self.status("SAVE FAILED: \(error.localizedDescription)")
                     self.preview.captureFlash(color: .systemRed)
@@ -926,14 +1051,15 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 self.updateCount()
                 self.preview.captureFlash(color: .systemBlue)
                 NSSound(named: NSSound.Name("Glass"))?.play()
+                self.isProcessing = false
                 self.lockedAfterCapture = true
                 self.awaitingSerialFromCapture = true
                 self.emptyFrames = 0
                 let waiting = self.ocrPending.count + (self.ocrBusy ? 1 : 0)
                 if waiting == 0 {
-                    self.status("Photograph saved (\(width)×\(height)). Reading it in the background…")
+                    self.status("Captured (\(width)×\(height))! Slide next bond in — reading in background…")
                 } else {
-                    self.status("Photograph saved (\(width)×\(height)). \(waiting) already in the OCR queue; this one will run next.")
+                    self.status("Captured (\(width)×\(height))! Slide next bond in (\(waiting) in OCR queue).")
                 }
                 self.lastLabel.stringValue = "Last: photograph saved, OCR pending…"
                 ScanLog.shared.write("original saved status=PROCESSING frame=\(width)x\(height) bytes=\(data.count) total=\(self.records.count) ocr_queue=\(waiting + 1)")
@@ -984,7 +1110,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         if !FileManager.default.fileExists(atPath: dest.path) {
             try? FileManager.default.copyItem(at: src, to: dest)
         }
-        try? writeRecords(records)
+        try? saveRecordLive(records[index], allRecords: records, sortOrder: index)
         updateCount()
         preview.captureFlash(color: .systemRed)
         status(message)
@@ -1027,7 +1153,16 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     private func priorRecord(for incoming: BondRecord) -> BondRecord? {
-        // Exact normalized serial first.
+        // Indexed SQLite normalized-serial lookup first.
+        if let indexedMatches = try? DatabaseManager.shared.findRecordsByNormalizedSerial(incoming.serial, excludingId: incoming.id) {
+            for candidate in indexedMatches {
+                let match = records.first(where: { $0.id == candidate.id }) ?? candidate
+                if canMergeCapture(incoming, into: match) {
+                    return match
+                }
+            }
+        }
+        // Exact normalized serial in-memory fallback.
         if let match = recordMatchingSerial(incoming.serial, in: records, excluding: incoming.id),
            canMergeCapture(incoming, into: match) {
             return match
@@ -1060,7 +1195,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         if record.status != priorStatus || record.notes != priorNotes,
            let idx = records.firstIndex(where: { $0.id == record.id }) {
             records[idx] = record
-            try? writeRecords(records)
+            try? saveRecordLive(record, allRecords: records, sortOrder: idx)
         }
         updateCount()
         let serialDisplay = record.serial.isEmpty ? "unreadable serial" : record.serial
@@ -1088,7 +1223,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             } else {
                 lockedAfterCapture = false
                 if autoFillRect == nil { autoFillRect = priorRect }
-                nextAutoAllowedAt = Date().timeIntervalSince1970 + 1.2
+                nextAutoAllowedAt = Date().timeIntervalSince1970 + retryCooldownInterval
                 ScanLog.shared.write("auto fill retry attempts=\(autoFillAttempts)/\(autoFillMaxAttempts) missing=\(requiredFieldsMissing(record).joined(separator: ","))")
             }
         } else {
@@ -1126,7 +1261,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             if filled.isEmpty {
                 records.removeAll { $0.id == incoming.id }
                 trashCapturePhotos(incoming)
-                try? writeRecords(records)
+                try? deleteRecordLive(id: incoming.id, allRecords: records)
                 ScanLog.shared.write("extra photograph dropped; no new required fields (prior id=\(prior.id))")
                 presentRecord(merged, flash: .systemOrange,
                               message: "Same bond — no new required fields. Extra photograph not kept.",
@@ -1135,12 +1270,18 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             }
             writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
             records.removeAll { $0.id == incoming.id }
+            let targetIndex: Int
             if let idx = records.firstIndex(where: { $0.id == prior.id }) {
                 records[idx] = merged
+                targetIndex = idx
             } else {
                 records.append(merged)
+                targetIndex = records.count - 1
             }
-            do { try writeRecords(records) }
+            do {
+                try deleteRecordLive(id: incoming.id, allRecords: records)
+                try saveRecordLive(merged, allRecords: records, sortOrder: targetIndex)
+            }
             catch { status("OCR results could not be saved: \(error.localizedDescription)"); preview.captureFlash(color: .systemRed); return }
             let fieldList = filled.joined(separator: ", ")
             ScanLog.shared.write("merged fields=\(fieldList) into existing record; photograph kept (prior id=\(prior.id)) status=\(merged.status)")
@@ -1157,7 +1298,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         applyRequiredStatus(&incoming)
         let previous = records
         records[index] = incoming
-        do { try writeRecords(records) }
+        do { try saveRecordLive(incoming, allRecords: records, sortOrder: index) }
         catch {
             records = previous
             status("OCR results could not be saved: \(error.localizedDescription)")
@@ -1179,7 +1320,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         applyRequiredStatus(&incoming)
 
         if auto && autoFillRecordId == nil && (!result.bondTextFound || result.huntScore < 45) {
-            nextAutoAllowedAt = Date().timeIntervalSince1970 + 3.0
+            nextAutoAllowedAt = Date().timeIntervalSince1970 + rejectCooldownInterval
             ScanLog.shared.write("auto scan rejected: low OCR evidence score=\(result.huntScore) count=\(result.lineCount)")
             isProcessing = false
             status("Not readable — improve lighting/focus, reposition, or press Space to save for review.")
@@ -1232,7 +1373,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                                               contributingSource: incoming.sourcePhoto,
                                               captureId: incoming.id)
                 records[priorIndex] = merged
-                try writeRecords(records)
+                try saveRecordLive(merged, allRecords: records, sortOrder: priorIndex)
                 let fieldList = (filled2.isEmpty ? filled : filled2).joined(separator: ", ")
                 ScanLog.shared.write("merged fields=\(fieldList) into existing record; photograph kept (prior id=\(prior.id)) status=\(merged.status)")
                 isProcessing = false
@@ -1267,7 +1408,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
             let previous = records
             records.append(incoming)
-            do { try writeRecords(records) }
+            do { try saveRecordLive(incoming, allRecords: records, sortOrder: records.count - 1) }
             catch { records = previous; throw error }
             ScanLog.shared.write("scan saved status=\(incoming.status) fields_nonempty=\([incoming.series, incoming.serial, incoming.issueMonth, incoming.issueYear, incoming.denomination].filter { !$0.isEmpty }.count) rectified=\(result.rectified) total=\(records.count)")
             NSSound(named: NSSound.Name("Glass"))?.play()
@@ -1315,7 +1456,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             await MainActor.run {
                 if let index = self.records.firstIndex(where: { $0.id == updated.id }) {
                     self.records[index] = updated
-                    do { try writeRecords(self.records); self.updateCount() }
+                    do { try saveRecordLive(updated, allRecords: self.records, sortOrder: index); self.updateCount() }
                     catch { self.status("AI update could not be saved: \(error.localizedDescription)") }
                 }
                 self.aiBusy = false
@@ -1334,6 +1475,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         if duplicates > 0 { text += "  •  \(duplicates) duplicate" }
         if processing > 0 { text += "  •  \(processing) reading" }
         countLabel.stringValue = text
+        bondsDrawer?.updateRecords(records)
     }
 
     @objc private func toggleAuto() {
@@ -1343,7 +1485,61 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         status(automatic ? "Automatic scanning on. Remove each bond after the confirmation flash." : "Manual mode. Press Space to scan each bond.")
     }
 
+    @objc private func toggleFastScan() {
+        fastScanEnabled.toggle()
+        fastButton.title = fastScanEnabled ? "Fast: ON" : "Fast: OFF"
+        ScanLog.shared.write("fast scan toggled to \(fastScanEnabled)")
+        status(fastScanEnabled
+            ? "Fast Scan on: quicker frame lock and immediate re-arm when a bond is removed."
+            : "Fast Scan off: standard stabilization and OCR re-arm timing.")
+    }
+
+    @objc private func toggleDrawer() {
+        drawerVisible.toggle()
+        drawerButton.title = drawerVisible ? "Bonds: ON" : "Bonds: OFF"
+        bondsDrawer.isHidden = !drawerVisible
+        drawerWidthConstraint.constant = drawerVisible ? 420 : 0
+    }
+
+    private func openBondPhoto(_ record: BondRecord) {
+        let relative = record.photo.isEmpty ? record.sourcePhoto : record.photo
+        guard !relative.isEmpty else {
+            status("No saved photo path for that record.")
+            return
+        }
+        let url = outputRoot.appendingPathComponent(relative)
+        if FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.open(url)
+        } else {
+            status("Saved photo not found on disk.")
+        }
+    }
+
     @objc private func openFolder() { NSWorkspace.shared.open(outputRoot) }
+
+    @objc private func exportCSVAction() {
+        let panel = NSSavePanel()
+        panel.title = "Export Bonds to CSV"
+        panel.nameFieldStringValue = "bonds.csv"
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.canCreateDirectories = true
+        let handleResponse: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self = self, response == .OK, let url = panel.url else { return }
+            do {
+                try exportCSV(self.records, to: url)
+                ScanLog.shared.write("user exported csv count=\(self.records.count)")
+                self.status("Exported \(self.records.count) bond records to \(url.lastPathComponent).")
+            } catch {
+                ScanLog.shared.write("csv export failed")
+                self.status("CSV export failed: \(error.localizedDescription)")
+            }
+        }
+        if let window = window {
+            panel.beginSheetModal(for: window, completionHandler: handleResponse)
+        } else {
+            handleResponse(panel.runModal())
+        }
+    }
 
     @objc private func rearm() {
         lockedAfterCapture = false
@@ -1371,7 +1567,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         records.removeLast()
         do {
-            try writeRecords(records)
+            try deleteRecordLive(id: last.id, allRecords: records)
             let image = outputRoot.appendingPathComponent(last.photo)
             if FileManager.default.fileExists(atPath: image.path) { try? FileManager.default.trashItem(at: image, resultingItemURL: nil) }
             let original = outputRoot.appendingPathComponent(last.sourcePhoto)

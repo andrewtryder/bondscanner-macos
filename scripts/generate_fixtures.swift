@@ -4,9 +4,32 @@ import AppKit
 import CoreGraphics
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-let bondsDir = root.appendingPathComponent("local-fixtures/bonds")
-let manifestURL = root.appendingPathComponent("local-fixtures/manifest.json")
-try? FileManager.default.createDirectory(at: bondsDir, withIntermediateDirectories: true)
+let syntheticDir = root.appendingPathComponent("local-fixtures/synthetic")
+let imagesDir = syntheticDir.appendingPathComponent("images")
+let manifestURL = syntheticDir.appendingPathComponent("manifest.json")
+
+// SAFETY GUARDS:
+// Ensure this script strictly writes ONLY to local-fixtures/synthetic
+// and cannot accidentally overwrite real photographs or manifests.
+let standardizedSynthetic = syntheticDir.standardizedFileURL.path
+precondition(
+    imagesDir.standardizedFileURL.path.hasPrefix(standardizedSynthetic),
+    "SAFETY VIOLATION: Target images directory must be inside local-fixtures/synthetic"
+)
+precondition(
+    manifestURL.standardizedFileURL.path.hasPrefix(standardizedSynthetic),
+    "SAFETY VIOLATION: Target manifest must be inside local-fixtures/synthetic"
+)
+precondition(
+    !imagesDir.standardizedFileURL.path.contains("local-fixtures/real"),
+    "SAFETY VIOLATION: Cannot write to real fixtures directory"
+)
+precondition(
+    !manifestURL.standardizedFileURL.path.contains("local-fixtures/real"),
+    "SAFETY VIOLATION: Cannot write to real fixtures manifest"
+)
+
+try? FileManager.default.createDirectory(at: imagesDir, withIntermediateDirectories: true)
 
 struct ManifestItem: Codable {
     let id: String
@@ -121,7 +144,11 @@ func drawBond(
     NSGraphicsContext.restoreGraphicsState()
 
     let data = rep.representation(using: .jpeg, properties: [NSBitmapImageRep.PropertyKey.compressionFactor: 0.95])!
-    let fileURL = bondsDir.appendingPathComponent(filename)
+    let fileURL = imagesDir.appendingPathComponent(filename)
+    precondition(
+        fileURL.standardizedFileURL.path.hasPrefix(standardizedSynthetic),
+        "SAFETY VIOLATION: Refusing to write image outside synthetic directory: \(fileURL.path)"
+    )
     try! data.write(to: fileURL)
 }
 
@@ -338,10 +365,10 @@ items.append(ManifestItem(
 let encoder = JSONEncoder()
 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
 let jsonData = try! encoder.encode(items)
+precondition(
+    manifestURL.standardizedFileURL.path.hasPrefix(standardizedSynthetic),
+    "SAFETY VIOLATION: Refusing to write manifest outside synthetic directory: \(manifestURL.path)"
+)
 try! jsonData.write(to: manifestURL, options: .atomic)
 
-// Also update local-fixtures.example.json so the committed template includes all scenarios
-let exampleURL = root.appendingPathComponent("local-fixtures.example.json")
-try! jsonData.write(to: exampleURL, options: .atomic)
-
-print("Generated \(items.count) fixture items and images in local-fixtures/bonds/")
+print("Generated \(items.count) fixture items and images in local-fixtures/synthetic/images/")

@@ -49,47 +49,58 @@ xcodebuild test -project BondScanner.xcodeproj -scheme BondScanner
 This repository includes a local-only image regression framework (`Tests/BondScannerTests/PrivateOCRRegressionTests.swift`) designed to evaluate Vision OCR against real bond photographs without committing sensitive financial or personal information.
 
 ### Strict Privacy Guarantee
-- The directories `local-fixtures/bonds/` and `local-fixtures/reports/`, along with any `local-fixtures/manifest.json`, are strictly ignored by `.gitignore`.
+- The directories `local-fixtures/synthetic/`, `local-fixtures/real/`, and `local-fixtures/reports/` are strictly ignored by `.gitignore`.
 - Fixture images, private manifests, and reports remain outside the `Sources/` and `Tests/` directories so XcodeGen will never bundle them into the application.
-- Public CI environments without private fixtures automatically skip these tests cleanly (`XCTSkip`).
+- Public CI environments or local environments without private real fixtures automatically skip the real photo tests cleanly (`XCTSkip`).
 - Test assertion failures never print raw OCR, serial numbers, tax IDs, or owner names to test logs.
+- Synthetic and real photo datasets are evaluated separately; their accuracy metrics and reports are never combined.
 
 ### Setting Up Private Fixtures
 
-1. **Place your bond images in `local-fixtures/bonds/`:**
-   Use neutral filenames such as `sample-01.jpg` through `sample-07.jpg`:
+1. **Synthetic Fixtures:**
+   Generated locally and written exclusively to `local-fixtures/synthetic/`:
    ```bash
-   mkdir -p local-fixtures/bonds local-fixtures/reports
-   cp /path/to/my-bonds/*.jpg local-fixtures/bonds/
+   swift scripts/generate_fixtures.swift
+   ```
+   This generates synthetic images in `local-fixtures/synthetic/images/` and the synthetic manifest `local-fixtures/synthetic/manifest.json`.
+
+2. **Real Photograph Fixtures (Privately Held Paper Bonds):**
+   Place your physical bond photographs in `local-fixtures/real/images/`:
+   ```bash
+   mkdir -p local-fixtures/real/images
+   cp /path/to/my-bonds/*.jpg local-fixtures/real/images/
    ```
 
-2. **Create your private manifest (`local-fixtures/manifest.json`):**
-   Copy the provided public template `local-fixtures.example.json`:
+3. **Create your verified real manifest (`local-fixtures/real/manifest.json`):**
+   Copy the example template `local-fixtures.example.json` or `local-fixtures/real/manifest.example.json`:
    ```bash
-   cp local-fixtures.example.json local-fixtures/manifest.json
+   cp local-fixtures.example.json local-fixtures/real/manifest.json
    ```
-   Open `local-fixtures/manifest.json` and adjust the ground-truth values (`series`, `denomination`, `serial`, `issueMonth`, `issueYear`, `datingStamp`) to match your physical documents. Any omitted field is treated as "not evaluated".
+   Open `local-fixtures/real/manifest.json` and adjust the ground-truth values (`series`, `denomination`, `serial`, `issueMonth`, `issueYear`, `datingStamp`) to match your physical documents based on manual verification (never from OCR output). Any omitted field is treated as "not evaluated".
 
-3. **Verify Git ignores the private fixtures:**
+4. **Verify Git ignores the private fixtures:**
    Confirm no private files or images are tracked by Git before testing:
    ```bash
-   git check-ignore -v local-fixtures/bonds/*.jpg
-   git check-ignore -v local-fixtures/manifest.json
+   git check-ignore -v local-fixtures/synthetic/manifest.json
+   git check-ignore -v local-fixtures/real/manifest.json
    git ls-files -- local-fixtures/
    git status --short
    ```
    *(Ensure `git ls-files -- local-fixtures/` returns zero output).*
 
-4. **Run the regression tests:**
+5. **Run the regression tests:**
    ```bash
    xcodebuild test -project BondScanner.xcodeproj -scheme BondScanner
    ```
 
-5. **Review Quality Metrics & Reports:**
-   Each test run writes privacy-safe aggregate metrics to `local-fixtures/reports/`:
-   - `local-fixtures/reports/latest.txt`: Human-readable summary table with accuracy percentages, false high-confidence field warnings, status checks, and timings.
-   - `local-fixtures/reports/latest.json`: Structured machine-readable metrics.
-   - `local-fixtures/reports/report-<timestamp>.txt` / `.json`: Historical runs.
+6. **Review Quality Metrics & Reports:**
+   Each test run writes isolated, privacy-safe aggregate metrics for each dataset:
+   - Synthetic fixtures:
+     - `local-fixtures/reports/synthetic/latest.txt` & `latest.json`
+     - `local-fixtures/reports/latest-synthetic.txt` & `latest-synthetic.json`
+   - Real photographs:
+     - `local-fixtures/reports/real/latest.txt` & `latest.json`
+     - `local-fixtures/reports/latest-real.txt` & `latest-real.json`
 
 ---
 

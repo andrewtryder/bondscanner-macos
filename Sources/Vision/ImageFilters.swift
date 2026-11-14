@@ -6,6 +6,154 @@ import Vision
 
 let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
+struct ImageEnhancementSettings {
+    var autoContrastEnabled: Bool = true
+    var manualContrast: Float = 1.20       // Range: 0.75 ... 2.20
+    var manualBrightness: Float = 0.00     // Range: -0.25 ... 0.25
+    var manualSharpness: Float = 0.35      // Range: 0.00 ... 1.00 (Focus assist / edge sharpness)
+}
+
+final class EnhancementController {
+    static let shared = EnhancementController()
+    private let lock = NSLock()
+    private var _settings = ImageEnhancementSettings()
+    private var _lastAutoParameters: (contrast: Float, brightness: Float) = (1.20, 0.0)
+
+    var settings: ImageEnhancementSettings {
+        get { lock.lock(); defer { lock.unlock() }; return _settings }
+        set { lock.lock(); _settings = newValue; lock.unlock() }
+    }
+
+    var lastAutoParameters: (contrast: Float, brightness: Float) {
+        get { lock.lock(); defer { lock.unlock() }; return _lastAutoParameters }
+        set { lock.lock(); _lastAutoParameters = newValue; lock.unlock() }
+    }
+
+    func update(_ mutate: (inout ImageEnhancementSettings) -> Void) {
+        lock.lock()
+        mutate(&_settings)
+        lock.unlock()
+    }
+}
+
+private func resolvedSampleExtent(for fullExtent: CGRect, region: CGRect?) -> CGRect {
+    if let r = region {
+        let candidate: CGRect
+        if r.width <= 1.05 && r.height <= 1.05 && r.minX >= -0.05 && r.minY >= -0.05 && r.width > 0.05 && r.height > 0.05 {
+            candidate = CGRect(
+                x: fullExtent.minX + r.minX * fullExtent.width,
+                y: fullExtent.minY + r.minY * fullExtent.height,
+                width: r.width * fullExtent.width,
+                height: r.height * fullExtent.height
+            ).intersection(fullExtent)
+        } else {
+            candidate = r.intersection(fullExtent)
+        }
+        if !candidate.isNull && !candidate.isEmpty && candidate.width >= 16 && candidate.height >= 16 {
+            return candidate
+        }
+    }
+    let inset = fullExtent.insetBy(dx: fullExtent.width * 0.10, dy: fullExtent.height * 0.10)
+    return inset.width >= 16 && inset.height >= 16 ? inset : fullExtent
+}
+
+private func applyEnhancementFilters(_ image: CGImage, contrast: Float, brightness: Float, saturation: Float, sharpness: Float) -> CGImage? {
+    let original = CIImage(cgImage: image)
+    let controls = CIFilter.colorControls()
+    controls.inputImage = original
+    controls.contrast = contrast
+    controls.brightness = brightness
+    controls.saturation = saturation
+    guard let toned = controls.outputImage else { return nil }
+    let sharpen = CIFilter.sharpenLuminance()
+    sharpen.inputImage = toned
+    sharpen.sharpness = sharpness
+    let final = sharpen.outputImage ?? toned
+    return ciContext.createCGImage(final, from: original.extent)
+}
+
+/// Computes adaptive contrast and brightness parameters by sampling luminance
+/// min/max and average within `region` (normalized Vision box or pixel rect).
+func computeAutoContrastParameters(_ image: CGImage, region: CGRect? = nil) -> (contrast: Float, brightness: Float) {
+    let ciImage = CIImage(cgImage: image)
+    let fullExtent = ciImage.extent
+    guard !fullExtent.isEmpty else { return (1.20, 0.0) }
+    let sampleExtent = resolvedSampleExtent(for: fullExtent, region: region)
+    let extentVector = CIVector(cgRect: sampleExtent)
+
+    guard let minMaxFilter = CIFilter(name: "CIAreaMinMax", parameters: [
+        kCIInputImageKey: ciImage,
+        kCIInputExtentKey: extentVector
+    ]),
+    let minMaxOut = minMaxFilter.outputImage,
+    let avgFilter = CIFilter(name: "CIAreaAverage", parameters: [
+        kCIInputImageKey: ciImage,
+        kCIInputExtentKey: extentVector
+    ]),
+    let avgOut = avgFilter.outputImage else {
+        return (1.20, 0.0)
+    }
+
+    let rgb = CGColorSpaceCreateDeviceRGB()
+    var minMaxBuf = [UInt8](repeating: 0, count: 8)
+    minMaxBuf.withUnsafeMutableBytes { rawPtr in
+        if let base = rawPtr.baseAddress {
+            ciContext.render(
+                minMaxOut,
+                toBitmap: base,
+                rowBytes: 8,
+                bounds: CGRect(x: 0, y: 0, width: 2, height: 1),
+                format: .RGBA8,
+                colorSpace: rgb
+            )
+        }
+    }
+
+    var avgBuf = [UInt8](repeating: 0, count: 4)
+    avgBuf.withUnsafeMutableBytes { rawPtr in
+        if let base = rawPtr.baseAddress {
+            ciContext.render(
+                avgOut,
+                toBitmap: base,
+                rowBytes: 4,
+                bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                format: .RGBA8,
+                colorSpace: rgb
+            )
+        }
+    }
+
+    let lMin = (0.299 * Float(minMaxBuf[0]) + 0.587 * Float(minMaxBuf[1]) + 0.114 * Float(minMaxBuf[2])) / 255.0
+    let lMax = (0.299 * Float(minMaxBuf[4]) + 0.587 * Float(minMaxBuf[5]) + 0.114 * Float(minMaxBuf[6])) / 255.0
+    let lAvg = (0.299 * Float(avgBuf[0]) + 0.587 * Float(avgBuf[1]) + 0.114 * Float(avgBuf[2])) / 255.0
+
+    let lPaper = 0.60 * lAvg + 0.40 * lMax
+    let lInk = 0.65 * lMin + 0.35 * lAvg
+    let deltaL = max(Float(0.08), lPaper - lInk)
+
+    let rawContrast = 0.52 / deltaL
+    let contrast = min(Float(2.10), max(Float(1.12), rawContrast))
+    let rawBrightness = (0.56 - lAvg) * 0.28
+    let brightness = min(Float(0.08), max(Float(-0.10), rawBrightness))
+
+    EnhancementController.shared.lastAutoParameters = (contrast, brightness)
+    return (contrast, brightness)
+}
+
+func autoContrastAdjustedImage(_ image: CGImage, region: CGRect? = nil) -> CGImage? {
+    let params = computeAutoContrastParameters(image, region: region)
+    let sharpness = EnhancementController.shared.settings.manualSharpness
+    return applyEnhancementFilters(image, contrast: params.contrast, brightness: params.brightness, saturation: 0.15, sharpness: sharpness)
+}
+
+func effectiveEnhancedImage(_ image: CGImage, region: CGRect? = nil) -> CGImage? {
+    let cfg = EnhancementController.shared.settings
+    if cfg.autoContrastEnabled {
+        return autoContrastAdjustedImage(image, region: region)
+    }
+    return applyEnhancementFilters(image, contrast: cfg.manualContrast, brightness: cfg.manualBrightness, saturation: 0.25, sharpness: cfg.manualSharpness)
+}
+
 func upscaledImage(_ image: CGImage, scale: CGFloat) -> CGImage? {
     let source = CIImage(cgImage: image)
     let lanczos = CIFilter.lanczosScaleTransform()
@@ -72,6 +220,10 @@ func dateBoxVariants(_ crop: CGImage, intensive: Bool) -> [(String, CGImage)] {
     if let faint = adjustedForFaintPrinting(crop) {
         out.append(("faint", faint))
         if let fu = upscaledImage(faint, scale: 2.6) { out.append(("faint-up", fu)) }
+    }
+    if let auto = autoContrastAdjustedImage(crop, region: nil) {
+        out.append(("auto", auto))
+        if let au = upscaledImage(auto, scale: 2.6) { out.append(("auto-up", au)) }
     }
     if let hi = highContrastImage(crop, contrast: 1.7, brightness: 0.05) {
         out.append(("hi", hi))
