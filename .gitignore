@@ -25,6 +25,7 @@ tmp/
 *.jpg
 *.jpeg
 *.png
+!/Resources/BondScanner-navy-1024.png
 *.csv
 *.json
 !local-fixtures.example.json

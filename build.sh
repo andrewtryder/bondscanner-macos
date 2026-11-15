@@ -73,8 +73,10 @@ if [[ ! -f "$PLIST" ]]; then
 fi
 
 mkdir -p "$CONTENTS/MacOS"
+mkdir -p "$CONTENTS/Resources"
 
 cp "$PLIST" "$CONTENTS/Info.plist"
+cp "$ROOT/Resources/BondScanner.icns" "$CONTENTS/Resources/BondScanner.icns"
 
 echo "Building Bond Scanner ($MODE) from ${#SWIFT_SRCS[@]} Swift source(s)"
 echo "Output: $APP"

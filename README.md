@@ -1,5 +1,7 @@
 # Bond Scanner (macOS)
 
+<img src="Resources/BondScanner-navy-1024.png" alt="Bond Scanner app icon" width="128">
+
 A lightweight, native macOS desktop application to scan and catalogue physical United States paper savings bonds (Series E, EE, and I) using Apple Vision OCR and a connected webcam.
 
 All processing occurs 100% locally on your Mac. No images, personal names, tax IDs, or serial numbers are ever transmitted or uploaded anywhere.
