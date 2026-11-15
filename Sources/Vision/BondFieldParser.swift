@@ -448,6 +448,7 @@ func applyRequiredStatus(_ record: inout BondRecord) {
 }
 
 func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord, contributingPhoto: String, contributingSource: String, captureId: String) -> [String] {
+    let before = existing
     var filled: [String] = []
     let confirmedFields = Set(existing.userConfirmedFields ?? [])
     func isUserConfirmed(_ key: String) -> Bool {
@@ -535,6 +536,11 @@ func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord,
         existing.reviewReasons = Array(mergedReasons).sorted()
     }
     applyRequiredStatus(&existing)
+    // OCR consolidation is a meaningful mutation too.  This makes an in-flight
+    // review analysis stale before any of its suggestions can be persisted.
+    if existing != before {
+        existing.revision = (before.revision ?? 0) + 1
+    }
     return filled
 }
 

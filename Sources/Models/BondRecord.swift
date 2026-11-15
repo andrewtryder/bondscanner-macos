@@ -1,6 +1,6 @@
 import Foundation
 
-struct BondRecord: Codable {
+struct BondRecord: Codable, Equatable {
     var id: String
     var capturedAt: String
     var series: String

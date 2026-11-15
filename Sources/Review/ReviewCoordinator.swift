@@ -36,7 +36,7 @@ struct LocalBondAIAnalyzer: BondAIAnalyzing {
         }
         // The original and at most three Vision-derived regions keep attachment count and
         // context bounded. Regions are created only from actual Vision observations.
-        let regions = BondAIEvidence.crops(from: image)
+        let regions = BondAIEvidence.crops(from: image, reviewReasons: record.reviewReasons ?? [])
         return await generateMultimodal(record: record, revision: revision, imageURL: imageURL, regions: regions)
     }
 
@@ -116,8 +116,9 @@ struct LocalBondAIAnalyzer: BondAIAnalyzing {
             guard permitted.contains(item.field) else { return nil }
             let proposed = item.proposedValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let abstained = item.abstained || proposed.isEmpty
-            // Deterministic validation prevents AI from laundering an invalid serial/date.
-            if !abstained && item.field == "serial" && !validatedSerial(cleanAlnum(proposed), series: record.series).isHigh { return nil }
+            // Format validity is never evidence.  A serial needs both normal validation
+            // and independent Vision OCR corroboration; ambiguous characters abstain.
+            if !abstained && item.field == "serial" && (!validatedSerial(cleanAlnum(proposed), series: record.series).isHigh || !BondAIEvidence.corroboratesSerial(proposed, in: record)) { return nil }
             if !abstained && item.field == "series" && !validSeriesValues().contains(proposed.uppercased()) { return nil }
             let assessment = BondAISuggestion.Assessment(rawValue: item.assessment) ?? .insufficientEvidence
             return BondAISuggestion(field: item.field, existingValue: BondAIEvidence.value(for: item.field, record: record), proposedValue: abstained ? nil : proposed, abstained: abstained, evidence: String(item.evidence.prefix(160)), imageRegion: item.evidence.contains("region") ? item.evidence : nil, ambiguity: String(item.ambiguity.prefix(300)), assessment: assessment, requiresOriginalInspection: item.requiresOriginalInspection || assessment != .strongEvidence)
@@ -138,14 +139,33 @@ private enum BondAIEvidence {
         let ocr = (record.rawOCR + "\n" + (record.additionalOCR ?? "")).prefix(7000)
         return "CURRENT_FIELDS=\(values)\nFIELD_CONFIDENCE=\(confidences)\nVALIDATION=\(warnings.prefix(24))\nOCR_DATA_BEGIN\n\(ocr)\nOCR_DATA_END"
     }
-    static func crops(from image: CGImage) -> [(String, CGImage)] {
+    static func corroboratesSerial(_ proposed: String, in record: BondRecord) -> Bool {
+        let proposed = cleanAlnum(proposed)
+        guard !proposed.isEmpty else { return false }
+        let visionText = cleanAlnum(record.rawOCR + "\n" + (record.additionalOCR ?? ""))
+        // Do not let a valid-looking value alone bootstrap itself into a suggestion.
+        return visionText.contains(proposed)
+    }
+    static func crops(from image: CGImage, reviewReasons: [String]) -> [(String, CGImage)] {
         let lines = textOCR(image, fast: false, alternateCount: 3)
         let definitions: [(String, (String) -> Bool)] = [
             ("serial-region", { !regexMatches("[A-Z0-9]{7,14}E{1,2}", in: cleanAlnum($0)).isEmpty }),
             ("issue-date-region", { $0.uppercased().contains("ISSUE") || $0.uppercased().contains("FIRST DAY") }),
             ("denomination-region", { $0.uppercased().contains("DOLLAR") || $0.contains("$") })
         ]
-        return definitions.compactMap { label, matcher in
+        let unresolved = reviewReasons.joined(separator: " ").lowercased()
+        let prioritized = definitions.sorted { lhs, rhs in
+            func priority(_ label: String) -> Int {
+                switch label {
+                case "serial-region": return unresolved.contains("serial") ? 0 : 2
+                case "issue-date-region": return unresolved.contains("date") || unresolved.contains("issue") ? 0 : 2
+                case "denomination-region": return unresolved.contains("denom") || unresolved.contains("face value") ? 0 : 2
+                default: return 3
+                }
+            }
+            return priority(lhs.0) < priority(rhs.0)
+        }
+        return prioritized.compactMap { label, matcher in
             guard let line = lines.first(where: { matcher($0.text) }), let crop = crop(image, normalized: line.box) else { return nil }
             return (label, crop)
         }
@@ -225,8 +245,12 @@ final class ReviewCoordinator {
     private let aiAnalyzer: any BondAIAnalyzing
     private var aiQueuedIDs: [String] = []
     private var aiActiveID: String?
+    /// Identifies the task which owns `aiActiveID`.  Cancellation is cooperative,
+    /// so an old task must never clear the state of a newer task.
+    private var aiActiveToken: UUID?
     private var aiTask: Task<Void, Never>?
     private(set) var aiPaused = false
+    private var aiDeferredForForegroundWork = false
     private(set) var aiCompleted = 0
     private(set) var aiAbstained = 0
     private(set) var aiFailed = 0
@@ -285,7 +309,21 @@ final class ReviewCoordinator {
 
     func pauseAIReview() { aiPaused = true; persistAIQueue() }
     func resumeAIReview() { aiPaused = false; persistAIQueue(); startNextAIJobIfPossible() }
-    func cancelAIReview() { aiTask?.cancel(); aiTask = nil; aiActiveID = nil; aiQueuedIDs.removeAll(); aiPaused = false; persistAIQueue() }
+    /// OCR/capture owns responsiveness.  This is intentionally non-persistent: a
+    /// foreground workload should defer new inference, never leave the queue paused.
+    func setAIBackgroundWorkDeferred(_ deferred: Bool) {
+        aiDeferredForForegroundWork = deferred
+        if !deferred { startNextAIJobIfPossible() }
+    }
+    func cancelAIReview() {
+        aiTask?.cancel()
+        aiTask = nil
+        aiActiveID = nil
+        aiActiveToken = nil
+        aiQueuedIDs.removeAll()
+        aiPaused = false
+        persistAIQueue()
+    }
 
     var aiProgressText: String {
         let total = aiQueuedIDs.count + (aiTask == nil ? 0 : 1) + aiCompleted + aiAbstained + aiFailed
@@ -301,35 +339,56 @@ final class ReviewCoordinator {
     }
 
     private func startNextAIJobIfPossible() {
-        guard !aiPaused, aiTask == nil, !aiQueuedIDs.isEmpty else { return }
+        guard !aiPaused, !aiDeferredForForegroundWork, aiTask == nil, !aiQueuedIDs.isEmpty else { return }
         let id = aiQueuedIDs.removeFirst()
         aiActiveID = id
+        let token = UUID()
+        aiActiveToken = token
         persistAIQueue()
-        guard let record = allRecords.first(where: { $0.id == id }) else { startNextAIJobIfPossible(); return }
+        guard let record = allRecords.first(where: { $0.id == id }) else {
+            finishAIJob(token: token, id: id)
+            return
+        }
         let photo = record.sourcePhoto.isEmpty ? record.photo : record.sourcePhoto
         let root = customOutputRoot ?? outputRoot
         let imageURL = root.appendingPathComponent(photo)
         let revision = record.revision ?? 0
         aiTask = Task { [weak self, aiAnalyzer] in
+            guard let self else { return }
             let analysis = await aiAnalyzer.analyze(record: record, imageURL: imageURL)
-            guard !Task.isCancelled else { return }
             await MainActor.run {
-                guard let self, let index = self.allRecords.firstIndex(where: { $0.id == id }) else { return }
-                // A human/OCR change during inference makes output stale; do not publish it.
-                guard (self.allRecords[index].revision ?? 0) == revision else { self.aiTask = nil; self.aiActiveID = nil; self.persistAIQueue(); self.startNextAIJobIfPossible(); return }
+                guard self.aiActiveToken == token else { return }
+                defer { self.finishAIJob(token: token, id: id) }
+                guard !Task.isCancelled,
+                      let index = self.allRecords.firstIndex(where: { $0.id == id }) else { return }
+                // A human/OCR change, status transition, or malformed envelope during
+                // inference makes output stale; never publish it.
+                guard self.allRecords[index].status == "REVIEW",
+                      (self.allRecords[index].revision ?? 0) == revision,
+                      analysis.recordID == id,
+                      analysis.recordRevision == revision else { return }
                 var latest = self.allRecords[index]
                 latest.aiAnalysis = analysis
-                self.allRecords[index] = latest
-                do { try saveRecordLive(latest, allRecords: self.allRecords, sortOrder: index) } catch { self.aiFailed += 1 }
+                var proposed = self.allRecords
+                proposed[index] = latest
+                // Database is authoritative: do not expose an AI result until it is durable.
+                do { try saveRecordLive(latest, allRecords: proposed, sortOrder: index) }
+                catch { self.aiFailed += 1; return }
+                self.allRecords = proposed
                 switch analysis.status { case .ready: self.aiCompleted += 1; case .abstained, .unavailable: self.aiAbstained += 1; default: self.aiFailed += 1 }
-                self.aiTask = nil
-                self.aiActiveID = nil
-                self.persistAIQueue()
                 self.delegate?.reviewCoordinator(self, didUpdateRecords: self.allRecords)
                 if self.currentRecordId == id { self.delegate?.reviewCoordinator(self, didUpdateSelectedRecord: latest) }
-                self.startNextAIJobIfPossible()
             }
         }
+    }
+
+    private func finishAIJob(token: UUID, id: String) {
+        guard aiActiveToken == token else { return }
+        aiTask = nil
+        aiActiveID = nil
+        aiActiveToken = nil
+        persistAIQueue()
+        startNextAIJobIfPossible()
     }
 
     private func persistAIQueue() {
@@ -811,16 +870,19 @@ final class ReviewCoordinator {
 
     func recoverStalledProcessing(record: BondRecord) throws -> BondRecord {
         var updated = record
+        updated.revision = (updated.revision ?? 0) + 1
         updated.status = "REVIEW"
         var reasons = Set(updated.reviewReasons ?? [])
         reasons.insert("stalled_processing: OCR interrupted")
         updated.reviewReasons = Array(reasons).sorted()
         applyRequiredStatus(&updated)
 
-        if let idx = allRecords.firstIndex(where: { $0.id == updated.id }) {
-            allRecords[idx] = updated
-        }
-        try saveRecordLive(updated, allRecords: allRecords)
+        var proposed = allRecords
+        if let idx = proposed.firstIndex(where: { $0.id == updated.id }) {
+            proposed[idx] = updated
+        } else { throw ReviewError.recordNotFound(updated.id) }
+        try saveRecordLive(updated, allRecords: proposed)
+        allRecords = proposed
         recalculateQueue()
         delegate?.reviewCoordinator(self, didUpdateRecords: allRecords)
         delegate?.reviewCoordinator(self, didSelectRecord: updated)
@@ -924,11 +986,15 @@ final class ReviewCoordinator {
         latest.revision = (latest.revision ?? 1) + 1
         applyRequiredStatus(&latest)
 
-        // Persist to database
-        if let idx = allRecords.firstIndex(where: { $0.id == latest.id }) {
-            allRecords[idx] = latest
+        // Persist the proposed snapshot before publishing it.  A failed write leaves
+        // both the displayed record and retry source untouched.
+        guard let idx = allRecords.firstIndex(where: { $0.id == latest.id }) else {
+            throw ReviewError.recordNotFound(latest.id)
         }
-        try saveRecordLive(latest, allRecords: allRecords)
+        var proposed = allRecords
+        proposed[idx] = latest
+        try saveRecordLive(latest, allRecords: proposed, sortOrder: idx)
+        allRecords = proposed
 
         recalculateQueue()
         delegate?.reviewCoordinator(self, didUpdateRecords: allRecords)

@@ -1329,6 +1329,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         guard !ocrBusy, let job = ocrPending.first else { return }
         ocrPending.removeFirst()
         ocrBusy = true
+        reviewWindowController?.coordinator.setAIBackgroundWorkDeferred(true)
         let remaining = ocrPending.count
         status("Reading the saved photograph with Apple Vision OCR…" + (remaining > 0 ? " (\(remaining) waiting)." : ""))
         ocrQueue.async { [weak self] in
@@ -1338,6 +1339,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                     self.markOCRFailed(id: job.id, message: "Could not read the saved photograph for OCR. The original file is still in the output folder.")
                     self.ocrBusy = false
                     self.pumpOCR()
+                    self.reviewWindowController?.coordinator.setAIBackgroundWorkDeferred(self.ocrBusy || !self.ocrPending.isEmpty)
                 }
                 return
             }
@@ -1352,20 +1354,32 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 self.applyOCR(result, to: job.id)
                 self.ocrBusy = false
                 self.pumpOCR()
+                self.reviewWindowController?.coordinator.setAIBackgroundWorkDeferred(self.ocrBusy || !self.ocrPending.isEmpty)
             }
         }
     }
 
     private func markOCRFailed(id: String, message: String) {
         guard let index = records.firstIndex(where: { $0.id == id }) else { return }
-        records[index].status = "REVIEW"
-        records[index].notes = message
-        let dest = outputRoot.appendingPathComponent(records[index].photo)
-        let src = outputRoot.appendingPathComponent(records[index].sourcePhoto)
+        var updated = records[index]
+        updated.status = "REVIEW"
+        updated.notes = message
+        updated.revision = (updated.revision ?? 0) + 1
+        let dest = outputRoot.appendingPathComponent(updated.photo)
+        let src = outputRoot.appendingPathComponent(updated.sourcePhoto)
         if !FileManager.default.fileExists(atPath: dest.path) {
             try? FileManager.default.copyItem(at: src, to: dest)
         }
-        try? saveRecordLive(records[index], allRecords: records, sortOrder: index)
+        var proposed = records
+        proposed[index] = updated
+        do {
+            try saveRecordLive(updated, allRecords: proposed, sortOrder: index)
+            records = proposed
+        } catch {
+            status("OCR failure state could not be saved: \(error.localizedDescription). Photo preserved.")
+            ScanLog.shared.write("ocr failure state write failed; photo preserved")
+            return
+        }
         updateCount()
         preview.captureFlash(color: .systemRed)
         status(message)
@@ -1507,6 +1521,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         incoming.capturedAt = row.capturedAt
         incoming.sourcePhoto = row.sourcePhoto
         incoming.photo = row.photo
+        incoming.revision = (row.revision ?? 0) + 1
         applyRequiredStatus(&incoming)
 
         // Prevent stale OCR jobs from overwriting newer user changes

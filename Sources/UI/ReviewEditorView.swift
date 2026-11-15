@@ -743,7 +743,7 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
         updateFieldBadgesAndErrors()
         updateReasonsBanner()
         updateDuplicateCard()
-        showAIAnalysis(r.aiAnalysis)
+        showAIAnalysis(r.aiAnalysis, for: r)
     }
 
     /// Safely handles external updates (background OCR completion, queue updates, etc.)
@@ -807,7 +807,7 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
 
         updateFieldBadgesAndErrors()
         updateReasonsBanner()
-        showAIAnalysis(record.aiAnalysis)
+        showAIAnalysis(record.aiAnalysis, for: record)
     }
 
     func updateProgress(_ progress: ReviewProgress) {
@@ -957,17 +957,25 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
 
     /// Displays AI output as draft-only edits. Applying one merely updates the
     /// current editor draft; the reviewer must still Save or Save & Next.
-    private func showAIAnalysis(_ analysis: BondAIAnalysis?) {
+    private func showAIAnalysis(_ analysis: BondAIAnalysis?, for record: BondRecord) {
         guard let analysis else { return }
         suggestionsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         suggestionsBox.isHidden = false
+        let isCurrent = analysis.recordID == record.id
+            && analysis.recordRevision == (record.revision ?? 0)
+            && analysis.promptVersion == BondAIAnalysis.currentPromptVersion
+            && record.status == "REVIEW"
         let status: String
+        if !isCurrent {
+            status = "AI Analysis History — Outdated (not actionable)"
+        } else {
         switch analysis.status {
         case .ready: status = "AI Analysis — Suggestions are unverified"
         case .abstained: status = "AI Analysis — Evidence insufficient"
         case .unavailable: status = "AI Analysis Unavailable"
         case .failed: status = "AI Analysis Could Not Complete"
         case .cancelled: status = "AI Analysis Cancelled"
+        }
         }
         let header = NSTextField(labelWithString: status)
         header.font = .systemFont(ofSize: 11.5, weight: .bold)
@@ -994,7 +1002,9 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
             detail.textColor = .secondaryLabelColor
             detail.maximumNumberOfLines = 2
             row.addArrangedSubview(detail)
-            if let value = suggestion.proposedValue, !suggestion.abstained {
+            // Stale output remains visible as audit history, but can never alter a
+            // draft or become an accidental recommendation after OCR/review edits.
+            if isCurrent, let value = suggestion.proposedValue, !suggestion.abstained {
                 currentSuggestions[suggestion.field] = value
                 let buttons = NSStackView()
                 buttons.orientation = .horizontal

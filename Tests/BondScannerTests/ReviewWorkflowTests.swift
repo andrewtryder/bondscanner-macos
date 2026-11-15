@@ -5,6 +5,27 @@ import SQLite3
 import XCTest
 
 final class ReviewWorkflowTests: XCTestCase {
+    private actor SuspendedAI: BondAIAnalyzing {
+        private var continuations: [String: CheckedContinuation<BondAIAnalysis, Never>] = [:]
+
+        func analyze(record: BondRecord, imageURL: URL) async -> BondAIAnalysis {
+            await withCheckedContinuation { continuation in
+                continuations[record.id] = continuation
+            }
+        }
+
+        func hasStarted(_ id: String) -> Bool { continuations[id] != nil }
+
+        func resume(_ record: BondRecord, status: BondAIAnalysis.Status = .ready) {
+            guard let continuation = continuations.removeValue(forKey: record.id) else { return }
+            continuation.resume(returning: BondAIAnalysis(
+                recordID: record.id, recordRevision: record.revision ?? 0,
+                analyzedAt: Date(), runtime: "suspended-test",
+                promptVersion: BondAIAnalysis.currentPromptVersion, status: status,
+                suggestions: [], summary: "Controlled test result", failureKind: nil
+            ))
+        }
+    }
     private struct SuggestingAI: BondAIAnalyzing {
         func analyze(record: BondRecord, imageURL: URL) async -> BondAIAnalysis {
             BondAIAnalysis(recordID: record.id, recordRevision: record.revision ?? 0, analyzedAt: Date(), runtime: "test", promptVersion: BondAIAnalysis.currentPromptVersion, status: .ready, suggestions: [BondAISuggestion(field: "serial", existingValue: record.serial, proposedValue: "C1234567890EE", abstained: false, evidence: "synthetic", imageRegion: nil, ambiguity: "test", assessment: .conflictingEvidence, requiresOriginalInspection: true)], summary: "Synthetic result", failureKind: nil)
@@ -22,6 +43,8 @@ final class ReviewWorkflowTests: XCTestCase {
         testDbURL = tempDir.appendingPathComponent("bonds.sqlite3")
         testDb = try? DatabaseManager(url: testDbURL)
         DatabaseManager.setSharedInstance(testDb)
+        UserDefaults.standard.removeObject(forKey: "bondAIReviewQueue")
+        UserDefaults.standard.removeObject(forKey: "bondAIReviewPaused")
 
         ExportConfiguration.shared.setCustomDestinations(
             records: tempDir.appendingPathComponent("records.json"),
@@ -33,6 +56,8 @@ final class ReviewWorkflowTests: XCTestCase {
         ScanLog.shared.isEnabled = true
         ExportConfiguration.shared.resetToDefaults()
         DatabaseManager.setSharedInstance(nil)
+        UserDefaults.standard.removeObject(forKey: "bondAIReviewQueue")
+        UserDefaults.standard.removeObject(forKey: "bondAIReviewPaused")
         testDb = nil
         if let dir = tempDir {
             try? FileManager.default.removeItem(at: dir)
@@ -120,6 +145,52 @@ final class ReviewWorkflowTests: XCTestCase {
         XCTAssertEqual(updated.serial, "C123456789OEE", "AI must never overwrite a bond field")
         XCTAssertEqual(updated.aiAnalysis?.recordRevision, 7)
         XCTAssertEqual(updated.aiAnalysis?.suggestions.first?.proposedValue, "C1234567890EE")
+    }
+
+    func testSuspendedAIAdvancesAfterRecordIsDeletedDuringInference() async throws {
+        var first = makeSampleRecord(id: "first", status: "REVIEW")
+        var second = makeSampleRecord(id: "second", status: "REVIEW")
+        first.revision = 3; second.revision = 4
+        for record in [first, second] {
+            let imageURL = tempDir.appendingPathComponent(record.sourcePhoto)
+            try FileManager.default.createDirectory(at: imageURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data().write(to: imageURL)
+            try testDb.upsertRecord(record)
+        }
+        let analyzer = SuspendedAI()
+        let coordinator = ReviewCoordinator(records: [first, second], outputRoot: tempDir, aiAnalyzer: analyzer)
+        coordinator.enqueueAIReview(recordID: first.id)
+        coordinator.enqueueAIReview(recordID: second.id)
+        for _ in 0..<50 where !(await analyzer.hasStarted(first.id)) { try await Task.sleep(for: .milliseconds(10)) }
+        let firstStarted = await analyzer.hasStarted(first.id)
+        XCTAssertTrue(firstStarted)
+
+        coordinator.setAllRecords([second]) // simulates a merge/delete while inference is suspended
+        await analyzer.resume(first)
+        for _ in 0..<50 where !(await analyzer.hasStarted(second.id)) { try await Task.sleep(for: .milliseconds(10)) }
+        let secondStarted = await analyzer.hasStarted(second.id)
+        XCTAssertTrue(secondStarted, "Deleted work must always release the queue")
+        await analyzer.resume(second)
+        for _ in 0..<50 where coordinator.allRecords.first?.aiAnalysis == nil { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(coordinator.allRecords.first?.aiAnalysis?.recordRevision, second.revision)
+    }
+
+    func testSuspendedAIRejectsRevisionChangedDuringInference() async throws {
+        var record = makeSampleRecord(status: "REVIEW")
+        record.revision = 10
+        let imageURL = tempDir.appendingPathComponent(record.sourcePhoto)
+        try FileManager.default.createDirectory(at: imageURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: imageURL)
+        try testDb.upsertRecord(record)
+        let analyzer = SuspendedAI()
+        let coordinator = ReviewCoordinator(records: [record], outputRoot: tempDir, aiAnalyzer: analyzer)
+        coordinator.enqueueAIReview(recordID: record.id)
+        for _ in 0..<50 where !(await analyzer.hasStarted(record.id)) { try await Task.sleep(for: .milliseconds(10)) }
+        _ = try coordinator.saveRecord(record: record, userEdits: ["owner": "Changed while AI ran"], confirmedFields: ["owner"])
+        await analyzer.resume(record)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(coordinator.allRecords.first?.aiAnalysis, "Stale AI output must not publish")
+        XCTAssertEqual(coordinator.allRecords.first?.owner, "Changed while AI ran")
     }
 
     // MARK: - 2. Manual Field Confirmation
