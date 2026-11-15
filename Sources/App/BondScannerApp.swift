@@ -204,6 +204,9 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if isTestMode || NSClassFromString("XCTestCase") != nil {
+            return
+        }
         ScanLog.shared.write("app quit")
         flushAutomaticExports(records: records)
         session.stopRunning()
@@ -1419,21 +1422,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     private func trashCapturePhotos(_ record: BondRecord) {
-        for rel in [record.photo, record.sourcePhoto] where !rel.isEmpty {
-            let usedElsewhere = records.contains { other in
-                other.id != record.id && (
-                    other.photo == rel || other.sourcePhoto == rel
-                        || (other.fieldPhoto ?? [:]).values.contains(rel)
-                )
-            }
-            if usedElsewhere {
-                continue
-            }
-            let url = outputRoot.appendingPathComponent(rel)
-            if FileManager.default.fileExists(atPath: url.path) {
-                try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
-            }
-        }
+        safelyTrashPhotographs(for: record, existingRecords: records, root: outputRoot)
     }
 
     private func priorRecord(for incoming: BondRecord) -> BondRecord? {
@@ -1566,6 +1555,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 // Exact match with no new fields. Keep the original photograph on disk. Never trash it!
                 let preserveNote = "Duplicate scan photo preserved at \(incoming.sourcePhoto)"
                 merged.notes = merged.notes.isEmpty ? preserveNote : "\(merged.notes); \(preserveNote)"
+                addAssociatedPhotos(to: &merged, newPhotos: [incoming.sourcePhoto, incoming.photo] + (incoming.associatedPhotos ?? []))
                 let previous = records
                 records.removeAll { $0.id == incoming.id }
                 if let idx = records.firstIndex(where: { $0.id == prior.id }) {
@@ -1587,6 +1577,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 return
             }
             writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
+            addAssociatedPhotos(to: &merged, newPhotos: [incoming.sourcePhoto, incoming.photo] + (incoming.associatedPhotos ?? []))
             let previous = records
             records.removeAll { $0.id == incoming.id }
             let targetIndex: Int
@@ -1611,7 +1602,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             ScanLog.shared.write("merged fields=\(fieldList) into existing record atomically; photograph kept (prior id=\(prior.id.prefix(8))) status=\(merged.status)")
             let flash: NSColor = requiredFieldsComplete(merged) ? .systemGreen : .systemYellow
             let message = requiredFieldsComplete(merged)
-                ? "Updated the existing record with \(fieldList). All required fields verified. Remove the bond."
+                ? "Updated the existing record with \(fieldList). Automatic validation passed. Remove the bond."
                 : "Updated the existing record with \(fieldList). Still missing \(requiredFieldsMissing(merged).joined(separator: ", "))."
             presentRecord(merged, flash: flash, message: message, automatic: false, contributed: true, isNew: false)
             return
@@ -1666,7 +1657,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         ScanLog.shared.write("scan updated status=\(incoming.status) fields_nonempty=\([incoming.series, incoming.serial, incoming.issueMonth, incoming.issueYear, incoming.denomination].filter { !$0.isEmpty }.count) rectified=\(result.rectified) total=\(records.count)")
         let flash: NSColor = incoming.status == "OK" ? .systemGreen : .systemYellow
         let message = incoming.status == "OK"
-            ? "OCR complete — verified. Remove the bond, then show the next one."
+            ? "OCR complete — automatic validation passed. Remove the bond, then show the next one."
             : "OCR complete — review needed (\(requiredFieldsMissing(incoming).joined(separator: ", "))). Remove the bond, then show the next one."
         presentRecord(incoming, flash: flash, message: message, automatic: false, contributed: true, isNew: true)
     }
@@ -1752,7 +1743,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                     if auto {
                         presentRecord(merged, flash: .systemOrange,
                                       message: requiredFieldsComplete(merged)
-                                          ? "Same bond already verified. Remove it before the next one."
+                                          ? "Same bond already validated. Remove it before the next one."
                                           : "Same bond — no new required fields. Trying again…",
                                       automatic: auto, contributed: false, isNew: false)
                     } else {
@@ -1770,6 +1761,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                                               contributingPhoto: incoming.photo,
                                               contributingSource: incoming.sourcePhoto,
                                               captureId: incoming.id)
+                addAssociatedPhotos(to: &merged, newPhotos: [incoming.sourcePhoto, incoming.photo] + (incoming.associatedPhotos ?? []))
                 records[priorIndex] = merged
                 try saveRecordLive(merged, allRecords: records, sortOrder: priorIndex)
                 let fieldList = (filled2.isEmpty ? filled : filled2).joined(separator: ", ")
@@ -1778,7 +1770,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 let flash: NSColor = requiredFieldsComplete(merged) ? .systemGreen : .systemYellow
                 let message: String
                 if requiredFieldsComplete(merged) {
-                    message = "Updated the existing record with \(fieldList). All required fields verified. Remove the bond."
+                    message = "Updated the existing record with \(fieldList). Automatic validation passed. Remove the bond."
                 } else if auto, autoFillAttempts + 1 < autoFillMaxAttempts {
                     message = "Updated with \(fieldList). Still missing \(requiredFieldsMissing(merged).joined(separator: ", ")). Trying another photograph…"
                 } else {
@@ -1813,7 +1805,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             let flash: NSColor = incoming.status == "OK" ? .systemGreen : .systemYellow
             let message: String
             if incoming.status == "OK" {
-                message = "Saved! All required fields verified. Remove the bond, then show the next one."
+                message = "Saved! Automatic validation passed. Remove the bond, then show the next one."
             } else if auto {
                 message = "Saved. Still missing \(requiredFieldsMissing(incoming).joined(separator: ", ")). Trying another photograph…"
             } else {
@@ -1833,8 +1825,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         let processing = records.filter { $0.status == "PROCESSING" }.count
         let duplicates = records.filter { $0.status == "DUPLICATE" }.count
         let reviews = records.filter { $0.status != "OK" && $0.status != "PROCESSING" && $0.status != "DUPLICATE" }.count
-        let verified = records.filter { $0.status == "OK" }.count
-        var text = "\(records.count) captured  •  \(verified) verified  •  \(reviews) need review"
+        let validated = records.filter { $0.status == "OK" }.count
+        var text = "\(records.count) captured  •  \(validated) validated  •  \(reviews) need review"
         if duplicates > 0 {
             text += "  •  \(duplicates) duplicate"
         }
@@ -1935,17 +1927,11 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         alert.addButton(withTitle: "Undo")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        records.removeLast()
+        let remaining = records.dropLast()
         do {
-            try deleteRecordLive(id: last.id, allRecords: records)
-            let image = outputRoot.appendingPathComponent(last.photo)
-            if FileManager.default.fileExists(atPath: image.path) {
-                try? FileManager.default.trashItem(at: image, resultingItemURL: nil)
-            }
-            let original = outputRoot.appendingPathComponent(last.sourcePhoto)
-            if FileManager.default.fileExists(atPath: original.path) {
-                try? FileManager.default.trashItem(at: original, resultingItemURL: nil)
-            }
+            try deleteRecordLive(id: last.id, allRecords: Array(remaining))
+            records.removeLast()
+            safelyTrashPhotographs(for: last, existingRecords: records, root: outputRoot)
             updateCount()
             lockedAfterCapture = false
             awaitingSerialFromCapture = false
@@ -1956,7 +1942,6 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             }
             status("Undid last scan. Ready.")
         } catch {
-            records.append(last)
             status("Cannot undo: \(error.localizedDescription)")
         }
     }

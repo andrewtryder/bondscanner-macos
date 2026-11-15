@@ -105,7 +105,7 @@ if [ "$SKIP_TESTS" = false ]; then
         exit 1
     fi
     TESTS="$(xcrun xcresulttool get test-results tests --path "$RESULT_BUNDLE")"
-    for suite in ReviewWorkflowTests BondValidationTests BondScannerTests; do
+    for suite in ReviewWorkflowTests BondValidationTests BondScannerTests DataSafetyAndRetentionTests; do
         SUITE="$(printf '%s' "$TESTS" | jq -c --arg suite "$suite" '.. | objects | select(.name? == $suite and .nodeType? == "Test Suite")' | head -n 1)"
         if [ -z "$SUITE" ]; then
             echo "❌ Expected XCTest suite missing: $suite" >&2

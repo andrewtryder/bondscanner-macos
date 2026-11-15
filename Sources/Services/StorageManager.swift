@@ -3,10 +3,83 @@ import CoreGraphics
 import Foundation
 import ImageIO
 
-let outputRoot = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans", isDirectory: true)
-let photosRoot = outputRoot.appendingPathComponent("photos", isDirectory: true)
-let recordsURLDefault = outputRoot.appendingPathComponent("records.json")
-let csvURLDefault = outputRoot.appendingPathComponent("bonds.csv")
+var isTestModeActive: Bool {
+    ProcessInfo.processInfo.environment["BONDSCANNER_TEST_MODE"] == "1" || NSClassFromString("XCTestCase") != nil
+}
+
+final class StorageConfiguration {
+    static let shared = StorageConfiguration()
+    private let lock = NSLock()
+    private var customOutputRoot: URL?
+    private var customBackupsRoot: URL?
+
+    var outputRoot: URL {
+        lock.lock()
+        defer { lock.unlock() }
+        if let custom = customOutputRoot {
+            return custom
+        }
+        if let env = ProcessInfo.processInfo.environment["BONDSCANNER_OUTPUT_ROOT"], !env.isEmpty {
+            return URL(fileURLWithPath: env, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans", isDirectory: true)
+    }
+
+    var backupsRoot: URL {
+        lock.lock()
+        defer { lock.unlock() }
+        if let custom = customBackupsRoot {
+            return custom
+        }
+        if let env = ProcessInfo.processInfo.environment["BONDSCANNER_BACKUPS_ROOT"], !env.isEmpty {
+            return URL(fileURLWithPath: env, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans_backups", isDirectory: true)
+    }
+
+    func setCustomOutputRoot(_ url: URL?) {
+        lock.lock()
+        defer { lock.unlock() }
+        customOutputRoot = url
+    }
+
+    func setCustomBackupsRoot(_ url: URL?) {
+        lock.lock()
+        defer { lock.unlock() }
+        customBackupsRoot = url
+    }
+
+    func setCustomRoots(outputRoot: URL?, backupsRoot: URL?) {
+        lock.lock()
+        defer { lock.unlock() }
+        customOutputRoot = outputRoot
+        customBackupsRoot = backupsRoot
+    }
+
+    func resetToDefaults() {
+        lock.lock()
+        defer { lock.unlock() }
+        customOutputRoot = nil
+        customBackupsRoot = nil
+    }
+}
+
+var outputRoot: URL {
+    StorageConfiguration.shared.outputRoot
+}
+
+var photosRoot: URL {
+    outputRoot.appendingPathComponent("photos", isDirectory: true)
+}
+
+var recordsURLDefault: URL {
+    outputRoot.appendingPathComponent("records.json")
+}
+
+var csvURLDefault: URL {
+    outputRoot.appendingPathComponent("bonds.csv")
+}
+
 var recordsURL: URL {
     ExportConfiguration.shared.recordsURL
 }
@@ -15,7 +88,98 @@ var csvURL: URL {
     ExportConfiguration.shared.csvURL
 }
 
-let debugURL = outputRoot.appendingPathComponent("scan-debug.log")
+var debugURL: URL {
+    outputRoot.appendingPathComponent("scan-debug.log")
+}
+
+enum StorageError: Error, LocalizedError, Equatable {
+    case productionAccessForbidden(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .productionAccessForbidden(path):
+            return "Production storage access forbidden during test mode: \(path)"
+        }
+    }
+}
+
+func isProductionStorageProtected() -> Bool {
+    isTestModeActive
+}
+
+func isProductionStorageProtected(destination: URL) -> Bool {
+    guard isTestModeActive else { return false }
+    let defaultProd = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans", isDirectory: true).standardized.path
+    let destPath = destination.standardized.path
+    return destPath == defaultProd || destPath.hasPrefix(defaultProd + "/")
+}
+
+func addAssociatedPhotos(to record: inout BondRecord, newPhotos: [String]) {
+    var existing = Set(record.associatedPhotos ?? [])
+    for p in newPhotos where !p.isEmpty {
+        if p != record.photo, p != record.sourcePhoto {
+            existing.insert(p)
+        }
+    }
+    record.associatedPhotos = existing.isEmpty ? nil : Array(existing).sorted()
+}
+
+func isPhotographReferenced(_ photoPath: String, excludingRecordId: String? = nil, among records: [BondRecord]) -> Bool {
+    guard !photoPath.isEmpty else { return false }
+    for r in records {
+        if let excl = excludingRecordId, r.id == excl {
+            continue
+        }
+        if r.photo == photoPath || r.sourcePhoto == photoPath {
+            return true
+        }
+        if let fieldPhotos = r.fieldPhoto, fieldPhotos.values.contains(photoPath) {
+            return true
+        }
+        if let assoc = r.associatedPhotos, assoc.contains(photoPath) {
+            return true
+        }
+    }
+    return false
+}
+
+@discardableResult
+func safelyTrashPhotographs(for record: BondRecord, existingRecords: [BondRecord], root: URL = outputRoot) -> [String] {
+    var trashed: [String] = []
+    var candidatePhotos = Set<String>()
+    if !record.photo.isEmpty {
+        candidatePhotos.insert(record.photo)
+    }
+    if !record.sourcePhoto.isEmpty {
+        candidatePhotos.insert(record.sourcePhoto)
+    }
+    if let assoc = record.associatedPhotos {
+        for p in assoc where !p.isEmpty {
+            candidatePhotos.insert(p)
+        }
+    }
+    if let fieldPhotos = record.fieldPhoto {
+        for p in fieldPhotos.values where !p.isEmpty {
+            candidatePhotos.insert(p)
+        }
+    }
+
+    for rel in candidatePhotos {
+        if isPhotographReferenced(rel, excludingRecordId: record.id, among: existingRecords) {
+            continue
+        }
+        let url = root.appendingPathComponent(rel)
+        if FileManager.default.fileExists(atPath: url.path) {
+            do {
+                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+                trashed.append(rel)
+            } catch {
+                ScanLog.shared.write("trashItem failed for \(rel): \(error.localizedDescription)")
+            }
+        }
+    }
+    return trashed
+}
 
 func sanitizeCSV(_ value: String) -> String {
     // Prevent spreadsheet formula injection from untrusted OCR strings.
@@ -42,12 +206,18 @@ func formatCSV(for records: [BondRecord]) -> String {
 }
 
 func exportCSV(_ records: [BondRecord], to url: URL = csvURL) throws {
+    guard !isProductionStorageProtected(destination: url) else {
+        throw StorageError.productionAccessForbidden(url.path)
+    }
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     let csv = formatCSV(for: records)
     try csv.write(to: url, atomically: true, encoding: .utf8)
 }
 
 func exportJSON(_ records: [BondRecord], to url: URL = recordsURL) throws {
+    guard !isProductionStorageProtected(destination: url) else {
+        throw StorageError.productionAccessForbidden(url.path)
+    }
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -144,6 +314,12 @@ final class ExportCoordinator {
     private func performExport(snapshot: [BondRecord], version: UInt64, logPrefix: String) {
         let destRecordsURL = ExportConfiguration.shared.recordsURL
         let destCSVURL = ExportConfiguration.shared.csvURL
+        guard !isProductionStorageProtected(destination: destRecordsURL),
+              !isProductionStorageProtected(destination: destCSVURL)
+        else {
+            ScanLog.shared.write("\(logPrefix) skipped: production destinations protected during test mode")
+            return
+        }
         do {
             try exportJSON(snapshot, to: destRecordsURL)
             try exportCSV(snapshot, to: destCSVURL)

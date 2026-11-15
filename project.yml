@@ -120,3 +120,16 @@ schemes:
         BONDSCANNER_AI_DRAFT_LIMIT: "5"
       targets:
         - BondScannerTests
+
+  BondScannerRealOCRRegression:
+    build:
+      targets:
+        BondScanner: all
+        BondScannerTests: [test]
+    test:
+      config: Debug
+      environmentVariables:
+        BONDSCANNER_TEST_MODE: "1"
+        BONDSCANNER_RUN_PRIVATE_REAL_OCR_REGRESSION: "1"
+      targets:
+        - BondScannerTests

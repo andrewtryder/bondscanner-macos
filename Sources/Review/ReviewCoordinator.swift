@@ -869,6 +869,32 @@ final class ReviewCoordinator {
         }
         merged.associatedPhotos = photos.isEmpty ? nil : Array(photos).sorted()
 
+        // 2b. Preserve field-level photograph provenance
+        var fieldPhotos = primary.fieldPhoto ?? [:]
+        var fieldCaptureIds = primary.fieldCaptureId ?? [:]
+        for f in fieldsToCheck {
+            let mVal = getVal(merged, field: f).trimmingCharacters(in: .whitespacesAndNewlines)
+            let pVal = getVal(primary, field: f).trimmingCharacters(in: .whitespacesAndNewlines)
+            let dVal = getVal(duplicate, field: f).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !dVal.isEmpty && (pVal.isEmpty || mVal == dVal) {
+                let dPhoto = duplicate.fieldPhoto?[f] ?? (duplicate.sourcePhoto.isEmpty ? duplicate.photo : duplicate.sourcePhoto)
+                if !dPhoto.isEmpty {
+                    fieldPhotos[f] = dPhoto
+                    if dPhoto != merged.photo && dPhoto != merged.sourcePhoto {
+                        var curAssoc = Set(merged.associatedPhotos ?? [])
+                        curAssoc.insert(dPhoto)
+                        merged.associatedPhotos = Array(curAssoc).sorted()
+                    }
+                }
+                let dCap = duplicate.fieldCaptureId?[f] ?? duplicate.id
+                if !dCap.isEmpty {
+                    fieldCaptureIds[f] = dCap
+                }
+            }
+        }
+        merged.fieldPhoto = fieldPhotos.isEmpty ? nil : fieldPhotos
+        merged.fieldCaptureId = fieldCaptureIds.isEmpty ? nil : fieldCaptureIds
+
         // 3. Retain confirmed-field status ONLY for values explicitly selected and retained
         var finalConfirmed = Set<String>()
         for f in fieldsToCheck {
