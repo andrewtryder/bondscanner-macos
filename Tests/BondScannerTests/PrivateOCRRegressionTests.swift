@@ -40,8 +40,6 @@ struct FixtureManifestItem: Decodable {
 // MARK: - Quality Metrics Models (Local Privacy-Safe Reporting)
 
 struct FixtureMetric: Codable {
-    let id: String
-    let scenario: String
     let durationSeconds: Double
     let seriesEvaluated: Bool
     let seriesMatch: Bool
@@ -207,7 +205,7 @@ final class PrivateOCRRegressionTests: XCTestCase {
                     return
                 }
                 guard let image = cgImageFromFile(imageURL) else {
-                    XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Failed to decode image file '\(item.filename)'")
+                    XCTFail("[\(dataset.displayName)] fixture: Failed to decode image")
                     return
                 }
 
@@ -235,14 +233,14 @@ final class PrivateOCRRegressionTests: XCTestCase {
                             (expectedSeries == "EE" && record.series == "E")
                         {
                             seriesMisclassified = true
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Series classification mismatch: E vs EE confusion")
+                            XCTFail("[\(dataset.displayName)] fixture: Series classification mismatch: E vs EE confusion")
                         } else {
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Series mismatch")
+                            XCTFail("[\(dataset.displayName)] fixture: Series mismatch")
                         }
 
                         if fieldConfidenceIsHigh(record, "series") {
                             falseHighConfFields.append("series")
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for series")
+                            XCTFail("[\(dataset.displayName)] fixture: False high-confidence reading for series")
                         }
                     }
                 }
@@ -259,10 +257,10 @@ final class PrivateOCRRegressionTests: XCTestCase {
                         denomMatch = true
                         matchedDenom += 1
                     } else {
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Denomination mismatch")
+                        XCTFail("[\(dataset.displayName)] fixture: Denomination mismatch")
                         if fieldConfidenceIsHigh(record, "denomination") {
                             falseHighConfFields.append("denomination")
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for denomination")
+                            XCTFail("[\(dataset.displayName)] fixture: False high-confidence reading for denomination")
                         }
                     }
                 }
@@ -281,14 +279,14 @@ final class PrivateOCRRegressionTests: XCTestCase {
                     } else {
                         // Check if selected serial looks like routing/account number (e.g. numeric without valid bond suffix)
                         if !normActual.isEmpty, normActual.rangeOfCharacter(from: CharacterSet.letters) == nil || !normActual.hasSuffix("E") {
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Serial mismatch (possible routing/account number confusion)")
+                            XCTFail("[\(dataset.displayName)] fixture: Serial mismatch (possible routing/account number confusion)")
                         } else {
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Serial mismatch")
+                            XCTFail("[\(dataset.displayName)] fixture: Serial mismatch")
                         }
 
                         if fieldConfidenceIsHigh(record, "serial") {
                             falseHighConfFields.append("serial")
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for serial")
+                            XCTFail("[\(dataset.displayName)] fixture: False high-confidence reading for serial")
                         }
                     }
                 }
@@ -317,17 +315,17 @@ final class PrivateOCRRegressionTests: XCTestCase {
                             let normStamp = stamp.uppercased()
                             if (!actMonth.isEmpty && normStamp.contains(actMonth)) || (!actYear.isEmpty && normStamp.contains(actYear)) {
                                 datingStampConfused = true
-                                XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Issue date confused with bank dating stamp")
+                                XCTFail("[\(dataset.displayName)] fixture: Issue date confused with bank dating stamp")
                             } else {
-                                XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Issue date mismatch")
+                                XCTFail("[\(dataset.displayName)] fixture: Issue date mismatch")
                             }
                         } else {
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Issue date mismatch")
+                            XCTFail("[\(dataset.displayName)] fixture: Issue date mismatch")
                         }
 
                         if fieldConfidenceIsHigh(record, "issueDate") {
                             falseHighConfFields.append("issueDate")
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for issueDate")
+                            XCTFail("[\(dataset.displayName)] fixture: False high-confidence reading for issueDate")
                         }
                     }
                 }
@@ -337,7 +335,7 @@ final class PrivateOCRRegressionTests: XCTestCase {
                     for (fieldKey, expectedLevel) in expectedConf {
                         let actualLevel = record.fieldConfidence?[fieldKey] ?? "none"
                         if actualLevel.caseInsensitiveCompare(expectedLevel) != .orderedSame {
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Confidence mismatch for '\(fieldKey)'")
+                            XCTFail("[\(dataset.displayName)] fixture: Confidence mismatch for '\(fieldKey)'")
                         }
                     }
                 }
@@ -354,7 +352,7 @@ final class PrivateOCRRegressionTests: XCTestCase {
                 if record.status.uppercased() == "OK" && hasAnyMismatch {
                     isIncorrectOK = true
                     totalIncorrectOK += 1
-                    XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Incorrect OK status assigned despite field mismatches")
+                    XCTFail("[\(dataset.displayName)] fixture: Incorrect OK status assigned despite field mismatches")
                 }
 
                 if let expStatus = item.expectedStatus, !expStatus.isEmpty {
@@ -362,15 +360,13 @@ final class PrivateOCRRegressionTests: XCTestCase {
                     if record.status.caseInsensitiveCompare(expStatus) == .orderedSame {
                         statusMatch = true
                     } else {
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Status mismatch")
+                        XCTFail("[\(dataset.displayName)] fixture: Status mismatch")
                     }
                 }
 
                 totalFalseHighConf += falseHighConfFields.count
 
                 fixtureMetrics.append(FixtureMetric(
-                    id: item.id,
-                    scenario: item.scenario ?? "Scenario \(item.id)",
                     durationSeconds: duration,
                     seriesEvaluated: seriesEvaluated,
                     seriesMatch: seriesMatch,
@@ -438,13 +434,13 @@ final class PrivateOCRRegressionTests: XCTestCase {
             for (exif, desc) in orientationExifs {
                 autoreleasepool {
                     guard let rotated = rotateCG(baseImage, exif: exif) else {
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Failed in-memory rotation to \(desc)")
+                        XCTFail("[\(dataset.displayName)] fixture: Failed in-memory rotation to \(desc)")
                         return
                     }
 
                     let result = scanImage(rotated)
                     if !result.bondTextFound && result.huntScore < 20 {
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Bond signal lost at orientation \(desc)")
+                        XCTFail("[\(dataset.displayName)] fixture: Bond signal lost at orientation \(desc)")
                     }
 
                     // If serial is expected, check that rotation handling still captured serial
@@ -452,7 +448,7 @@ final class PrivateOCRRegressionTests: XCTestCase {
                         let normExpected = normalizeSerial(expSerial)
                         let normActual = normalizeSerial(result.record.serial)
                         if normActual != normExpected, fieldConfidenceIsHigh(result.record, "serial") {
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence serial at orientation \(desc)")
+                            XCTFail("[\(dataset.displayName)] fixture: False high-confidence serial at orientation \(desc)")
                         }
                     }
                 }
@@ -477,11 +473,21 @@ final class PrivateOCRRegressionTests: XCTestCase {
     // MARK: - Test Methods: Real Photographs (Privately Held Paper Bonds)
 
     func testRealManifestRegression() throws {
+        try requirePrivateRealOCRRegressionOptIn()
         try evaluateManifestRegression(for: .real)
     }
 
     func testRealOrientationInvariance() throws {
+        try requirePrivateRealOCRRegressionOptIn()
         try evaluateOrientationInvariance(for: .real)
+    }
+
+    /// Real photographs stay out of normal local/hosted CI. They are manually
+    /// invoked with an explicit local opt-in and retain strict regression checks.
+    private func requirePrivateRealOCRRegressionOptIn() throws {
+        guard ProcessInfo.processInfo.environment["BONDSCANNER_RUN_PRIVATE_REAL_OCR_REGRESSION"] == "1" else {
+            throw XCTSkip("Set BONDSCANNER_RUN_PRIVATE_REAL_OCR_REGRESSION=1 to evaluate ignored private real-photo fixtures.")
+        }
     }
 
     // MARK: - Report Persistence (Isolated per Dataset)
@@ -509,7 +515,7 @@ final class PrivateOCRRegressionTests: XCTestCase {
         }
 
         // Generate human-readable text report
-        var text = """
+        let text = """
         ================================================================================
         BOND SCANNER OCR QUALITY METRICS REPORT [\(dataset.displayName.uppercased())]
         Dataset: \(dataset.rawValue)
@@ -527,34 +533,7 @@ final class PrivateOCRRegressionTests: XCTestCase {
           False High-Confidence Fields: \(summary.totalFalseHighConfidenceFields)
           Incorrect OK Status Count:    \(summary.totalIncorrectOKStatusCount)
         ================================================================================
-        PER-FIXTURE BREAKDOWN:
-
         """
-
-        for f in summary.perFixture {
-            let sMatch = f.seriesEvaluated ? (f.seriesMatch ? "PASS" : "FAIL") : "N/E"
-            let dMatch = f.denominationEvaluated ? (f.denominationMatch ? "PASS" : "FAIL") : "N/E"
-            let serMatch = f.serialEvaluated ? (f.serialMatch ? "PASS" : "FAIL") : "N/E"
-            let dateMatch = f.issueDateEvaluated ? (f.issueDateMatch ? "PASS" : "FAIL") : "N/E"
-            let statusStr = f.isIncorrectOKStatus ? "BAD_OK" : f.recordedStatus
-
-            text += String(format: "  [%@] %-38@ | Series: %@ | Denom: %@ | Serial: %@ | Date: %@ | Status: %@ (%.2fs)\n",
-                           f.id,
-                           String(f.scenario.prefix(38)),
-                           sMatch, dMatch, serMatch, dateMatch, statusStr, f.durationSeconds)
-
-            if !f.falseHighConfidenceFields.isEmpty {
-                text += "      * WARNING: False high-confidence in: \(f.falseHighConfidenceFields.joined(separator: ", "))\n"
-            }
-            if f.datingStampConfused {
-                text += "      * WARNING: Issue date confused with bank dating stamp\n"
-            }
-            if f.seriesMisclassified {
-                text += "      * WARNING: Series E / EE misclassification\n"
-            }
-        }
-
-        text += "================================================================================\n"
 
         let datedTxtURL = reportsDir.appendingPathComponent("report-\(safeDate).txt")
         let latestTxtURL = reportsDir.appendingPathComponent("latest.txt")

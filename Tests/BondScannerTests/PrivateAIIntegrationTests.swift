@@ -1,7 +1,7 @@
 @testable import BondScanner
 import XCTest
 
-private enum AIEvalMode: String { case review, all }
+private enum AIEvalMode: String, Codable { case review, all }
 private enum AIEvalRun: String, CaseIterable { case textOnly, multimodal }
 
 private struct AIEvalCounters: Codable {
@@ -37,6 +37,8 @@ private struct AIEvalCounters: Codable {
 private struct AIEvalCheckpoint: Codable {
     var nextFixtureIndex: Int
     var complete: Bool
+    var mode: AIEvalMode
+    var limit: Int
     var vision: AIEvalCounters
     var text: AIEvalCounters
     var image: AIEvalCounters
@@ -167,7 +169,9 @@ final class PrivateAIIntegrationTests: XCTestCase {
         var startIndex = 0
         if env["BONDSCANNER_AI_EVAL_RESUME"] == "1",
            let data = try? Data(contentsOf: checkpointURL),
-           let checkpoint = try? JSONDecoder().decode(AIEvalCheckpoint.self, from: data)
+           let checkpoint = try? JSONDecoder().decode(AIEvalCheckpoint.self, from: data),
+           checkpoint.mode == mode,
+           checkpoint.limit == limit
         {
             vision = checkpoint.vision; text = checkpoint.text; image = checkpoint.image
             startIndex = checkpoint.complete ? limit : checkpoint.nextFixtureIndex
@@ -175,42 +179,49 @@ final class PrivateAIIntegrationTests: XCTestCase {
 
         for (fixtureIndex, fixture) in fixtures.prefix(limit).enumerated() where fixtureIndex >= startIndex {
             vision.fixtures += 1
-            guard let url = PrivateFixturesEnvironment.imageURL(for: fixture.filename, dataset: .real) else { vision.missingPhotos += 1; continue }
-            guard let imageFile = cgImageFromFile(url) else { vision.undecodablePhotos += 1; continue }
-            let visionStart = CFAbsoluteTimeGetCurrent()
-            var record = scanImage(imageFile).record
-            vision.latencies.append(CFAbsoluteTimeGetCurrent() - visionStart)
-            record.id = UUID().uuidString; record.revision = 1
-            for field in AIEvaluation.fields {
-                vision.addVision(AIEvaluation.value(record, field: field), expected: AIEvaluation.expected(fixture, field: field), field: field)
-            }
-            let expectedMonth = AIEvaluation.expected(fixture, field: "issueMonth"), expectedYear = AIEvaluation.expected(fixture, field: "issueYear")
-            if !expectedMonth.isEmpty, !expectedYear.isEmpty {
-                vision.dateEvaluated += 1
-                if AIEvaluation.normalized(record.issueMonth, field: "issueMonth") == AIEvaluation.normalized(expectedMonth, field: "issueMonth"), record.issueYear == expectedYear {
-                    vision.dateExact += 1
+            if let url = PrivateFixturesEnvironment.imageURL(for: fixture.filename, dataset: .real) {
+                if let imageFile = cgImageFromFile(url) {
+                    let visionStart = CFAbsoluteTimeGetCurrent()
+                    var record = scanImage(imageFile).record
+                    vision.latencies.append(CFAbsoluteTimeGetCurrent() - visionStart)
+                    record.id = UUID().uuidString; record.revision = 1
+                    for field in AIEvaluation.fields {
+                        vision.addVision(AIEvaluation.value(record, field: field), expected: AIEvaluation.expected(fixture, field: field), field: field)
+                    }
+                    let expectedMonth = AIEvaluation.expected(fixture, field: "issueMonth"), expectedYear = AIEvaluation.expected(fixture, field: "issueYear")
+                    if !expectedMonth.isEmpty, !expectedYear.isEmpty {
+                        vision.dateEvaluated += 1
+                        if AIEvaluation.normalized(record.issueMonth, field: "issueMonth") == AIEvaluation.normalized(expectedMonth, field: "issueMonth"), record.issueYear == expectedYear {
+                            vision.dateExact += 1
+                        }
+                    }
+                    let eligible = ReviewCoordinator.isAutomaticallyReviewEligible(record)
+                    if eligible {
+                        vision.reviewFixtures += 1
+                    }
+                    if mode == .all || eligible {
+                        text.fixtures += 1; image.fixtures += 1
+                        if availability == .available {
+                            await score(analyzer: LocalBondAIAnalyzer(mode: .textOnly), record: record, imageURL: url, fixture: fixture, counters: &text)
+                            await score(analyzer: LocalBondAIAnalyzer(mode: .multimodal), record: record, imageURL: url, fixture: fixture, counters: &image)
+                        } else {
+                            text.unavailable += 1; image.unavailable += 1
+                        }
+                    }
+                } else {
+                    vision.undecodablePhotos += 1
                 }
-            }
-            let eligible = ReviewCoordinator.isAutomaticallyReviewEligible(record)
-            if eligible {
-                vision.reviewFixtures += 1
-            }
-            guard mode == .all || eligible else { continue }
-            text.fixtures += 1; image.fixtures += 1
-            if availability == .available {
-                await score(analyzer: LocalBondAIAnalyzer(mode: .textOnly), record: record, imageURL: url, fixture: fixture, counters: &text)
-                await score(analyzer: LocalBondAIAnalyzer(mode: .multimodal), record: record, imageURL: url, fixture: fixture, counters: &image)
             } else {
-                text.unavailable += 1; image.unavailable += 1
+                vision.missingPhotos += 1
             }
             // Safe aggregate-only checkpoint: interrupted hardware runs retain
             // completed measurements without identifiers, OCR, or proposals.
             try writeReport(vision: vision, text: text, image: image, mode: mode, limit: limit, availability: availability, isComplete: false)
-            let checkpoint = AIEvalCheckpoint(nextFixtureIndex: fixtureIndex + 1, complete: false, vision: vision, text: text, image: image)
+            let checkpoint = AIEvalCheckpoint(nextFixtureIndex: fixtureIndex + 1, complete: false, mode: mode, limit: limit, vision: vision, text: text, image: image)
             try JSONEncoder().encode(checkpoint).write(to: checkpointURL, options: .atomic)
         }
         try writeReport(vision: vision, text: text, image: image, mode: mode, limit: limit, availability: availability, isComplete: true)
-        try JSONEncoder().encode(AIEvalCheckpoint(nextFixtureIndex: limit, complete: true, vision: vision, text: text, image: image)).write(to: checkpointURL, options: .atomic)
+        try JSONEncoder().encode(AIEvalCheckpoint(nextFixtureIndex: limit, complete: true, mode: mode, limit: limit, vision: vision, text: text, image: image)).write(to: checkpointURL, options: .atomic)
     }
 
     private func score(analyzer: LocalBondAIAnalyzer, record: BondRecord, imageURL: URL, fixture: FixtureManifestItem, counters: inout AIEvalCounters) async {
