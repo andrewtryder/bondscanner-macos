@@ -117,10 +117,18 @@ This repository includes a local-only image regression framework (`Tests/BondSca
 
 ## Data Integrity, Exports & Backup
 
+### Collection location
+
+Bond Scanner saves collections in `~/BondScans` by default. The folder contains `bonds.sqlite3`, its SQLite journal files, the `photos` folder, automatic `records.json` and `bonds.csv` exports, and `scan-debug.log`.
+
+Choose **Bond Scanner → Settings…** (⌘,) to see the current folder, open it in Finder, choose another folder, or restore the default location. When choosing an empty folder, you can copy the current collection or explicitly start an empty one. To reopen a collection, choose its existing folder. A change takes effect on the next launch. A copy includes changes made before quitting; the original collection is left in place. Existing destination files are never overwritten. If the selected location is unavailable, reconnect the drive or restore access and retry; Bond Scanner does not silently open a different collection.
+
+The independent backup location defaults to `~/BondScans_backups`. Changing the collection location does not move backups, and the collection and backup folders must not overlap.
+
 ### Storage Architecture
-- **Primary Store**: `~/BondScans/bonds.sqlite3` is the authoritative, WAL-backed, crash-resilient SQLite database.
+- **Primary Store**: `bonds.sqlite3` inside the collection folder is the authoritative, WAL-backed, crash-resilient SQLite database.
 - **Schema Versioning**: Managed via `PRAGMA user_version` (Version 1) with forward migration support.
-- **Automatic Live Exports**: Every scan capture, edit, merge, or deletion automatically schedules a debounced background export to both `~/BondScans/records.json` and `~/BondScans/bonds.csv`. Exports are synchronously flushed on application termination.
+- **Automatic Live Exports**: Every scan capture, edit, merge, or deletion automatically schedules a debounced background export to `records.json` and `bonds.csv` inside the collection folder. Exports are synchronously flushed on application termination.
 - **Manual CSV Export**: Users can export a custom CSV snapshot at any time via the toolbar "Export CSV…" button. Formula characters (`=`, `+`, `-`, `@`) are automatically sanitized to prevent CSV injection.
 
 ### Photograph Preservation & Duplicate Safety
@@ -131,7 +139,7 @@ This repository includes a local-only image regression framework (`Tests/BondSca
 ### Backup and Disaster Recovery
 - **Online Backup**: Consistent point-in-time snapshots can be created safely using SQLite's native `VACUUM INTO` (`DatabaseManager.shared.backupDatabase(to:)`), verified immediately with SQLite `integrity_check`.
 - **Restoration Safety**: Restores stage into a temporary database first, verify SQLite integrity and schema compatibility, and safeguard the original database, WAL, and SHM files before atomic swap. If restoration fails, the original database is automatically restored.
-- **Photographs Scope**: A database backup alone preserves the structured SQLite records, review reasons, and metadata, but **does not include the associated photographs** stored in `~/BondScans/photos`. For complete disaster recovery, back up the entire `~/BondScans` directory.
+- **Photographs Scope**: A database backup alone preserves the structured SQLite records, review reasons, and metadata, but **does not include the associated photographs** in the collection's `photos` folder. For complete disaster recovery, back up the entire collection folder.
 - **Explicit Recovery & UI Reporting**: Initialization failures are never confused with database corruption. Locked or read-only databases are reported directly in the UI without modifying files. Validated database corruption prompts for explicit recovery, preserving existing DB, WAL, and SHM files to a timestamped archive before clean replacement. Silent fallbacks to temporary or in-memory databases are completely disallowed in production.
 
 ---

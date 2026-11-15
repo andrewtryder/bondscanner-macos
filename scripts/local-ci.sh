@@ -100,6 +100,7 @@ if [ "$SKIP_TESTS" = false ]; then
     TOTAL="$(printf '%s' "$SUMMARY" | jq -r '.totalTestCount // 0')"
     FAILED="$(printf '%s' "$SUMMARY" | jq -r '.failedTests // 0')"
     PASSED="$(printf '%s' "$SUMMARY" | jq -r '.passedTests // 0')"
+    echo "XCTest results: total=$TOTAL passed=$PASSED failed=$FAILED"
     if [ "$TOTAL" -le 0 ] || [ "$PASSED" -le 0 ] || [ "$FAILED" -ne 0 ]; then
         echo "❌ XCTest result invalid: total=$TOTAL passed=$PASSED failed=$FAILED" >&2
         exit 1

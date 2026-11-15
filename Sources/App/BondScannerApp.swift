@@ -4,6 +4,7 @@ import AVFoundation
 import CoreImage
 import CoreMedia
 import CoreVideo
+import Darwin
 import Foundation
 import ImageIO
 import QuartzCore
@@ -29,6 +30,10 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var drawerWidthConstraint: NSLayoutConstraint!
     private var drawerVisible = true
     private var reviewWindowController: ReviewWindowController?
+    private var didStartCollection = false
+    private var collectionLockFD: Int32 = -1
+    private var settingsWindow: NSWindow?
+    private var settingsLocationLabel: NSTextField?
     private var aiLabel: NSTextField!
     private var focusLabel: NSTextField!
     private var focusInfo = "Focus: awaiting camera"
@@ -40,8 +45,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var noBondChecks = 0
     private var lastDiagnosticAt: TimeInterval = 0
     private var lastVideoLogAt: TimeInterval = 0
-    private var session = AVCaptureSession()
-    private let photoOutput = AVCapturePhotoOutput()
+    private var session: AVCaptureSession!
+    private var photoOutput: AVCapturePhotoOutput!
     private var photoCaptureSupported = false
     private var chosenFormatWidth = 0
     private var chosenFormatHeight = 0
@@ -146,12 +151,43 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         if isTestMode || NSClassFromString("XCTestCase") != nil {
             return
         }
+        if let bundleID = Bundle.main.bundleIdentifier,
+           NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier })
+        {
+            showStartupError("Another Bond Scanner instance is already running. Quit it before opening or switching collections.")
+            return
+        }
         do {
+            try prepareCollectionLocation()
+        } catch {
+            showStartupError("The collection location could not be opened. No other collection was selected.\n\n\(error.localizedDescription)")
+            return
+        }
+        do {
+            let databaseAlreadyExists = FileManager.default.fileExists(atPath: databaseURL.path)
+            if !databaseAlreadyExists {
+                try CollectionValidator.validateFirstLaunch(root: outputRoot)
+            }
             try FileManager.default.createDirectory(at: photosRoot, withIntermediateDirectories: true)
             let db = try DatabaseManager.initializeShared(url: databaseURL)
-            records = try db.migrateFromJSONIfNeeded(jsonURL: recordsURL)
-            for i in records.indices {
-                applyRequiredStatus(&records[i])
+            if databaseAlreadyExists {
+                records = try db.loadAllRecords()
+                // An existing empty database and a populated legacy export are ambiguous.
+                // Do not import or overwrite that file without a recovery decision.
+                if records.isEmpty, FileManager.default.fileExists(atPath: recordsURL.path) {
+                    let data = try Data(contentsOf: recordsURL)
+                    let legacyRecords = try JSONDecoder().decode([BondRecord].self, from: data)
+                    guard legacyRecords.isEmpty else {
+                        throw DatabaseError.restoreFailed("The database is empty but records.json contains records. Both files were preserved; resolve the mismatch before starting.")
+                    }
+                }
+            } else {
+                records = try db.migrateFromJSONIfNeeded(jsonURL: recordsURL)
+            }
+            if !databaseAlreadyExists {
+                for i in records.indices {
+                    applyRequiredStatus(&records[i])
+                }
             }
             if let latest = records.max(by: { $0.capturedAt < $1.capturedAt }) {
                 let serial = normalizeSerial(latest.serial)
@@ -160,6 +196,17 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 }
             }
             try writeRecords(records)
+            if ProcessInfo.processInfo.environment["BONDSCANNER_OUTPUT_ROOT"] == nil {
+                let preferences = CollectionLocationPreferences()
+                var state = try preferences.load()
+                if state.activePath == nil {
+                    state.activePath = outputRoot.standardizedFileURL.path
+                    try preferences.save(state)
+                }
+            }
+            session = AVCaptureSession()
+            photoOutput = AVCapturePhotoOutput()
+            didStartCollection = true
         } catch let err as DatabaseError {
             switch err {
             case let .databaseCorrupted(detail):
@@ -169,14 +216,14 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
                 showStartupError("Database is locked by another process: \(detail).\nPlease close any other running instances.")
                 return
             case let .permissionDenied(detail):
-                showStartupError("Cannot access database due to permissions: \(detail).\nPlease check permissions for ~/BondScans.")
+                showStartupError("Cannot access database due to permissions: \(detail).\nPlease check permissions for \(outputRoot.path).")
                 return
             default:
                 showStartupError("Database error: \(err.localizedDescription)")
                 return
             }
         } catch {
-            showStartupError("Could not open ~/BondScans: \(error.localizedDescription)")
+            showStartupError("Could not open \(outputRoot.path): \(error.localizedDescription)")
             return
         }
         setupMenu()
@@ -189,7 +236,11 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             } // Space
             return event
         }
-        requestCameraAccess()
+        // A development-only override permits UI validation with synthetic data
+        // without starting a camera or capturing real photographs.
+        if ProcessInfo.processInfo.environment["BONDSCANNER_DISABLE_CAMERA"] != "1" {
+            requestCameraAccess()
+        }
         for record in records where record.status == "PROCESSING" {
             let url = outputRoot.appendingPathComponent(record.sourcePhoto)
             if FileManager.default.fileExists(atPath: url.path) {
@@ -204,7 +255,13 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if isTestMode || NSClassFromString("XCTestCase") != nil {
+        defer {
+            if collectionLockFD >= 0 {
+                close(collectionLockFD)
+                collectionLockFD = -1
+            }
+        }
+        if isTestMode || NSClassFromString("XCTestCase") != nil || !didStartCollection {
             return
         }
         ScanLog.shared.write("app quit")
@@ -215,10 +272,85 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         }
     }
 
+    /// Resolve and verify the location before database, logging, export, or camera startup.
+    private func prepareCollectionLocation() throws {
+        // Explicit development overrides remain isolated from the saved production setting.
+        let overridden = !(ProcessInfo.processInfo.environment["BONDSCANNER_OUTPUT_ROOT"] ?? "").isEmpty
+        let preferences = CollectionLocationPreferences()
+        var state = overridden ? CollectionLocationState(activePath: nil, pending: nil) : try preferences.load()
+        // A lock held for the entire process prevents another current version from
+        // continuing to write the old collection while a switch is applied.
+        let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("BondScanner", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let lockPath = support.appendingPathComponent("collection.lock").path
+        let fd = open(lockPath, O_CREAT | O_RDWR | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else { throw DatabaseError.permissionDenied("Could not open the collection process lock.") }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            throw DatabaseError.databaseLocked("Another Bond Scanner instance is using collection storage.")
+        }
+        collectionLockFD = fd
+        if overridden {
+            return
+        }
+        let previous = state.activePath ?? StorageConfiguration.defaultOutputRoot.path
+        if let request = state.pending {
+            guard request.sourcePath == previous else {
+                throw DatabaseError.restoreFailed("The pending change does not match the saved collection location.")
+            }
+            while true {
+                do {
+                    _ = try preferences.applyPending(backups: backupsRoot)
+                    state = try preferences.load()
+                    break
+                } catch {
+                    let alert = NSAlert()
+                    alert.messageText = "Collection location could not be changed"
+                    alert.informativeText = "\(error.localizedDescription)\n\nThe previous collection remains at \(previous)."
+                    alert.addButton(withTitle: "Retry")
+                    alert.addButton(withTitle: "Keep Previous Location")
+                    alert.addButton(withTitle: "Quit")
+                    let response = alert.runModal()
+                    if response == .alertFirstButtonReturn {
+                        continue
+                    }
+                    guard response == .alertSecondButtonReturn else { throw error }
+                    state.pending = nil
+                    try preferences.save(state)
+                    break
+                }
+            }
+        }
+        let path = state.activePath ?? StorageConfiguration.defaultOutputRoot.path
+        let root = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        guard root.path == path else { throw DatabaseError.restoreFailed("The saved location is not a canonical absolute path.") }
+        if state.activePath != nil || FileManager.default.fileExists(atPath: root.appendingPathComponent("bonds.sqlite3").path) {
+            while true {
+                do {
+                    _ = try CollectionValidator.validate(root: root, backups: backupsRoot)
+                    break
+                } catch {
+                    let alert = NSAlert()
+                    alert.messageText = "Collection is unavailable"
+                    alert.informativeText = "\(error.localizedDescription)\n\nReconnect the drive or restore access, then retry. No other collection will be opened automatically."
+                    alert.addButton(withTitle: "Retry")
+                    alert.addButton(withTitle: "Quit")
+                    guard alert.runModal() == .alertFirstButtonReturn else { throw error }
+                }
+            }
+        }
+        StorageConfiguration.shared.setLaunchOutputRoot(root)
+    }
+
     private func setupMenu() {
         let bar = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu(title: "Bond Scanner")
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settings.target = self
+        appMenu.addItem(settings)
+        appMenu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Bond Scanner", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         appMenu.addItem(quit)
@@ -275,6 +407,151 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
 
     @objc private func quitApp() {
         NSApp.terminate(nil)
+    }
+
+    @objc private func openSettings() {
+        if let settingsWindow = settingsWindow {
+            refreshSettingsLocation()
+            settingsWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 610, height: 250),
+                             styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        panel.title = "Settings"
+        panel.isReleasedWhenClosed = false
+        let content = panel.contentView!
+        let heading = NSTextField(labelWithString: "Collection Storage")
+        heading.font = .boldSystemFont(ofSize: 16)
+        heading.frame = NSRect(x: 24, y: 210, width: 560, height: 22)
+        content.addSubview(heading)
+        let location = NSTextField(wrappingLabelWithString: "")
+        location.frame = NSRect(x: 24, y: 145, width: 560, height: 60)
+        location.lineBreakMode = .byTruncatingMiddle
+        content.addSubview(location)
+        settingsLocationLabel = location
+        let explanation = NSTextField(wrappingLabelWithString: "This folder contains the SQLite database, original and processed photos, and automatic CSV and JSON exports.")
+        explanation.frame = NSRect(x: 24, y: 105, width: 560, height: 38)
+        content.addSubview(explanation)
+        let choose = NSButton(title: "Choose Folder…", target: self, action: #selector(chooseCollectionFolder))
+        choose.frame = NSRect(x: 24, y: 55, width: 130, height: 32)
+        content.addSubview(choose)
+        let finder = NSButton(title: "Open in Finder", target: self, action: #selector(openCollectionInFinder))
+        finder.frame = NSRect(x: 162, y: 55, width: 130, height: 32)
+        content.addSubview(finder)
+        let restore = NSButton(title: "Restore Default Location", target: self, action: #selector(restoreDefaultCollection))
+        restore.frame = NSRect(x: 300, y: 55, width: 200, height: 32)
+        content.addSubview(restore)
+        settingsWindow = panel
+        refreshSettingsLocation()
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func refreshSettingsLocation() {
+        let pending = try? CollectionLocationPreferences().load().pending
+        let suffix = pending.map { "\nPending after restart: \($0.destinationPath)" } ?? ""
+        settingsLocationLabel?.stringValue = "Current collection: \(outputRoot.path)\(suffix)"
+    }
+
+    @objc private func openCollectionInFinder() {
+        NSWorkspace.shared.open(outputRoot)
+    }
+
+    @objc private func chooseCollectionFolder() {
+        let picker = NSOpenPanel()
+        picker.canChooseDirectories = true
+        picker.canChooseFiles = false
+        picker.allowsMultipleSelection = false
+        picker.canCreateDirectories = true
+        picker.prompt = "Choose Folder"
+        if picker.runModal() == .OK, let url = picker.url {
+            requestCollectionLocation(url)
+        }
+    }
+
+    @objc private func restoreDefaultCollection() {
+        let destination = StorageConfiguration.defaultOutputRoot
+        if !FileManager.default.fileExists(atPath: destination.path) {
+            do {
+                try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+            } catch {
+                showLocationError(error)
+                return
+            }
+        }
+        requestCollectionLocation(destination)
+    }
+
+    private func showLocationError(_ error: Error) {
+        let alert = NSAlert(error: error)
+        alert.runModal()
+    }
+
+    private func requestCollectionLocation(_ url: URL) {
+        do {
+            guard ProcessInfo.processInfo.environment["BONDSCANNER_OUTPUT_ROOT"] == nil else {
+                throw DatabaseError.restoreFailed("Location changes are unavailable while a development storage override is active.")
+            }
+            let destination = url.standardizedFileURL
+            let preferences = CollectionLocationPreferences()
+            var state = try preferences.load()
+            let current = outputRoot.standardizedFileURL
+            guard (state.activePath ?? StorageConfiguration.defaultOutputRoot.path) == current.path else {
+                throw DatabaseError.restoreFailed("The saved location changed while the app was running. Restart before changing it.")
+            }
+            if destination == current {
+                state.pending = nil
+                try preferences.save(state)
+                refreshSettingsLocation()
+                return
+            }
+            let names = try FileManager.default.contentsOfDirectory(atPath: destination.path)
+            let action: CollectionSwitchAction
+            if names.contains("bonds.sqlite3") {
+                _ = try CollectionValidator.validate(root: destination, backups: backupsRoot)
+                let alert = NSAlert()
+                alert.messageText = "Open this existing collection?"
+                alert.informativeText = "The current collection will remain at \(current.path). Restart is required."
+                alert.addButton(withTitle: "Open Existing Collection")
+                alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+                action = .open
+            } else {
+                guard names.isEmpty else {
+                    throw DatabaseError.restoreFailed("Choose an empty folder or a folder containing an existing Bond Scanner collection. No files were overwritten.")
+                }
+                let alert = NSAlert()
+                alert.messageText = "Choose how to use this folder"
+                alert.informativeText = "The current collection remains at \(current.path). Copying happens after you restart, including changes made before quitting."
+                alert.addButton(withTitle: "Copy Existing Collection")
+                alert.addButton(withTitle: "Start New Empty Collection")
+                alert.addButton(withTitle: "Cancel")
+                let response = alert.runModal()
+                if response == .alertFirstButtonReturn {
+                    action = .copy
+                } else if response == .alertSecondButtonReturn {
+                    let confirm = NSAlert()
+                    confirm.messageText = "Start an empty collection?"
+                    confirm.informativeText = "Your existing records and photographs will remain at \(current.path). They will not be moved."
+                    confirm.addButton(withTitle: "Start Empty Collection")
+                    confirm.addButton(withTitle: "Cancel")
+                    guard confirm.runModal() == .alertFirstButtonReturn else { return }
+                    action = .new
+                } else {
+                    return
+                }
+            }
+            state.pending = PendingCollectionSwitch(sourcePath: current.path, destinationPath: destination.path, action: action)
+            try preferences.save(state)
+            refreshSettingsLocation()
+            let alert = NSAlert()
+            alert.messageText = "Restart Bond Scanner to change location"
+            alert.informativeText = "The current collection remains in use until you quit."
+            alert.runModal()
+        } catch {
+            showLocationError(error)
+        }
     }
 
     @objc private func openReviewWorkflow() {
@@ -377,7 +654,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             }
             if lockedHardware {
                 focusInfo = "Focus: locked for fixed stand (edge assist \(String(format: "%.2f", position)))"
-                focusLabel?.stringValue = focusInfo + "  |  Debug: ~/BondScans/scan-debug.log"
+                focusLabel?.stringValue = focusInfo + "  |  Debug: \(debugURL.path)"
             }
         }
     }
@@ -477,7 +754,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         statusLabel = label("Starting webcam…", size: 17)
         lastLabel = label("Hold a bond steady inside the yellow guide.", size: 14)
         aiLabel = label("OCR: Apple Vision (offline)", size: 12)
-        focusLabel = label("Focus: checking camera…  |  Debug: ~/BondScans/scan-debug.log", size: 12)
+        focusLabel = label("Focus: checking camera…  |  Debug: \(debugURL.path)", size: 12)
         for v in [countLabel!, statusLabel!, lastLabel!, aiLabel!, focusLabel!] {
             v.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(v)
@@ -531,7 +808,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private func showCorruptionErrorWithRecoveryOption(detail: String) {
         let alert = NSAlert()
         alert.messageText = "Bond Scanner Database Corrupted"
-        alert.informativeText = "The database file at ~/BondScans/bonds.sqlite3 failed integrity checks (\(detail)).\n\nWould you like to recover the database? The existing database and WAL/SHM files will be preserved in a timestamped archive before a clean replacement database is created."
+        alert.informativeText = "The database file at \(databaseURL.path) failed integrity checks (\(detail)).\n\nWould you like to recover the database? The existing database and WAL/SHM files will be preserved in a timestamped archive before a clean replacement database is created."
         alert.addButton(withTitle: "Recover Database")
         alert.addButton(withTitle: "Quit")
         let response = alert.runModal()
@@ -552,7 +829,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private func showRecoveryNotice() {
         let alert = NSAlert()
         alert.messageText = "Database Recovery Completed"
-        alert.informativeText = "The corrupted database, WAL, and SHM files were safely archived in ~/BondScans.\nA fresh inventory has been initialized."
+        alert.informativeText = "The corrupted database, WAL, and SHM files were safely archived in \(outputRoot.path).\nA fresh inventory has been initialized."
         alert.runModal()
     }
 
@@ -872,7 +1149,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             logCameraControls(camera)
             focusInfo = continuous ? "Focus: continuous autofocus requested" :
                 (autoFocus ? "Focus: one-shot autofocus requested" : "Focus: webcam controls unavailable / hardware-managed")
-            focusLabel.stringValue = focusInfo + "  |  Debug: ~/BondScans/scan-debug.log"
+            focusLabel.stringValue = focusInfo + "  |  Debug: \(debugURL.path)"
 
             session.commitConfiguration()
             logActiveFormatState(camera, at: "after_commit")

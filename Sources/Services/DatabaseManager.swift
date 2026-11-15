@@ -4,8 +4,13 @@ import SQLite3
 
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-let databaseURL = outputRoot.appendingPathComponent("bonds.sqlite3")
-let backupsRoot = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans_backups", isDirectory: true)
+var databaseURL: URL {
+    outputRoot.appendingPathComponent("bonds.sqlite3")
+}
+
+var backupsRoot: URL {
+    StorageConfiguration.shared.backupsRoot
+}
 
 enum DatabaseError: Error, LocalizedError, Equatable {
     case openFailed(String)
@@ -154,6 +159,9 @@ final class DatabaseManager {
     /// Throws `DatabaseError.permissionDenied` if the file cannot be accessed due to permissions.
     @discardableResult
     static func validateDatabaseIntegrity(at url: URL) throws -> Bool {
+        guard !isProductionStorageProtected(destination: url) else {
+            throw DatabaseError.permissionDenied("Database inspection outside temporary test storage is forbidden during test mode.")
+        }
         guard FileManager.default.fileExists(atPath: url.path) else { return true }
         var handle: OpaquePointer?
         let rc = sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil)
@@ -668,16 +676,21 @@ final class DatabaseManager {
     /// Validates the created backup with SQLite `integrity_check` before returning.
     ///
     /// NOTE: A database backup alone preserves the structured SQLite records and metadata,
-    /// but does NOT include the associated photograph files stored in ~/BondScans/photos.
+    /// but does NOT include the associated photograph files stored in the collection's photos folder.
     func backupDatabase(to destinationURL: URL) throws {
         lock.lock()
         defer { lock.unlock() }
+        guard !isProductionStorageProtected(destination: destinationURL) else {
+            throw DatabaseError.permissionDenied("Backup destination is protected during test mode.")
+        }
+        guard !FileManager.default.fileExists(atPath: destinationURL.path),
+              (try? FileManager.default.destinationOfSymbolicLink(atPath: destinationURL.path)) == nil
+        else {
+            throw DatabaseError.restoreFailed("The backup destination already exists; no file was replaced.")
+        }
         try execute("PRAGMA wal_checkpoint(TRUNCATE);")
         let destDir = destinationURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            try FileManager.default.removeItem(at: destinationURL)
-        }
         let escapedPath = destinationURL.path.replacingOccurrences(of: "'", with: "''")
         try execute("VACUUM INTO '\(escapedPath)';")
 
@@ -695,10 +708,13 @@ final class DatabaseManager {
     /// integrity, and ensures that any restoration failure preserves the original DB, WAL, and SHM files.
     ///
     /// NOTE: A database backup alone preserves the structured SQLite records and metadata,
-    /// but does NOT include the associated photograph files stored in ~/BondScans/photos.
+    /// but does NOT include the associated photograph files stored in the collection's photos folder.
     func restoreDatabase(from backupURL: URL) throws {
         lock.lock()
         defer { lock.unlock() }
+        guard !isProductionStorageProtected(destination: backupURL) else {
+            throw DatabaseError.permissionDenied("Backup source is protected during test mode.")
+        }
         guard FileManager.default.fileExists(atPath: backupURL.path) else {
             throw DatabaseError.restoreFailed("Backup file does not exist at \(backupURL.path)")
         }
@@ -857,6 +873,13 @@ final class DatabaseManager {
         lock.lock()
         defer { lock.unlock() }
 
+        guard !isProductionStorageProtected(destination: jsonURL),
+              csvSourceURL.map({ !isProductionStorageProtected(destination: $0) }) ?? true,
+              backupRootURL.map({ !isProductionStorageProtected(destination: $0) }) ?? true
+        else {
+            throw DatabaseError.permissionDenied("Migration paths are protected during test mode.")
+        }
+
         if try count() == 0, FileManager.default.fileExists(atPath: jsonURL.path) {
             let data = try Data(contentsOf: jsonURL)
             let decoded = try decoder.decode([BondRecord].self, from: data)
@@ -921,6 +944,9 @@ extension DatabaseManager {
     /// Reads and decodes all BondRecords directly from a SQLite snapshot database.
     /// Ensures that backup manifests and photograph references correspond exactly to the database snapshot.
     static func loadRecordsFromSnapshot(at snapshotURL: URL) throws -> [BondRecord] {
+        guard !isProductionStorageProtected(destination: snapshotURL) else {
+            throw DatabaseError.permissionDenied("Snapshot source is protected during test mode.")
+        }
         var inspectHandle: OpaquePointer?
         let inspectRc = sqlite3_open_v2(snapshotURL.path, &inspectHandle, SQLITE_OPEN_READONLY, nil)
         guard inspectRc == SQLITE_OK, let h = inspectHandle else {
@@ -977,6 +1003,9 @@ extension DatabaseManager {
         if isProductionStorageProtected(destination: destinationDir) {
             throw DatabaseError.permissionDenied("Access to production destination is forbidden during test mode: \(destinationDir.path)")
         }
+        if isProductionStorageProtected(destination: photosSourceDir) {
+            throw DatabaseError.permissionDenied("Access to production photos is forbidden during test mode: \(photosSourceDir.path)")
+        }
 
         // Live collection tree protection:
         // A backup should never be published into the live photos or data directory,
@@ -990,7 +1019,7 @@ extension DatabaseManager {
         let resolvedDBDir = databaseURL.deletingLastPathComponent().resolvingSymlinksInPath().standardized.path
 
         func isTreeOverlap(dest: String, tree: String) -> Bool {
-            dest == tree || dest.hasPrefix(tree + "/") || tree.hasPrefix(dest + "/")
+            dest == tree || dest.hasPrefix(tree.hasSuffix("/") ? tree : tree + "/") || tree.hasPrefix(dest.hasSuffix("/") ? dest : dest + "/")
         }
 
         if isTreeOverlap(dest: standardizedDest, tree: standardizedOutput) ||
@@ -1263,6 +1292,10 @@ extension DatabaseManager {
             throw DatabaseError.restoreFailed("Explicit user authorization is required for collection restoration")
         }
 
+        if isProductionStorageProtected(destination: backupDir) {
+            throw DatabaseError.permissionDenied("Access to production backup source is forbidden during test mode: \(backupDir.path)")
+        }
+
         if isProductionStorageProtected(destination: destinationDBURL) {
             throw DatabaseError.permissionDenied("Access to production database destination is forbidden during test mode: \(destinationDBURL.path)")
         }
@@ -1276,6 +1309,9 @@ extension DatabaseManager {
             effectiveBackupDir = currentLink.resolvingSymlinksInPath()
         } else {
             effectiveBackupDir = backupDir
+        }
+        guard !isProductionStorageProtected(destination: effectiveBackupDir) else {
+            throw DatabaseError.permissionDenied("Resolved backup source is protected during test mode.")
         }
 
         let manifestURL = effectiveBackupDir.appendingPathComponent("backup_manifest.json")
