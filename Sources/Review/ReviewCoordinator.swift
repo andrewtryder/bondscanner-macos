@@ -11,6 +11,9 @@ import FoundationModels
 /// `SystemLanguageModel.default`; it never constructs a cloud/PCC model.
 enum BondAIAnalysisMode: String, Sendable { case automatic, textOnly, multimodal }
 
+/// Privacy-safe availability detail suitable for UI and private evaluation reports.
+enum LocalModelAvailability: String, Sendable { case available, deviceIneligible, appleIntelligenceDisabled, modelNotReady, unsupportedOS, unavailableUnknown }
+
 struct LocalBondAIAnalyzer: BondAIAnalyzing {
     /// Evaluation can force a mode while production continues to select the best
     /// available local capability automatically.
@@ -284,17 +287,34 @@ final class ReviewCoordinator {
     }
 
     static var localModelAvailable: Bool {
+        localModelAvailability == .available
+    }
+
+    static var localModelAvailability: LocalModelAvailability {
         #if canImport(FoundationModels)
-        if #available(macOS 26.0, *) { return SystemLanguageModel.default.isAvailable }
+        if #available(macOS 26.0, *) {
+            switch SystemLanguageModel.default.availability {
+            case .available: return .available
+            case .unavailable(.deviceNotEligible): return .deviceIneligible
+            case .unavailable(.appleIntelligenceNotEnabled): return .appleIntelligenceDisabled
+            case .unavailable(.modelNotReady): return .modelNotReady
+            @unknown default: return .unavailableUnknown
+            }
+        }
         #endif
-        return false
+        return .unsupportedOS
     }
 
     /// Enqueue a finished OCR record without blocking capture, camera re-arm, or OCR.
     func automaticallyReviewIfEligible(_ record: BondRecord) {
-        guard Self.automaticAIEnabled, record.status == "REVIEW" else { return }
-        guard !(requiredFieldsComplete(record) && (record.reviewReasons ?? []).isEmpty) else { return }
+        guard Self.automaticAIEnabled, Self.isAutomaticallyReviewEligible(record) else { return }
         enqueueAIReview(recordID: record.id)
+    }
+
+    /// Shared production policy used by the queue and private benchmark. A complete
+    /// record can still need review because of unresolved validation/duplicate reasons.
+    static func isAutomaticallyReviewEligible(_ record: BondRecord) -> Bool {
+        record.status == "REVIEW" && !(requiredFieldsComplete(record) && (record.reviewReasons ?? []).isEmpty)
     }
 
     func enqueueAIReview(recordID: String, force: Bool = false) {
