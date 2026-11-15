@@ -1,9 +1,9 @@
-import Foundation
 import CoreGraphics
+import Foundation
 
 func regexMatches(_ pattern: String, in text: String) -> [String] {
     guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
-    let r = NSRange(text.startIndex..<text.endIndex, in: text)
+    let r = NSRange(text.startIndex ..< text.endIndex, in: text)
     return re.matches(in: text, range: r).compactMap { m in
         guard let range = Range(m.range, in: text) else { return nil }
         return String(text[range])
@@ -26,12 +26,16 @@ func normalizeSerial(_ raw: String) -> String {
     var end = chars.count
     if end > start && chars[end - 1] == "E" {
         end -= 1
-        if end > start && chars[end - 1] == "E" { end -= 1 }
+        if end > start && chars[end - 1] == "E" {
+            end -= 1
+        }
     } else if end > start && chars[end - 1] == "I" {
         end -= 1
     }
     if start < end {
-        for i in start..<end where chars[i] == "O" { chars[i] = "0" }
+        for i in start ..< end where chars[i] == "O" {
+            chars[i] = "0"
+        }
     }
     return String(chars)
 }
@@ -40,7 +44,9 @@ func recordMatchingSerial(_ raw: String, in records: [BondRecord], excluding id:
     let key = normalizeSerial(raw)
     guard !key.isEmpty else { return nil }
     return records.first { record in
-        if let id = id, record.id == id { return false }
+        if let id = id, record.id == id {
+            return false
+        }
         let other = normalizeSerial(record.serial)
         return !other.isEmpty && other == key
     }
@@ -48,14 +54,16 @@ func recordMatchingSerial(_ raw: String, in records: [BondRecord], excluding id:
 
 /// Strict 1-glyph OCR confusions used only when comparing two already-read serials.
 func serialCharsAreOCRConfusable(_ a: Character, _ b: Character) -> Bool {
-    if a == b { return true }
+    if a == b {
+        return true
+    }
     let pair = String([a, b]).uppercased()
-    let allowed: Set<String> = [
+    let allowed: Set = [
         "0O", "O0", "0D", "D0", "08", "80", "06", "60", "09", "90",
         "1I", "I1", "1L", "L1", "17", "71",
         "5S", "S5", "56", "65",
         "8B", "B8", "83", "38", "86", "68", "89", "98",
-        "2Z", "Z2", "4A", "A4"
+        "2Z", "Z2", "4A", "A4",
     ]
     return allowed.contains(pair)
 }
@@ -65,8 +73,12 @@ func serialCharsAreOCRConfusable(_ a: Character, _ b: Character) -> Bool {
 func serialsMatchForMerge(_ incomingRaw: String, _ existingRaw: String) -> (exact: Bool, near: Bool) {
     let a = normalizeSerial(incomingRaw)
     let b = normalizeSerial(existingRaw)
-    if a.isEmpty || b.isEmpty { return (false, false) }
-    if a == b { return (true, false) }
+    if a.isEmpty || b.isEmpty {
+        return (false, false)
+    }
+    if a == b {
+        return (true, false)
+    }
     guard a.count == b.count else { return (false, false) }
     let diffs = zip(Array(a), Array(b)).filter { $0.0 != $0.1 }
     guard diffs.count == 1, serialCharsAreOCRConfusable(diffs[0].0, diffs[0].1) else {
@@ -86,8 +98,12 @@ func findNearMatchRecord(_ incoming: BondRecord, in records: [BondRecord], exclu
     let incomingSerial = normalizeSerial(incoming.serial)
     guard !incomingSerial.isEmpty, !validatedSerial(incoming.serial, series: incoming.series).value.isEmpty else { return nil }
     for existing in records {
-        if let id = id, existing.id == id { continue }
-        if existing.id == incoming.id { continue }
+        if let id = id, existing.id == id {
+            continue
+        }
+        if existing.id == incoming.id {
+            continue
+        }
         let existingSerial = normalizeSerial(existing.serial)
         guard !existingSerial.isEmpty, !validatedSerial(existing.serial, series: existing.series).value.isEmpty else { continue }
         let match = serialsMatchForMerge(incoming.serial, existing.serial)
@@ -103,16 +119,32 @@ func recordsHaveConflictingFields(_ a: BondRecord, _ b: BondRecord) -> Bool {
     func conflict(_ v1: String, _ v2: String) -> Bool {
         let t1 = v1.trimmingCharacters(in: .whitespacesAndNewlines)
         let t2 = v2.trimmingCharacters(in: .whitespacesAndNewlines)
-        if t1.isEmpty || t2.isEmpty { return false }
+        if t1.isEmpty || t2.isEmpty {
+            return false
+        }
         return t1.caseInsensitiveCompare(t2) != .orderedSame
     }
-    if conflict(a.series, b.series) { return true }
-    if conflict(a.denomination, b.denomination) { return true }
-    if conflict(a.issueMonth, b.issueMonth) { return true }
-    if conflict(a.issueYear, b.issueYear) { return true }
-    if conflict(a.owner, b.owner) { return true }
-    if conflict(a.secondName, b.secondName) { return true }
-    if conflict(a.taxID, b.taxID) { return true }
+    if conflict(a.series, b.series) {
+        return true
+    }
+    if conflict(a.denomination, b.denomination) {
+        return true
+    }
+    if conflict(a.issueMonth, b.issueMonth) {
+        return true
+    }
+    if conflict(a.issueYear, b.issueYear) {
+        return true
+    }
+    if conflict(a.owner, b.owner) {
+        return true
+    }
+    if conflict(a.secondName, b.secondName) {
+        return true
+    }
+    if conflict(a.taxID, b.taxID) {
+        return true
+    }
     return false
 }
 
@@ -121,9 +153,7 @@ func recordsHaveConflictingFields(_ a: BondRecord, _ b: BondRecord) -> Bool {
 /// OCR-confusable near-matches and conflicting fields are NEVER automatically merged.
 func canMergeCapture(_ incoming: BondRecord, into existing: BondRecord) -> Bool {
     let match = serialsMatchForMerge(incoming.serial, existing.serial)
-    guard match.exact else { return false }
-
-    guard !recordsHaveConflictingFields(incoming, existing) else { return false }
+    guard match.exact, !recordsHaveConflictingFields(incoming, existing) else { return false }
 
     let vIncoming = validatedSerial(incoming.serial, series: incoming.series)
     let vExisting = validatedSerial(existing.serial, series: existing.series)
@@ -157,7 +187,9 @@ func fieldConfidenceIsHigh(_ record: BondRecord, _ key: String) -> Bool {
     return (record.fieldConfidence?[key] ?? "") == "high"
 }
 
-func validSeriesValues() -> [String] { ["E", "EE", "I"] }
+func validSeriesValues() -> [String] {
+    ["E", "EE", "I"]
+}
 
 func validFaceValues(for series: String) -> [String] {
     // Series E face values. Same list is used when the series is still unknown,
@@ -194,7 +226,9 @@ func validatedSerial(_ raw: String, series: String = "") -> FieldReading {
         // Do not accept the E-truncated form of an EE serial.
         guard let range = n.range(of: hit) else { return false }
         let after = range.upperBound
-        if after < n.endIndex, n[after] == "E" { return false }
+        if after < n.endIndex, n[after] == "E" {
+            return false
+        }
         return isExactE(hit)
     }.sorted { $0.count > $1.count }
     let iHits = regexMatches("[A-Z][0-9]{10}I", in: n).filter { isExactI($0) }
@@ -226,36 +260,56 @@ func validatedSerial(_ raw: String, series: String = "") -> FieldReading {
 func monthNumber(_ text: String) -> String? {
     let names = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
     let s = text.uppercased().trimmingCharacters(in: .whitespacesAndNewlines)
-    if let i = names.firstIndex(where: { s.hasPrefix($0) }) { return String(format: "%02d", i + 1) }
-    if let v = Int(s), (1...12).contains(v) { return String(format: "%02d", v) }
+    if let i = names.firstIndex(where: { s.hasPrefix($0) }) {
+        return String(format: "%02d", i + 1)
+    }
+    if let v = Int(s), (1 ... 12).contains(v) {
+        return String(format: "%02d", v)
+    }
     return nil
 }
 
 func requiredFieldIsConfident(_ record: BondRecord, key: String, value: String) -> Bool {
     guard !value.isEmpty else { return false }
-    if (record.fieldConfidence?[key] ?? "") == "uncertain" { return false }
-    if (record.fieldConfidence?[key] ?? "") == "high" { return true }
+    if let confirmed = record.userConfirmedFields, confirmed.contains(key) {
+        return true
+    }
+    if (record.fieldConfidence?[key] ?? "") == "uncertain" {
+        return false
+    }
+    if (record.fieldConfidence?[key] ?? "") == "high" {
+        return true
+    }
     // Legacy rows with no confidence: do not treat as green just because a value is present.
     return false
 }
 
-func acceptedFaceValue(_ value: String) -> Bool {
+func acceptedFaceValue(_ value: String, isUserConfirmed: Bool = false) -> Bool {
+    let clean = value.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespaces)
+    if isUserConfirmed {
+        return ["10", "25", "50", "75", "100", "200", "500", "1000", "5000", "10000"].contains(clean)
+    }
     // This batch is $25, $50, and $100 only. Other extracted amounts stay
     // in the record but are not enough for a green status.
-    return ["25", "50", "100"].contains(value)
+    return ["25", "50", "100"].contains(clean)
 }
 
 func requiredFieldsComplete(_ record: BondRecord) -> Bool {
+    let denomConfirmed = record.userConfirmedFields?.contains("denomination") == true
     return requiredFieldIsConfident(record, key: "serial", value: record.serial)
         && requiredFieldIsConfident(record, key: "denomination", value: record.denomination)
-        && acceptedFaceValue(record.denomination)
+        && acceptedFaceValue(record.denomination, isUserConfirmed: denomConfirmed)
 }
 
 func requiredFieldsMissing(_ record: BondRecord) -> [String] {
     var missing: [String] = []
-    if !requiredFieldIsConfident(record, key: "serial", value: record.serial) { missing.append("serial") }
+    let denomConfirmed = record.userConfirmedFields?.contains("denomination") == true
+    if !requiredFieldIsConfident(record, key: "serial", value: record.serial) {
+        missing.append("serial")
+    }
     if !requiredFieldIsConfident(record, key: "denomination", value: record.denomination)
-        || !acceptedFaceValue(record.denomination) {
+        || !acceptedFaceValue(record.denomination, isUserConfirmed: denomConfirmed)
+    {
         missing.append("face value")
     }
     return missing
@@ -263,21 +317,28 @@ func requiredFieldsMissing(_ record: BondRecord) -> [String] {
 
 /// Date confidence for the CSV. An uncertain or missing date never blocks green.
 func dateCheck(for record: BondRecord, among records: [BondRecord]) -> String {
-    if record.issueMonth.isEmpty || record.issueYear.isEmpty { return "missing" }
+    if record.issueMonth.isEmpty || record.issueYear.isEmpty {
+        return "missing"
+    }
     let high = fieldConfidenceIsHigh(record, "issueDate")
     let recent = recentScanIssueDates(before: record.capturedAt, among: records.filter { $0.id != record.id })
     let unambiguous = high && (record.fieldSource?["issueDate"] ?? "").contains("agree")
     if sequenceInconsistencyNote(month: record.issueMonth, year: record.issueYear,
-                                 recent: recent, unambiguous: unambiguous) != nil {
+                                 recent: recent, unambiguous: unambiguous) != nil
+    {
         return "uncertain"
     }
     return high ? "ok" : "uncertain"
 }
 
 func applyRequiredStatus(_ record: inout BondRecord) {
-    if record.status == "PROCESSING" || record.status == "DUPLICATE" { return }
+    if record.status == "PROCESSING" || record.status == "DUPLICATE" {
+        return
+    }
     let upper = record.status.uppercased()
-    if upper == "FAILED" || upper == "FAIL" || upper == "ERROR" || upper == "FAILURE" { return }
+    if upper == "FAILED" || upper == "FAIL" || upper == "ERROR" || upper == "FAILURE" {
+        return
+    }
     let missing = requiredFieldsMissing(record)
 
     // Evidence-based bond validation
@@ -285,25 +346,72 @@ func applyRequiredStatus(_ record: inout BondRecord) {
     record.validationWarnings = validation.warnings.isEmpty ? nil : validation.warnings
     record.validationErrors = validation.hardErrors.isEmpty ? nil : validation.hardErrors
 
-    if !validation.hardErrors.isEmpty {
+    // Track structured review reasons separately from confidence and notes
+    var reasons = Set(record.reviewReasons ?? [])
+    let resolved = Set(record.resolvedReviewReasons ?? [])
+
+    // Filter out previous dynamic validation and missing-field reasons before re-evaluating
+    reasons = reasons.filter { !$0.hasPrefix("validation:") && !$0.hasPrefix("missing_required:") }
+
+    // If notes historically indicated a near-match, ensure it is recorded in structured reasons
+    if record.notes.contains("Near-match") || record.notes.contains("near-match"), !resolved.contains("near_match"), !reasons.contains(where: { $0.hasPrefix("near_match") }) {
+        reasons.insert("near_match")
+    }
+
+    // Add current validation hard errors
+    for err in validation.hardErrors {
+        let reasonKey = "validation: \(err)"
+        if !resolved.contains(reasonKey) {
+            reasons.insert(reasonKey)
+        }
+    }
+
+    // Add current missing required fields
+    if !missing.isEmpty {
+        reasons.insert("missing_required: \(missing.joined(separator: ", "))")
+    }
+
+    // Preserve legacy review intent:
+    // If a record historically had REVIEW status, but has no structured reasons and the user has not
+    // explicitly confirmed it or resolved the legacy review, retain a legacy review reason.
+    if upper == "REVIEW" && reasons.isEmpty && (record.userConfirmedFields ?? []).isEmpty && !resolved.contains("legacy_review") {
+        reasons.insert("legacy_review: manual verification required")
+    }
+
+    // Remove any explicitly resolved reasons
+    for r in resolved {
+        reasons.remove(r)
+    }
+
+    record.reviewReasons = reasons.isEmpty ? nil : Array(reasons).sorted()
+
+    // If ANY review reason exists (e.g. near-match, validation error, missing field),
+    // status MUST be REVIEW and cannot be reclassified as OK simply because OCR confidence is high.
+    if let activeReasons = record.reviewReasons, !activeReasons.isEmpty {
         record.status = "REVIEW"
-        record.notes = "Validation: " + validation.hardErrors.joined(separator: "; ")
+        if !validation.hardErrors.isEmpty {
+            let valNote = "Validation: " + validation.hardErrors.joined(separator: "; ")
+            if !record.notes.contains("Validation:") {
+                record.notes = record.notes.isEmpty ? valNote : "\(record.notes); \(valNote)"
+            }
+        } else if !missing.isEmpty {
+            let missNote = "Missing or uncertain: " + missing.joined(separator: ", ")
+            if !record.notes.contains("Missing or uncertain:") {
+                record.notes = record.notes.isEmpty ? missNote : "\(record.notes); \(missNote)"
+            }
+        }
+        if !validation.warnings.isEmpty, !record.notes.contains("Warning:") {
+            record.notes += " | Warning: " + validation.warnings.joined(separator: "; ")
+        }
         return
     }
 
-    if missing.isEmpty {
-        record.status = "OK"
-        if !validation.warnings.isEmpty {
-            record.notes = "Warning: " + validation.warnings.joined(separator: "; ")
-        } else if record.notes.hasPrefix("Missing or uncertain:") || record.notes.hasPrefix("Validation:") {
-            record.notes = ""
-        }
-    } else {
-        record.status = "REVIEW"
-        record.notes = "Missing or uncertain: " + missing.joined(separator: ", ")
-        if !validation.warnings.isEmpty {
-            record.notes += " | Warning: " + validation.warnings.joined(separator: "; ")
-        }
+    // No review reasons and no missing fields -> OK
+    record.status = "OK"
+    if !validation.warnings.isEmpty {
+        record.notes = "Warning: " + validation.warnings.joined(separator: "; ")
+    } else if record.notes.hasPrefix("Missing or uncertain:") || record.notes.hasPrefix("Validation:") {
+        record.notes = ""
     }
 }
 
@@ -321,7 +429,9 @@ func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord,
     }
     func take(_ key: String, confidenceKey: String? = nil, current: String, incomingValue: String, set: (String) -> Void) {
         // Requirement 5: Never silently replace user-confirmed values!
-        if isUserConfirmed(key) { return }
+        if isUserConfirmed(key) {
+            return
+        }
         let ckey = confidenceKey ?? key
         let incomingOK = !incomingValue.isEmpty
         let shouldReplaceUncertain = !current.isEmpty && incomingOK && incomingHigh(ckey) && !existingHigh(ckey)
@@ -329,7 +439,9 @@ func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord,
         guard shouldFillEmpty || shouldReplaceUncertain else { return }
         if shouldReplaceUncertain {
             var prev = existing.previousExtracted ?? [:]
-            if prev[key] == nil { prev[key] = current }
+            if prev[key] == nil {
+                prev[key] = current
+            }
             existing.previousExtracted = prev
         }
         set(incomingValue)
@@ -339,8 +451,12 @@ func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord,
         var src = existing.fieldSource ?? [:]
         photos[key] = contributingSource.isEmpty ? contributingPhoto : contributingSource
         ids[key] = captureId
-        if let c = incoming.fieldConfidence?[ckey] { conf[ckey] = c }
-        if let s = incoming.fieldSource?[ckey] { src[ckey] = s }
+        if let c = incoming.fieldConfidence?[ckey] {
+            conf[ckey] = c
+        }
+        if let s = incoming.fieldSource?[ckey] {
+            src[ckey] = s
+        }
         existing.fieldPhoto = photos
         existing.fieldCaptureId = ids
         existing.fieldConfidence = conf
@@ -353,12 +469,24 @@ func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord,
     take("issueYear", confidenceKey: "issueDate", current: existing.issueYear, incomingValue: incoming.issueYear) { existing.issueYear = $0 }
     take("denomination", current: existing.denomination, incomingValue: incoming.denomination) { existing.denomination = $0 }
     if !filled.isEmpty {
-        if existing.owner.isEmpty && !incoming.owner.isEmpty { existing.owner = incoming.owner }
-        if existing.secondName.isEmpty && !incoming.secondName.isEmpty { existing.secondName = incoming.secondName }
-        if existing.secondRole.isEmpty && !incoming.secondRole.isEmpty { existing.secondRole = incoming.secondRole }
-        if existing.address.isEmpty && !incoming.address.isEmpty { existing.address = incoming.address }
-        if existing.issuingAgent.isEmpty && !incoming.issuingAgent.isEmpty { existing.issuingAgent = incoming.issuingAgent }
-        if existing.datingStamp.isEmpty && !incoming.datingStamp.isEmpty { existing.datingStamp = incoming.datingStamp }
+        if existing.owner.isEmpty, !incoming.owner.isEmpty {
+            existing.owner = incoming.owner
+        }
+        if existing.secondName.isEmpty, !incoming.secondName.isEmpty {
+            existing.secondName = incoming.secondName
+        }
+        if existing.secondRole.isEmpty, !incoming.secondRole.isEmpty {
+            existing.secondRole = incoming.secondRole
+        }
+        if existing.address.isEmpty, !incoming.address.isEmpty {
+            existing.address = incoming.address
+        }
+        if existing.issuingAgent.isEmpty, !incoming.issuingAgent.isEmpty {
+            existing.issuingAgent = incoming.issuingAgent
+        }
+        if existing.datingStamp.isEmpty, !incoming.datingStamp.isEmpty {
+            existing.datingStamp = incoming.datingStamp
+        }
         if !incoming.rawOCR.isEmpty {
             if let prev = existing.additionalOCR, !prev.isEmpty {
                 existing.additionalOCR = prev + "\n---\n" + incoming.rawOCR
@@ -366,6 +494,13 @@ func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord,
                 existing.additionalOCR = incoming.rawOCR
             }
         }
+    }
+    if let inReasons = incoming.reviewReasons, !inReasons.isEmpty {
+        var mergedReasons = Set(existing.reviewReasons ?? [])
+        for r in inReasons {
+            mergedReasons.insert(r)
+        }
+        existing.reviewReasons = Array(mergedReasons).sorted()
     }
     applyRequiredStatus(&existing)
     return filled
@@ -377,11 +512,15 @@ func annotateFieldSources(_ record: inout BondRecord, photo: String, captureId: 
     let pairs: [(String, String)] = [
         ("series", record.series), ("serial", record.serial),
         ("issueMonth", record.issueMonth), ("issueYear", record.issueYear),
-        ("denomination", record.denomination)
+        ("denomination", record.denomination),
     ]
     for (key, value) in pairs {
-        if value.isEmpty { continue }
-        if let fields = fields, !fields.contains(key) { continue }
+        if value.isEmpty {
+            continue
+        }
+        if let fields = fields, !fields.contains(key) {
+            continue
+        }
         if photos[key] == nil {
             photos[key] = photo
             ids[key] = captureId
@@ -399,21 +538,27 @@ func normalizeDenominationText(_ raw: String) -> String {
         "TWENTV": "TWENTY", "TVENTY": "TWENTY",
         "SEVENTV": "SEVENTY", "SEVEMTY": "SEVENTY",
         "I8.75": "18.75", "I8,75": "18.75",
-        "\u{2014}": "-", "\u{2013}": "-", "\u{2212}": "-"
+        "\u{2014}": "-", "\u{2013}": "-", "\u{2212}": "-",
     ]
-    for (a, b) in replacements { t = t.replacingOccurrences(of: a, with: b) }
+    for (a, b) in replacements {
+        t = t.replacingOccurrences(of: a, with: b)
+    }
     return t
 }
 
 func levenshtein(_ a: String, _ b: String) -> Int {
     let aChars = Array(a), bChars = Array(b)
-    if aChars.isEmpty { return bChars.count }
-    if bChars.isEmpty { return aChars.count }
-    var prev = Array(0...bChars.count)
+    if aChars.isEmpty {
+        return bChars.count
+    }
+    if bChars.isEmpty {
+        return aChars.count
+    }
+    var prev = Array(0 ... bChars.count)
     var cur = [Int](repeating: 0, count: bChars.count + 1)
-    for i in 1...aChars.count {
+    for i in 1 ... aChars.count {
         cur[0] = i
-        for j in 1...bChars.count {
+        for j in 1 ... bChars.count {
             let cost = aChars[i - 1] == bChars[j - 1] ? 0 : 1
             cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
         }
@@ -450,10 +595,16 @@ func isYearToken(_ token: String) -> Bool {
 /// OCR near-misses are not plausible issue years.
 func isPlausibleIssueYear(_ year: String, series: String) -> Bool {
     guard let y = Int(year), year.count == 4 else { return false }
-    if series == "E" { return (1941...1980).contains(y) }
-    if series == "EE" { return (1980...2026).contains(y) }
-    if series == "I" { return (1998...2026).contains(y) }
-    return (1941...2026).contains(y)
+    if series == "E" {
+        return (1941 ... 1980).contains(y)
+    }
+    if series == "EE" {
+        return (1980 ... 2026).contains(y)
+    }
+    if series == "I" {
+        return (1998 ... 2026).contains(y)
+    }
+    return (1941 ... 2026).contains(y)
 }
 
 /// Month from a month NAME only. Bare 1…12 are ruler ticks and must not
@@ -467,7 +618,7 @@ func monthFromName(_ text: String) -> String? {
     }
     // Common OCR confusions for a faint 3-letter month (especially SEP).
     let aliases: [String: String] = [
-        "SEF": "SEP", "SFP": "SEP", "5EP": "SEP", "SCP": "SEP", "SETEMBER": "SEP"
+        "SEF": "SEP", "SFP": "SEP", "5EP": "SEP", "SCP": "SEP", "SETEMBER": "SEP",
     ]
     let token = s.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).first.map(String.init) ?? s
     if let canon = aliases[token], let i = names.firstIndex(of: canon) {
@@ -478,20 +629,28 @@ func monthFromName(_ text: String) -> String? {
 
 func monthAbbrev(_ month: String) -> String {
     let names = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-    if let i = Int(month), (1...12).contains(i) { return names[i - 1] }
+    if let i = Int(month), (1 ... 12).contains(i) {
+        return names[i - 1]
+    }
     return month
 }
 
 func isRulerLikeText(_ text: String) -> Bool {
     let t = text.uppercased().trimmingCharacters(in: .whitespacesAndNewlines)
-    if t.contains("INCH") || t.contains("CENTIMETER") || t == "CM" || t == "MM" || t == "IN" { return true }
+    if t.contains("INCH") || t.contains("CENTIMETER") || t == "CM" || t == "MM" || t == "IN" {
+        return true
+    }
     // Isolated tick numbers: "1", "10", "12", "1 2 3 4".
     let compact = t.replacingOccurrences(of: " ", with: "")
     if regexMatches("^[0-9]{1,2}$", in: compact).isEmpty == false {
-        if let n = Int(compact), (0...16).contains(n) { return true }
+        if let n = Int(compact), (0 ... 16).contains(n) {
+            return true
+        }
     }
     let nums = regexMatches("\\b[0-9]{1,2}\\b", in: t)
-    if nums.count >= 3, nums.allSatisfy({ Int($0) ?? 99 <= 16 }) { return true }
+    if nums.count >= 3, nums.allSatisfy({ Int($0) ?? 99 <= 16 }) {
+        return true
+    }
     return false
 }
 
@@ -512,7 +671,7 @@ func wordAmountReadings(in blob: String, series: String) -> [(value: String, str
         ("ONETHOUSAND", "1000", 2), ("FIVEHUNDRED", "500", 2),
         ("TWOHUNDRED", "200", 2), ("ONEHUNDRED", "100", 2),
         ("SEVENTYFIVE", "75", 2), ("TWENTYFIVE", "25", 2),
-        ("FIFTYDOLLARS", "50", 2)
+        ("FIFTYDOLLARS", "50", 2),
     ]
     // Exact (after TVENTY→TWENTY normalization) first.
     let exactPairs: [(String, String)] = [
@@ -522,13 +681,17 @@ func wordAmountReadings(in blob: String, series: String) -> [(value: String, str
         ("SEVENTY-FIVE", "75"), ("SEVENTY FIVE", "75"), ("SEVENTYFIVE", "75"),
         ("TWENTY-FIVE", "25"), ("TWENTY FIVE", "25"), ("TWENTYFIVE", "25"),
         ("FIFTY DOLLARS", "50"), ("TEN DOLLARS", "10"),
-        ("SEVENTY FIVE DOLLARS", "75"), ("TWENTY FIVE DOLLARS", "25")
+        ("SEVENTY FIVE DOLLARS", "75"), ("TWENTY FIVE DOLLARS", "25"),
     ]
     for (word, amount) in exactPairs where faces.contains(amount) && normalized.contains(word) {
         hits.append((amount, 2, word))
     }
-    if regexMatches("TWENTY[\\s-]*F[I1L]?VE", in: normalized).isEmpty == false { hits.append(("25", 2, "TWENTY-FIVE")) }
-    if regexMatches("SEVENTY[\\s-]*F[I1L]?VE", in: normalized).isEmpty == false { hits.append(("75", 2, "SEVENTY-FIVE")) }
+    if regexMatches("TWENTY[\\s-]*F[I1L]?VE", in: normalized).isEmpty == false {
+        hits.append(("25", 2, "TWENTY-FIVE"))
+    }
+    if regexMatches("SEVENTY[\\s-]*F[I1L]?VE", in: normalized).isEmpty == false {
+        hits.append(("75", 2, "SEVENTY-FIVE"))
+    }
 
     // Sliding-window Levenshtein against compact letter strings (TVENTYFINE ≈ TWENTYFIVE).
     for (phrase, amount, strength) in phrases where faces.contains(amount) {
@@ -539,10 +702,12 @@ func wordAmountReadings(in blob: String, series: String) -> [(value: String, str
         let minLen = max(target.count - 1, 1)
         let maxLen = target.count + 1
         if chars.count >= minLen {
-            for len in minLen...min(maxLen, chars.count) {
-                if chars.count < len { break }
-                for start in 0...(chars.count - len) {
-                    let window = String(chars[start..<(start + len)])
+            for len in minLen ... min(maxLen, chars.count) {
+                if chars.count < len {
+                    break
+                }
+                for start in 0 ... (chars.count - len) {
+                    let window = String(chars[start ..< (start + len)])
                     if levenshtein(window, phrase) <= maxDist {
                         hits.append((amount, strength, "fuzzy:\(phrase)"))
                     }
@@ -552,21 +717,27 @@ func wordAmountReadings(in blob: String, series: String) -> [(value: String, str
     }
     // Isolated FIFTY / HUNDRED without DOLLARS is weaker and easy to hallucinate.
     if hits.isEmpty {
-        if normalized.contains("FIFTY") && faces.contains("50") { hits.append(("50", 1, "FIFTY")) }
-        if normalized.contains("THOUSAND") && faces.contains("1000") && !normalized.contains("TEN THOUSAND") && !normalized.contains("FIVE THOUSAND") {
+        if normalized.contains("FIFTY"), faces.contains("50") {
+            hits.append(("50", 1, "FIFTY"))
+        }
+        if normalized.contains("THOUSAND"), faces.contains("1000"), !normalized.contains("TEN THOUSAND"), !normalized.contains("FIVE THOUSAND") {
             hits.append(("1000", 1, "THOUSAND"))
         }
     }
     // Dedup, keep strongest evidence for each amount.
     var best: [String: (Int, String)] = [:]
     for (v, s, e) in hits {
-        if let prev = best[v], prev.0 >= s { continue }
+        if let prev = best[v], prev.0 >= s {
+            continue
+        }
         best[v] = (s, e)
     }
     // More specific compounds (TWENTYFIVE) ahead of shorter ones (TEN DOLLARS)
     // so `.first` cannot pick a false $10 over a real $25.
     return best.map { ($0.key, $0.value.0, $0.value.1) }.sorted { a, b in
-        if a.1 != b.1 { return a.1 > b.1 }
+        if a.1 != b.1 {
+            return a.1 > b.1
+        }
         return a.2.count > b.2.count
     }
 }
@@ -580,16 +751,26 @@ func cornerNumeralReadings(_ lines: [OCRLine], series: String, treatAsCorner: Bo
     }
     var votes: [String: Int] = [:]
     for line in lines {
-        if isDateLikeText(line.text) { continue }
-        if isRulerLikeText(line.text) { continue }
+        if isDateLikeText(line.text) {
+            continue
+        }
+        if isRulerLikeText(line.text) {
+            continue
+        }
         let token = cleanAlnum(line.text)
-        if isYearToken(token) { continue }
+        if isYearToken(token) {
+            continue
+        }
         // "10 MAY 1966" compacted is 10MAY1966 — skip any face value on a date line (already continued).
         var candidates: [String] = []
-        if faces.contains(token) { candidates.append(token) }
-        if token.hasSuffix("00") && token.count == 4 {
+        if faces.contains(token) {
+            candidates.append(token)
+        }
+        if token.hasSuffix("00"), token.count == 4 {
             let stem = String(token.dropLast(2))
-            if faces.contains(stem) { candidates.append(stem) }
+            if faces.contains(stem) {
+                candidates.append(stem)
+            }
         }
         for value in candidates {
             let onCorner = treatAsCorner || isCorner(line.box)
@@ -626,7 +807,8 @@ func supportingNumeralReading(_ lines: [OCRLine], series: String) -> FieldReadin
     if blob.contains("MATURITY") || blob.contains("FACE VALUE") || blob.contains("MATURITY VALUE") {
         for value in faces {
             if regexMatches("(?:MATURITY|FACE)\\s*(?:VALUE)?[^A-Z0-9]{0,12}" + value + "\\b", in: blob).isEmpty == false
-                || regexMatches("\\b" + value + "\\b[^A-Z0-9]{0,12}(?:MATURITY|FACE)", in: blob).isEmpty == false {
+                || regexMatches("\\b" + value + "\\b[^A-Z0-9]{0,12}(?:MATURITY|FACE)", in: blob).isEmpty == false
+            {
                 return FieldReading(value: value, confidence: "uncertain", source: "maturity-label")
             }
         }
@@ -640,7 +822,7 @@ func supportingNumeralReading(_ lines: [OCRLine], series: String) -> FieldReadin
             ("150\\s*[.,]\\s*00", "200"),
             ("375\\s*[.,]\\s*00", "500"),
             ("750\\s*[.,]\\s*00", "1000"),
-            ("7\\s*[.,]\\s*50", "10")
+            ("7\\s*[.,]\\s*50", "10"),
         ]
         let priceContext = blob.contains("ISSUE") || blob.contains("PRICE") || blob.contains("PURCHASE")
         if priceContext {

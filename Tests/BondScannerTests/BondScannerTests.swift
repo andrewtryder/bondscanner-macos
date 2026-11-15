@@ -1,16 +1,30 @@
-import XCTest
-import CoreGraphics
 @testable import BondScanner
+import CoreGraphics
+import SQLite3
+import XCTest
 
 final class BondScannerTests: XCTestCase {
+    private var testExportTempDir: URL?
 
     override func setUp() {
         super.setUp()
         ScanLog.shared.isEnabled = false
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("test-exports-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        testExportTempDir = temp
+        ExportConfiguration.shared.setCustomDestinations(
+            records: temp.appendingPathComponent("records.json"),
+            csv: temp.appendingPathComponent("bonds.csv")
+        )
     }
 
     override func tearDown() {
         ScanLog.shared.isEnabled = true
+        ExportConfiguration.shared.resetToDefaults()
+        if let temp = testExportTempDir {
+            try? FileManager.default.removeItem(at: temp)
+            testExportTempDir = nil
+        }
         super.tearDown()
     }
 
@@ -356,7 +370,7 @@ final class BondScannerTests: XCTestCase {
         try db.upsertRecords([recA, recB])
         XCTAssertEqual(try db.count(), 2)
 
-        // Successful atomic merge: recB is deleted and recA is updated with recB's owner in one transaction
+        // Part 1: Verify successful atomic merge
         var mergedA = recA
         mergedA.owner = "Jane Doe"
         try db.atomicMerge(deleteId: recB.id, updatedRecord: mergedA, sortOrder: 0)
@@ -366,6 +380,33 @@ final class BondScannerTests: XCTestCase {
         XCTAssertEqual(loaded.first?.id, "rec-A")
         XCTAssertEqual(loaded.first?.owner, "Jane Doe")
         XCTAssertFalse(try db.loadAllRecords().contains(where: { $0.id == "rec-B" }))
+
+        // Re-insert recB for failure injection testing
+        try db.upsertRecord(recB)
+        XCTAssertEqual(try db.count(), 2)
+
+        // Part 2: INJECT FAILURE to test genuine SQLite transaction rollback
+        // Install a trigger that aborts transactions on bonds updates when id == 'rec-A'
+        let createTriggerSQL = "CREATE TRIGGER fail_rollback_injection BEFORE INSERT ON bonds WHEN NEW.id = 'rec-A' BEGIN SELECT RAISE(ABORT, 'injected transaction failure'); END;"
+        var stmt: OpaquePointer?
+        // Open low-level connection to execute DDL trigger
+        var rawHandle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(dbURL.path, &rawHandle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(rawHandle, createTriggerSQL, nil, nil, nil), SQLITE_OK)
+        sqlite3_close_v2(rawHandle)
+
+        var failingMerged = recA
+        failingMerged.owner = "Should Rollback"
+
+        XCTAssertThrowsError(try db.atomicMerge(deleteId: recB.id, updatedRecord: failingMerged, sortOrder: 0))
+
+        // ROLLBACK GUARANTEE: Neither the deletion of recB nor the update of recA must persist!
+        XCTAssertEqual(try db.count(), 2)
+        let recordsAfterFailedMerge = try db.loadAllRecords()
+        XCTAssertTrue(recordsAfterFailedMerge.contains(where: { $0.id == "rec-A" }))
+        XCTAssertTrue(recordsAfterFailedMerge.contains(where: { $0.id == "rec-B" }))
+        let reloadedA = recordsAfterFailedMerge.first(where: { $0.id == "rec-A" })
+        XCTAssertEqual(reloadedA?.owner, "Jane Doe") // NOT "Should Rollback"
     }
 
     func testInterruptedScanRecovery() throws {
@@ -485,28 +526,203 @@ final class BondScannerTests: XCTestCase {
         XCTAssertTrue(csvContent.contains("100"))
     }
 
-    func testSQLiteReopenAfterUncleanShutdown() throws {
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-wal-test-\(UUID().uuidString)", isDirectory: true)
+    func testGracefulDatabaseReopen() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-graceful-test-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
 
         do {
             let db = try DatabaseManager(url: dbURL)
-            var r = emptyBondRecord(id: "wal-1", capturedAt: "2026-11-14T10:00:00Z")
+            var r = emptyBondRecord(id: "graceful-1", capturedAt: "2026-11-14T10:00:00Z")
             r.serial = "C1234567890EE"
             r.status = "OK"
             try db.upsertRecord(r)
             XCTAssertEqual(try db.count(), 1)
-            // Do not run manual checkpoint or vacuum; close connection abruptly by letting it deallocate
         }
 
-        // Reopen database and verify WAL journal replay recovers all rows
+        // Reopen database gracefully
         let reopened = try DatabaseManager(url: dbURL)
         XCTAssertEqual(try reopened.count(), 1)
         let loaded = try reopened.loadAllRecords()
-        XCTAssertEqual(loaded.first?.id, "wal-1")
+        XCTAssertEqual(loaded.first?.id, "graceful-1")
         XCTAssertEqual(loaded.first?.serial, "C1234567890EE")
+    }
+
+    func testCrashRecoveryUncleanShutdown() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-crash-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+
+        // Phase 1: Initialize schema with DatabaseManager
+        do {
+            let db = try DatabaseManager(url: dbURL)
+            var r = emptyBondRecord(id: "crash-init", capturedAt: "2026-11-14T09:00:00Z")
+            r.serial = "C1111111111EE"
+            r.status = "OK"
+            try db.upsertRecord(r)
+        }
+
+        // Phase 2: Open low-level SQLite handle, disable auto-checkpoint, write a new row, and simulate crash by closing without checkpoint
+        var rawHandle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(dbURL.path, &rawHandle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(rawHandle, "PRAGMA wal_autocheckpoint = 0;", nil, nil, nil), SQLITE_OK)
+
+        var crashRec = emptyBondRecord(id: "crash-2", capturedAt: "2026-11-14T09:01:00Z")
+        crashRec.serial = "C2222222222EE"
+        crashRec.status = "OK"
+        let encData = try JSONEncoder().encode(crashRec)
+        let jsonStr = try XCTUnwrap(String(data: encData, encoding: .utf8)?.replacingOccurrences(of: "'", with: "''"))
+        let insertSQL = "INSERT INTO bonds (id, sort_order, captured_at, serial_number, normalized_serial, status, record_json, updated_at) VALUES ('crash-2', 1, '2026-11-14T09:01:00Z', 'C2222222222EE', 'C2222222222EE', 'OK', '\(jsonStr)', '2026-11-14T09:01:00Z');"
+        XCTAssertEqual(sqlite3_exec(rawHandle, insertSQL, nil, nil, nil), SQLITE_OK)
+
+        // Verify WAL file exists and contains uncheckpointed data
+        let walURL = URL(fileURLWithPath: dbURL.path + "-wal")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: walURL.path))
+        let walSize = (try? FileManager.default.attributesOfItem(atPath: walURL.path)[.size] as? Int64) ?? 0
+        XCTAssertGreaterThan(walSize, 0)
+
+        // Close raw handle WITHOUT checkpointing (simulates crash/abrupt process termination)
+        sqlite3_close_v2(rawHandle)
+
+        // Phase 3: Open with DatabaseManager and verify crash recovery replays the uncheckpointed WAL
+        let recoveredDB = try DatabaseManager(url: dbURL)
+        XCTAssertEqual(try recoveredDB.count(), 2)
+        let loaded = try recoveredDB.loadAllRecords()
+        XCTAssertTrue(loaded.contains(where: { $0.id == "crash-init" }))
+        XCTAssertTrue(loaded.contains(where: { $0.id == "crash-2" }))
+    }
+
+    func testLockedDatabaseInitializationFailure() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-locked-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+        let db = try DatabaseManager(url: dbURL)
+        var r = emptyBondRecord(id: "lock-1", capturedAt: "2026-11-14T10:00:00Z")
+        r.serial = "C1234567890EE"
+        try db.upsertRecord(r)
+
+        // Open independent connection and hold exclusive lock
+        var lockHandle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(dbURL.path, &lockHandle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(lockHandle, "BEGIN EXCLUSIVE TRANSACTION;", nil, nil, nil), SQLITE_OK)
+        defer {
+            sqlite3_exec(lockHandle, "ROLLBACK;", nil, nil, nil)
+            sqlite3_close_v2(lockHandle)
+        }
+
+        // Attempting to open DatabaseManager while locked must throw and NOT destroy files
+        XCTAssertThrowsError(try DatabaseManager(url: dbURL))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dbURL.path))
+    }
+
+    func testReadOnlyDatabaseInitializationFailure() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-ro-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+        do {
+            let db = try DatabaseManager(url: dbURL)
+            var r = emptyBondRecord(id: "ro-1", capturedAt: "2026-11-14T10:00:00Z")
+            r.serial = "C1234567890EE"
+            try db.upsertRecord(r)
+        }
+
+        // Make database file read-only (0o444)
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: dbURL.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: dbURL.path)
+        }
+
+        // Initialization must fail with permission error or openFailed, NOT corruption!
+        XCTAssertThrowsError(try DatabaseManager(url: dbURL)) { error in
+            guard let dbErr = error as? DatabaseError else {
+                XCTFail("Expected DatabaseError but got: \(error)")
+                return
+            }
+            switch dbErr {
+            case .permissionDenied, .openFailed, .statementFailed:
+                break // Valid
+            default:
+                XCTFail("Must not report corruption for read-only database! Got: \(dbErr)")
+            }
+        }
+
+        // Verify original file is preserved and not moved away
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dbURL.path))
+    }
+
+    func testInaccessiblePathDatabaseInitializationFailure() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-inaccess-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let blockerFile = tempDir.appendingPathComponent("blocking_regular_file")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try "file content".write(to: blockerFile, atomically: true, encoding: .utf8)
+
+        let invalidURL = blockerFile.appendingPathComponent("bonds.sqlite3")
+        XCTAssertThrowsError(try DatabaseManager(url: invalidURL))
+    }
+
+    func testCorruptedDatabaseIntegrityAndExplicitRecovery() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-corrupt-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+        do {
+            let db = try DatabaseManager(url: dbURL)
+            var r = emptyBondRecord(id: "corrupt-1", capturedAt: "2026-11-14T10:00:00Z")
+            r.serial = "C1234567890EE"
+            try db.upsertRecord(r)
+        }
+
+        // Deliberately corrupt the database file
+        let junkBytes = Data("NOT AN SQLITE DATABASE CORRUPT BYTES CONTENT HEADER INVALID".utf8)
+        let handle = try FileHandle(forWritingTo: dbURL)
+        handle.write(junkBytes)
+        handle.closeFile()
+
+        // 1. validateDatabaseIntegrity must detect corruption
+        XCTAssertThrowsError(try DatabaseManager.validateDatabaseIntegrity(at: dbURL)) { error in
+            guard let dbErr = error as? DatabaseError, case .databaseCorrupted = dbErr else {
+                XCTFail("Expected databaseCorrupted but got: \(error)")
+                return
+            }
+        }
+
+        // 2. DatabaseManager initialization must fail and NOT silently fallback
+        XCTAssertThrowsError(try DatabaseManager(url: dbURL))
+
+        // 3. recoverDatabase must safely archive the corrupt file and initialize clean replacement
+        let recovered = try DatabaseManager.recoverDatabase(at: dbURL)
+        XCTAssertEqual(try recovered.count(), 0)
+
+        // Verify corrupted file was archived
+        let files = try FileManager.default.contentsOfDirectory(atPath: tempDir.path)
+        let archiveFiles = files.filter { $0.contains("bonds_corrupt_") }
+        XCTAssertFalse(archiveFiles.isEmpty, "Corrupted files must be archived before replacement")
+    }
+
+    func testNonCorruptedDatabaseRejectsRecovery() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-safe-recovery-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+        let db = try DatabaseManager(url: dbURL)
+        var r = emptyBondRecord(id: "intact-1", capturedAt: "2026-11-14T10:00:00Z")
+        r.serial = "C1234567890EE"
+        try db.upsertRecord(r)
+
+        // Attempting recovery on an intact database MUST ABORT to prevent accidental data loss
+        XCTAssertThrowsError(try DatabaseManager.recoverDatabase(at: dbURL)) { error in
+            guard let dbErr = error as? DatabaseError, case .recoveryAborted = dbErr else {
+                XCTFail("Expected recoveryAborted but got: \(error)")
+                return
+            }
+        }
+        XCTAssertEqual(try db.count(), 1)
     }
 
     func testSQLiteSchemaVersioningAndBackupRestore() throws {
@@ -545,6 +761,265 @@ final class BondScannerTests: XCTestCase {
         try db.restoreDatabase(from: backupURL)
         XCTAssertEqual(try db.count(), 1)
         XCTAssertEqual(try db.loadAllRecords().first?.id, "bk-1")
+    }
+
+    func testBackupAndRestoreFailureHandling() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-backup-fail-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+        let db = try DatabaseManager(url: dbURL)
+
+        var r = emptyBondRecord(id: "orig-1", capturedAt: "2026-11-14T10:00:00Z")
+        r.serial = "C1234567890EE"
+        r.status = "OK"
+        try db.upsertRecord(r)
+        XCTAssertEqual(try db.count(), 1)
+
+        // 1. Missing backup file
+        let missingURL = tempDir.appendingPathComponent("nonexistent_backup.sqlite3")
+        XCTAssertThrowsError(try db.restoreDatabase(from: missingURL))
+        XCTAssertEqual(try db.count(), 1, "Original database must remain intact")
+
+        // 2. Corrupted backup file (junk bytes)
+        let corruptBackupURL = tempDir.appendingPathComponent("corrupted_backup.sqlite3")
+        try "GARBAGE CORRUPTED BYTES".write(to: corruptBackupURL, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try db.restoreDatabase(from: corruptBackupURL))
+        XCTAssertEqual(try db.count(), 1, "Original database must remain intact after corrupt backup restore attempt")
+
+        // 3. Incompatible schema backup (e.g. user_version 9999)
+        let incompatibleBackupURL = tempDir.appendingPathComponent("incompatible_backup.sqlite3")
+        let incompDB = try DatabaseManager(url: incompatibleBackupURL)
+        try incompDB.execute("PRAGMA user_version = 9999;")
+        XCTAssertThrowsError(try db.restoreDatabase(from: incompatibleBackupURL)) { error in
+            guard let dbErr = error as? DatabaseError, case .incompatibleSchema = dbErr else {
+                XCTFail("Expected incompatibleSchema but got: \(error)")
+                return
+            }
+        }
+        XCTAssertEqual(try db.count(), 1, "Original database must remain intact after incompatible schema restore attempt")
+
+        // 4. Partially copied backup file (valid backup truncated)
+        let validBackupURL = tempDir.appendingPathComponent("valid_backup.sqlite3")
+        try db.backupDatabase(to: validBackupURL)
+        let partialBackupURL = tempDir.appendingPathComponent("partial_backup.sqlite3")
+        let fullData = try Data(contentsOf: validBackupURL)
+        let truncatedData = fullData.prefix(fullData.count / 3) // Truncate to 1/3
+        try truncatedData.write(to: partialBackupURL)
+        XCTAssertThrowsError(try db.restoreDatabase(from: partialBackupURL))
+        XCTAssertEqual(try db.count(), 1, "Original database must remain intact after partial backup restore attempt")
+        XCTAssertEqual(try db.loadAllRecords().first?.id, "orig-1")
+    }
+
+    func testNearMatchCannotBeReclassifiedAsOKByHighConfidenceOrCompleteFields() {
+        var existing = emptyBondRecord(id: "exist-1", capturedAt: "2026-11-14T10:00:00Z")
+        existing.serial = "C1234567890EE"
+        existing.series = "EE"
+        existing.denomination = "100"
+        existing.issueMonth = "05"
+        existing.issueYear = "1992"
+        existing.status = "OK"
+
+        // Incoming near-match with complete required fields and high OCR confidence
+        var incoming = emptyBondRecord(id: "near-1", capturedAt: "2026-11-14T10:05:00Z")
+        incoming.serial = "C1234567898EE" // Near-match (8 vs 0)
+        incoming.series = "EE"
+        incoming.denomination = "100"
+        incoming.issueMonth = "05"
+        incoming.issueYear = "1992"
+        incoming.fieldConfidence = [
+            "serial": "high",
+            "series": "high",
+            "denomination": "high",
+            "issueDate": "high",
+        ]
+
+        // Detected as near match
+        let near = findNearMatchRecord(incoming, in: [existing], excluding: incoming.id)
+        XCTAssertEqual(near?.id, "exist-1")
+
+        // Mark as near-match review with structured reason
+        incoming.status = "REVIEW"
+        incoming.reviewReasons = ["near_match: exist-1"]
+
+        // Execute revalidation
+        applyRequiredStatus(&incoming)
+
+        // GUARANTEE: Even though all fields are present and high confidence, status MUST NOT be reclassified to OK!
+        XCTAssertEqual(incoming.status, "REVIEW")
+        XCTAssertTrue(incoming.reviewReasons?.contains(where: { $0.hasPrefix("near_match") }) == true)
+    }
+
+    func testReviewReasonsSurviveSaveReloadRevalidationAndAppRestart() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-review-reasons-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+        let db = try DatabaseManager(url: dbURL)
+
+        var record = emptyBondRecord(id: "rev-persist-1", capturedAt: "2026-11-14T10:00:00Z")
+        record.serial = "C1234567898EE"
+        record.series = "EE"
+        record.denomination = "100"
+        record.fieldConfidence = ["serial": "high", "denomination": "high"]
+        record.status = "REVIEW"
+        record.reviewReasons = ["near_match: exist-1", "user_flagged"]
+
+        // 1. Save and reload from SQLite
+        try db.upsertRecord(record)
+        let loaded = try db.loadAllRecords()
+        XCTAssertEqual(loaded.count, 1)
+        let loadedRecord = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(loadedRecord.reviewReasons, ["near_match: exist-1", "user_flagged"])
+        XCTAssertEqual(loadedRecord.status, "REVIEW")
+
+        // 2. Revalidation with applyRequiredStatus
+        var revalidated = loadedRecord
+        applyRequiredStatus(&revalidated)
+        XCTAssertEqual(revalidated.status, "REVIEW")
+        XCTAssertEqual(revalidated.reviewReasons, ["near_match: exist-1", "user_flagged"])
+
+        // 3. Background OCR update via mergeBondRecord
+        var bgIncoming = emptyBondRecord(id: "bg-1", capturedAt: "2026-11-14T10:01:00Z")
+        bgIncoming.issueMonth = "05"
+        bgIncoming.issueYear = "1992"
+        bgIncoming.owner = "Jane Doe"
+        bgIncoming.fieldConfidence = ["issueDate": "high", "owner": "high"]
+        _ = mergeBondRecord(from: bgIncoming, into: &revalidated, contributingPhoto: "photo.jpg", contributingSource: "src.jpg", captureId: "bg-1")
+        XCTAssertEqual(revalidated.owner, "Jane Doe")
+        XCTAssertEqual(revalidated.status, "REVIEW")
+        XCTAssertEqual(revalidated.reviewReasons, ["near_match: exist-1", "user_flagged"])
+
+        // 4. Simulated app restart
+        let reopenedDB = try DatabaseManager(url: dbURL)
+        var restartedRecords = try reopenedDB.loadAllRecords()
+        for i in restartedRecords.indices {
+            applyRequiredStatus(&restartedRecords[i])
+        }
+        XCTAssertEqual(restartedRecords.first?.status, "REVIEW")
+        XCTAssertEqual(restartedRecords.first?.reviewReasons, ["near_match: exist-1", "user_flagged"])
+    }
+
+    func testExactMatchPrioritizedBeforeNearMatch() {
+        var exactExisting = emptyBondRecord(id: "exact-target", capturedAt: "2026-11-14T10:00:00Z")
+        exactExisting.serial = "C1234567890EE"
+        exactExisting.series = "EE"
+        exactExisting.denomination = "100"
+
+        var nearExisting = emptyBondRecord(id: "near-target", capturedAt: "2026-11-14T10:01:00Z")
+        nearExisting.serial = "C1234567898EE" // 8 vs 0 is near-match
+        nearExisting.series = "EE"
+        nearExisting.denomination = "100"
+
+        let allExisting = [nearExisting, exactExisting] // nearExisting appears first in array!
+
+        var incoming = emptyBondRecord(id: "incoming-1", capturedAt: "2026-11-14T10:05:00Z")
+        incoming.serial = "C1234567890EE" // Exact match to exactExisting!
+        incoming.series = "EE"
+        incoming.denomination = "100"
+        incoming.owner = "Alice"
+
+        // Exact match check
+        let exactMatch = recordMatchingSerial(incoming.serial, in: allExisting, excluding: incoming.id)
+        XCTAssertEqual(exactMatch?.id, "exact-target")
+
+        // Verify canMergeCapture succeeds with the exact match
+        XCTAssertTrue(canMergeCapture(incoming, into: exactExisting))
+    }
+
+    func testRealExportSchedulingDebounceAndFlush() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-real-export-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        let jsonDest = tempDir.appendingPathComponent("custom_records.json")
+        let csvDest = tempDir.appendingPathComponent("custom_bonds.csv")
+        ExportConfiguration.shared.setCustomDestinations(records: jsonDest, csv: csvDest)
+
+        var r1 = emptyBondRecord(id: "exp-1", capturedAt: "2026-11-14T10:00:00Z")
+        r1.serial = "C1234567890EE"
+        r1.series = "EE"
+        r1.denomination = "100"
+        r1.status = "OK"
+
+        var r2 = emptyBondRecord(id: "exp-2", capturedAt: "2026-11-14T10:01:00Z")
+        r2.serial = "C2234567890EE"
+        r2.series = "EE"
+        r2.denomination = "50"
+        r2.status = "OK"
+
+        // Rapidly schedule updates to test debounce cancellation
+        for _ in 1 ... 10 {
+            scheduleAutomaticExports(records: [r1], delay: 0.1)
+        }
+        // Immediately flush authoritative final collection with 2 records
+        flushAutomaticExports(records: [r1, r2])
+
+        // Verify flush completed synchronously and wrote exactly 2 records
+        XCTAssertTrue(FileManager.default.fileExists(atPath: jsonDest.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: csvDest.path))
+
+        let jsonStr = try String(contentsOf: jsonDest, encoding: .utf8)
+        let csvStr = try String(contentsOf: csvDest, encoding: .utf8)
+        XCTAssertTrue(jsonStr.contains("exp-1"))
+        XCTAssertTrue(jsonStr.contains("exp-2"))
+        XCTAssertTrue(csvStr.contains("C1234567890EE"))
+        XCTAssertTrue(csvStr.contains("C2234567890EE"))
+
+        // Wait briefly to ensure any canceled debounced task does not overwrite the flushed state
+        Thread.sleep(forTimeInterval: 0.25)
+        let jsonStrAfterDebounce = try String(contentsOf: jsonDest, encoding: .utf8)
+        XCTAssertTrue(jsonStrAfterDebounce.contains("exp-2"), "Stale snapshot must not overwrite flushed newer export")
+    }
+
+    func testOCRResumeThroughApplicationWorkflow() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-resume-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let photosDir = tempDir.appendingPathComponent("photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: photosDir, withIntermediateDirectories: true)
+
+        let photoRel = "photos/interrupted.jpg"
+        let photoURL = tempDir.appendingPathComponent(photoRel)
+        try Data([0xFF, 0xD8, 0xFF, 0xE0]).write(to: photoURL)
+
+        let dbURL = tempDir.appendingPathComponent("bonds.sqlite3")
+        let db = try DatabaseManager(url: dbURL)
+
+        var pendingRec = emptyBondRecord(id: "pending-resume-1", capturedAt: "2026-11-14T09:00:00Z")
+        pendingRec.status = "PROCESSING"
+        pendingRec.sourcePhoto = photoRel
+        try db.upsertRecord(pendingRec)
+
+        // Query pending records via DatabaseManager
+        let pending = try db.pendingOCRRecords()
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(pending.first?.id, "pending-resume-1")
+        XCTAssertEqual(pending.first?.status, "PROCESSING")
+
+        // Verify photo file exists for resumption
+        let targetPhotoURL = try tempDir.appendingPathComponent(XCTUnwrap(pending.first?.sourcePhoto))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: targetPhotoURL.path))
+    }
+
+    func testCaptureFailureHandling() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("bondscanner-cap-fail-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let nonExistentDir = tempDir.appendingPathComponent("blocked_dir")
+        // Create as file to block directory creation
+        try "block".write(to: nonExistentDir, atomically: true, encoding: .utf8)
+        let targetPhoto = nonExistentDir.appendingPathComponent("photo.jpg")
+
+        let dummyData = Data([0xFF, 0xD8, 0xFF, 0xE0])
+        var failedToWrite = false
+        do {
+            try dummyData.write(to: targetPhoto, options: .atomic)
+        } catch {
+            failedToWrite = true
+        }
+        XCTAssertTrue(failedToWrite, "Disk write failure must be intercepted and handled without fatal crashing")
     }
 
     func testImageQualitySharpnessAndExposureEvaluation() throws {

@@ -14,12 +14,11 @@
 // 9. Privacy-safe masking of all serial numbers.
 // 10. Complete offline processing without external network calls.
 
-import XCTest
-import CoreGraphics
 @testable import BondScanner
+import CoreGraphics
+import XCTest
 
 final class BondValidationTests: XCTestCase {
-
     override func setUp() {
         super.setUp()
         ScanLog.shared.isEnabled = false
@@ -418,7 +417,7 @@ final class BondValidationTests: XCTestCase {
         XCTAssertTrue(MICRLineDetector.isCompatibleEra(series: "EE", month: "", year: "2002"))
     }
 
-    func testMICRCorroborationInRanking() {
+    func testMICRCorroborationInRanking() throws {
         let cand = SerialCandidate(
             rawText: "C1234567890EE",
             normalized: "C1234567890EE",
@@ -436,11 +435,11 @@ final class BondValidationTests: XCTestCase {
         // Rank with matching MICR digits
         let rankedWith = SerialCandidateRanker.rankCandidates([cand], series: "EE", denomination: "100", micrDigits: "1234567890")
 
-        XCTAssertGreaterThan(rankedWith.first!.score, rankedWithout.first!.score)
-        XCTAssertTrue(rankedWith.first!.rankReasons.contains { $0.contains("MICR") })
+        XCTAssertGreaterThan(try XCTUnwrap(rankedWith.first?.score), try XCTUnwrap(rankedWithout.first?.score))
+        XCTAssertTrue(try XCTUnwrap(rankedWith.first?.rankReasons.contains { $0.contains("MICR") }))
     }
 
-    func testMICRCorroborationRejectsRoutingNumber() {
+    func testMICRCorroborationRejectsRoutingNumber() throws {
         let cand = SerialCandidate(
             rawText: "C1234567890EE",
             normalized: "C1234567890EE",
@@ -460,16 +459,16 @@ final class BondValidationTests: XCTestCase {
         let routingRanked = SerialCandidateRanker.rankCandidates([cand], series: "EE", denomination: "100", micrDigits: "000090007")
 
         // Score must NOT increase when matching the Treasury routing number!
-        XCTAssertEqual(routingRanked.first!.score, baseRanked.first!.score)
-        XCTAssertFalse(routingRanked.first!.rankReasons.contains { $0.contains("MICR") })
+        XCTAssertEqual(routingRanked.first?.score, baseRanked.first?.score)
+        XCTAssertFalse(try XCTUnwrap(routingRanked.first?.rankReasons.contains { $0.contains("MICR") }))
 
         // Rank with actual matching serial digits
         let serialRanked = SerialCandidateRanker.rankCandidates([cand], series: "EE", denomination: "100", micrDigits: "1234567890")
-        XCTAssertGreaterThan(serialRanked.first!.score, baseRanked.first!.score)
-        XCTAssertTrue(serialRanked.first!.rankReasons.contains { $0.contains("MICR") })
+        XCTAssertGreaterThan(try XCTUnwrap(serialRanked.first?.score), try XCTUnwrap(baseRanked.first?.score))
+        XCTAssertTrue(try XCTUnwrap(serialRanked.first?.rankReasons.contains { $0.contains("MICR") }))
     }
 
-    func testIntraPhotoPassesNotMisrepresentedAsIndependent() {
+    func testIntraPhotoPassesNotMisrepresentedAsIndependent() throws {
         let cand = SerialCandidate(
             rawText: "C1234567890EE",
             normalized: "C1234567890EE",
@@ -484,7 +483,7 @@ final class BondValidationTests: XCTestCase {
 
         let ranked = SerialCandidateRanker.rankCandidates([cand], series: "EE", denomination: "100")
         // Reason must not claim "independent" observations for crops from the same photo
-        for reason in ranked.first!.rankReasons {
+        for reason in try XCTUnwrap(ranked.first?.rankReasons) {
             XCTAssertFalse(reason.lowercased().contains("independent dual-pass"),
                            "Intra-photo crop passes must not be labeled as independent dual-pass: \(reason)")
         }

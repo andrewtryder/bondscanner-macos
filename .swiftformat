@@ -1,0 +1,7 @@
+# SwiftFormat Configuration
+--swiftversion 5.0
+--exclude .build,build,local-fixtures,scripts
+--indent 4
+--allman false
+--stripunusedargs closure-only
+--disable redundantSelf

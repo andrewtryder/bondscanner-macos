@@ -129,9 +129,10 @@ This repository includes a local-only image regression framework (`Tests/BondSca
 - **Atomic Duplicate Consolidations**: Multi-record merges execute inside an immediate SQLite transaction. Duplicate captures only consolidate when serials are exact validated matches with zero conflicting fields. Near-matches are preserved as separate records for user review. Original photographs are never trashed during duplicate merges.
 
 ### Backup and Disaster Recovery
-- **Online Backup**: Consistent point-in-time snapshots can be created safely using SQLite's native `VACUUM INTO` (`DatabaseManager.shared.backupDatabase(to:)`).
-- **Restoration**: Restores verify foreign keys and database integrity before replacing live data.
-- **Self-Healing Initialization**: If SQLite encounters unrecoverable disk corruption, the corrupted database file is safely archived to `~/BondScans_backups/corrupt_<timestamp>.sqlite3`, allowing a fresh database to initialize without crashing the application or losing photos.
+- **Online Backup**: Consistent point-in-time snapshots can be created safely using SQLite's native `VACUUM INTO` (`DatabaseManager.shared.backupDatabase(to:)`), verified immediately with SQLite `integrity_check`.
+- **Restoration Safety**: Restores stage into a temporary database first, verify SQLite integrity and schema compatibility, and safeguard the original database, WAL, and SHM files before atomic swap. If restoration fails, the original database is automatically restored.
+- **Photographs Scope**: A database backup alone preserves the structured SQLite records, review reasons, and metadata, but **does not include the associated photographs** stored in `~/BondScans/photos`. For complete disaster recovery, back up the entire `~/BondScans` directory.
+- **Explicit Recovery & UI Reporting**: Initialization failures are never confused with database corruption. Locked or read-only databases are reported directly in the UI without modifying files. Validated database corruption prompts for explicit recovery, preserving existing DB, WAL, and SHM files to a timestamped archive before clean replacement. Silent fallbacks to temporary or in-memory databases are completely disallowed in production.
 
 ---
 

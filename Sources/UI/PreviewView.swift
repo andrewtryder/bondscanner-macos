@@ -1,7 +1,7 @@
-import Foundation
 import AppKit
 import AVFoundation
 import CoreImage
+import Foundation
 import QuartzCore
 
 final class PreviewView: NSView {
@@ -62,7 +62,10 @@ final class PreviewView: NSView {
         applyVideoLayerFilter(contrast: 1.20, brightness: 0.0, sharpness: 0.35)
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
     private func setupHUD() {
         hudContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -165,7 +168,7 @@ final class PreviewView: NSView {
             topRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             brightnessRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             contrastRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            focusRow.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            focusRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
     }
 
@@ -192,7 +195,9 @@ final class PreviewView: NSView {
                              width: b.width * imageFrame.width,
                              height: b.height * imageFrame.height)
             detected.path = CGPath(roundedRect: box, cornerWidth: 8, cornerHeight: 8, transform: nil)
-        } else { detected.path = nil }
+        } else {
+            detected.path = nil
+        }
         CATransaction.commit()
     }
 

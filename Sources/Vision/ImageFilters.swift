@@ -1,16 +1,16 @@
-import Foundation
 import CoreGraphics
 import CoreImage
 import CoreImage.CIFilterBuiltins
+import Foundation
 import Vision
 
 let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
 struct ImageEnhancementSettings {
     var autoContrastEnabled: Bool = true
-    var manualContrast: Float = 1.20       // Range: 0.75 ... 2.20
-    var manualBrightness: Float = 0.00     // Range: -0.25 ... 0.25
-    var manualSharpness: Float = 0.35      // Range: 0.00 ... 1.00 (Focus assist / edge sharpness)
+    var manualContrast: Float = 1.20 // Range: 0.75 ... 2.20
+    var manualBrightness: Float = 0.00 // Range: -0.25 ... 0.25
+    var manualSharpness: Float = 0.35 // Range: 0.00 ... 1.00 (Focus assist / edge sharpness)
 }
 
 final class EnhancementController {
@@ -83,14 +83,15 @@ func computeAutoContrastParameters(_ image: CGImage, region: CGRect? = nil) -> (
 
     guard let minMaxFilter = CIFilter(name: "CIAreaMinMax", parameters: [
         kCIInputImageKey: ciImage,
-        kCIInputExtentKey: extentVector
+        kCIInputExtentKey: extentVector,
     ]),
-    let minMaxOut = minMaxFilter.outputImage,
-    let avgFilter = CIFilter(name: "CIAreaAverage", parameters: [
-        kCIInputImageKey: ciImage,
-        kCIInputExtentKey: extentVector
-    ]),
-    let avgOut = avgFilter.outputImage else {
+        let minMaxOut = minMaxFilter.outputImage,
+        let avgFilter = CIFilter(name: "CIAreaAverage", parameters: [
+            kCIInputImageKey: ciImage,
+            kCIInputExtentKey: extentVector,
+        ]),
+        let avgOut = avgFilter.outputImage
+    else {
         return (1.20, 0.0)
     }
 
@@ -148,9 +149,17 @@ struct ImageQualityReport {
     let isProperlyExposed: Bool
     let warning: String?
 
-    var isBlurry: Bool { !isSharp }
-    var isUnderExposed: Bool { meanLuminance < 0.22 }
-    var isOverExposed: Bool { meanLuminance > 0.85 }
+    var isBlurry: Bool {
+        !isSharp
+    }
+
+    var isUnderExposed: Bool {
+        meanLuminance < 0.22
+    }
+
+    var isOverExposed: Bool {
+        meanLuminance > 0.85
+    }
 }
 
 func evaluateImageQuality(_ image: CGImage, region: CGRect? = nil) -> ImageQualityReport {
@@ -168,14 +177,15 @@ func evaluateImageQuality(_ image: CGImage, region: CGRect? = nil) -> ImageQuali
 
     if let minMaxFilter = CIFilter(name: "CIAreaMinMax", parameters: [
         kCIInputImageKey: ciImage,
-        kCIInputExtentKey: extentVector
+        kCIInputExtentKey: extentVector,
     ]),
-    let minMaxOut = minMaxFilter.outputImage,
-    let avgFilter = CIFilter(name: "CIAreaAverage", parameters: [
-        kCIInputImageKey: ciImage,
-        kCIInputExtentKey: extentVector
-    ]),
-    let avgOut = avgFilter.outputImage {
+        let minMaxOut = minMaxFilter.outputImage,
+       let avgFilter = CIFilter(name: "CIAreaAverage", parameters: [
+           kCIInputImageKey: ciImage,
+           kCIInputExtentKey: extentVector,
+       ]),
+       let avgOut = avgFilter.outputImage
+    {
         let rgb = CGColorSpaceCreateDeviceRGB()
         var minMaxBuf = [UInt8](repeating: 0, count: 8)
         minMaxBuf.withUnsafeMutableBytes { rawPtr in
@@ -199,14 +209,15 @@ func evaluateImageQuality(_ image: CGImage, region: CGRect? = nil) -> ImageQuali
     var sharpness: Float = 0.5
     if let edgesFilter = CIFilter(name: "CIEdges", parameters: [
         kCIInputImageKey: ciImage,
-        "inputIntensity": NSNumber(value: 2.0)
+        "inputIntensity": NSNumber(value: 2.0),
     ]),
-    let edgesOut = edgesFilter.outputImage,
-    let edgeAvgFilter = CIFilter(name: "CIAreaAverage", parameters: [
-        kCIInputImageKey: edgesOut,
-        kCIInputExtentKey: extentVector
-    ]),
-    let edgeAvgOut = edgeAvgFilter.outputImage {
+        let edgesOut = edgesFilter.outputImage,
+       let edgeAvgFilter = CIFilter(name: "CIAreaAverage", parameters: [
+           kCIInputImageKey: edgesOut,
+           kCIInputExtentKey: extentVector,
+       ]),
+       let edgeAvgOut = edgeAvgFilter.outputImage
+    {
         var edgeBuf = [UInt8](repeating: 0, count: 4)
         edgeBuf.withUnsafeMutableBytes { rawPtr in
             if let base = rawPtr.baseAddress {
@@ -283,7 +294,7 @@ func cornerCrops(_ image: CGImage) -> [CGImage] {
         CGRect(x: 0, y: 0, width: cw, height: ch),
         CGRect(x: w - cw, y: 0, width: cw, height: ch),
         CGRect(x: 0, y: h - ch, width: cw, height: ch),
-        CGRect(x: w - cw, y: h - ch, width: cw, height: ch)
+        CGRect(x: w - cw, y: h - ch, width: cw, height: ch),
     ]
     return rects.compactMap { image.cropping(to: $0) }
 }
@@ -317,24 +328,37 @@ func highContrastImage(_ image: CGImage, contrast: Float, brightness: Float = 0)
 
 func dateBoxVariants(_ crop: CGImage, intensive: Bool) -> [(String, CGImage)] {
     var out: [(String, CGImage)] = [("raw", crop)]
-    if let up2 = upscaledImage(crop, scale: 2.2) { out.append(("up2", up2)) }
-    if let up3 = upscaledImage(crop, scale: 3.0) { out.append(("up3", up3)) }
+    if let up2 = upscaledImage(crop, scale: 2.2) {
+        out.append(("up2", up2))
+    }
+    if let up3 = upscaledImage(crop, scale: 3.0) {
+        out.append(("up3", up3))
+    }
     if let faint = adjustedForFaintPrinting(crop) {
         out.append(("faint", faint))
-        if let fu = upscaledImage(faint, scale: 2.6) { out.append(("faint-up", fu)) }
+        if let fu = upscaledImage(faint, scale: 2.6) {
+            out.append(("faint-up", fu))
+        }
     }
     if let auto = autoContrastAdjustedImage(crop, region: nil) {
         out.append(("auto", auto))
-        if let au = upscaledImage(auto, scale: 2.6) { out.append(("auto-up", au)) }
+        if let au = upscaledImage(auto, scale: 2.6) {
+            out.append(("auto-up", au))
+        }
     }
     if let hi = highContrastImage(crop, contrast: 1.7, brightness: 0.05) {
         out.append(("hi", hi))
-        if let hu = upscaledImage(hi, scale: 2.5) { out.append(("hi-up", hu)) }
+        if let hu = upscaledImage(hi, scale: 2.5) {
+            out.append(("hi-up", hu))
+        }
     }
     if intensive {
-        if let up4 = upscaledImage(crop, scale: 3.6) { out.append(("up4", up4)) }
+        if let up4 = upscaledImage(crop, scale: 3.6) {
+            out.append(("up4", up4))
+        }
         if let darker = highContrastImage(crop, contrast: 2.0, brightness: -0.08),
-           let du = upscaledImage(darker, scale: 3.0) {
+           let du = upscaledImage(darker, scale: 3.0)
+        {
             out.append(("dark-up", du))
         }
     }
@@ -350,8 +374,12 @@ func rotateCG(_ cg: CGImage, exif: Int) -> CGImage? {
 /// bounding boxes are not usable for aspect: they ignore the image's 16:9 shape.
 func rectanglePixelGeometry(_ rectangle: VNRectangleObservation, image: CGImage) -> (width: CGFloat, height: CGFloat, aspect: CGFloat, areaFraction: CGFloat) {
     let w = CGFloat(image.width), h = CGFloat(image.height)
-    func pt(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x * w, y: p.y * h) }
-    func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat { hypot(a.x - b.x, a.y - b.y) }
+    func pt(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: p.x * w, y: p.y * h)
+    }
+    func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        hypot(a.x - b.x, a.y - b.y)
+    }
     let rw = (dist(pt(rectangle.topLeft), pt(rectangle.topRight)) + dist(pt(rectangle.bottomLeft), pt(rectangle.bottomRight))) / 2
     let rh = (dist(pt(rectangle.topLeft), pt(rectangle.bottomLeft)) + dist(pt(rectangle.topRight), pt(rectangle.bottomRight))) / 2
     let longS = max(rw, rh)
@@ -365,21 +393,33 @@ func rectanglePixelGeometry(_ rectangle: VNRectangleObservation, image: CGImage)
 func bondRectangleScore(_ rectangle: VNRectangleObservation, image: CGImage) -> Double {
     let g = rectanglePixelGeometry(rectangle, image: image)
     // Reject ruler-like strips and tiny scraps.
-    if g.aspect > 3.6 || g.aspect < 1.45 { return -1 }
-    if g.areaFraction < 0.08 || g.areaFraction > 0.92 { return -1 }
-    if g.width < 400 || g.height < 160 { return -1 }
+    if g.aspect > 3.6 || g.aspect < 1.45 {
+        return -1
+    }
+    if g.areaFraction < 0.08 || g.areaFraction > 0.92 {
+        return -1
+    }
+    if g.width < 400 || g.height < 160 {
+        return -1
+    }
     var score = Double(rectangle.confidence) * 4
     let aspectError = abs(g.aspect - 2.25)
-    if g.aspect >= 2.05 && g.aspect <= 2.50 { score += 14 - aspectError * 10 }
-    else if g.aspect >= 1.80 && g.aspect <= 2.85 { score += 7 - aspectError * 4 }
-    else { score += 1 }
-    if g.areaFraction >= 0.12 && g.areaFraction <= 0.72 { score += 5 }
+    if g.aspect >= 2.05 && g.aspect <= 2.50 {
+        score += 14 - aspectError * 10
+    } else if g.aspect >= 1.80 && g.aspect <= 2.85 {
+        score += 7 - aspectError * 4
+    } else {
+        score += 1
+    }
+    if g.areaFraction >= 0.12 && g.areaFraction <= 0.72 {
+        score += 5
+    }
     score += min(Double(g.areaFraction), 0.6) * 3
     return score
 }
 
-// Read broad potential outlines (front/back, rotated, different denominations).
-// Prefer a bond-shaped rectangle (~2.1–2.4:1) over a long thin ruler.
+/// Read broad potential outlines (front/back, rotated, different denominations).
+/// Prefer a bond-shaped rectangle (~2.1–2.4:1) over a long thin ruler.
 func rectangleCandidates(_ image: CGImage) -> [VNRectangleObservation] {
     let request = VNDetectRectanglesRequest()
     // Detection is slightly broader than the bond window so perspective-skewed
@@ -407,7 +447,9 @@ func rectify(_ image: CGImage, using rectangle: VNRectangleObservation) -> CGIma
     let w = CGFloat(image.width), h = CGFloat(image.height)
     let correction = CIFilter.perspectiveCorrection()
     correction.inputImage = source
-    func point(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x * w, y: p.y * h) }
+    func point(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: p.x * w, y: p.y * h)
+    }
     correction.topLeft = point(rectangle.topLeft)
     correction.topRight = point(rectangle.topRight)
     correction.bottomLeft = point(rectangle.bottomLeft)

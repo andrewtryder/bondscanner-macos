@@ -1,6 +1,6 @@
 import Foundation
 
-// Log only operational telemetry. No OCR text, names, tax IDs, or serial numbers.
+/// Log only operational telemetry. No OCR text, names, tax IDs, or serial numbers.
 final class ScanLog {
     static let shared = ScanLog()
     private let lock = NSLock()
@@ -18,6 +18,8 @@ final class ScanLog {
         defer { handle.closeFile() }
         handle.seekToEndOfFile()
         let timestamp = ISO8601DateFormatter().string(from: Date())
-        if let data = "[\(timestamp)] \(event)\n".data(using: .utf8) { handle.write(data) }
+        if let data = "[\(timestamp)] \(event)\n".data(using: .utf8) {
+            handle.write(data)
+        }
     }
 }

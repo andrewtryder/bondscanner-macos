@@ -39,4 +39,14 @@ struct BondRecord: Codable {
     var validationErrors: [String]?
     /// Experimental MICR recognition result if available on compatible photographs.
     var micrData: String?
+    /// Structured review reasons persisted separately from confidence and notes.
+    var reviewReasons: [String]?
+    /// Additional original photo paths associated with this bond (e.g. from merged duplicate scans).
+    var associatedPhotos: [String]?
+    /// Audit trail of validation warnings explicitly acknowledged by the user.
+    var acknowledgedWarnings: [String]?
+    /// Audit trail of structured review reasons explicitly resolved by the user.
+    var resolvedReviewReasons: [String]?
+    /// ID of potential duplicate / near-match candidate record if known.
+    var duplicateCandidateId: String?
 }

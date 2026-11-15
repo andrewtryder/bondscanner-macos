@@ -1,18 +1,28 @@
-import Foundation
 import AppKit
 import CoreGraphics
+import Foundation
 import ImageIO
 
 let outputRoot = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans", isDirectory: true)
 let photosRoot = outputRoot.appendingPathComponent("photos", isDirectory: true)
-let recordsURL = outputRoot.appendingPathComponent("records.json")
-let csvURL = outputRoot.appendingPathComponent("bonds.csv")
+let recordsURLDefault = outputRoot.appendingPathComponent("records.json")
+let csvURLDefault = outputRoot.appendingPathComponent("bonds.csv")
+var recordsURL: URL {
+    ExportConfiguration.shared.recordsURL
+}
+
+var csvURL: URL {
+    ExportConfiguration.shared.csvURL
+}
+
 let debugURL = outputRoot.appendingPathComponent("scan-debug.log")
 
 func sanitizeCSV(_ value: String) -> String {
     // Prevent spreadsheet formula injection from untrusted OCR strings.
     var v = value
-    if let first = v.first, "=+-@".contains(first) { v = "'" + v }
+    if let first = v.first, "=+-@".contains(first) {
+        v = "'" + v
+    }
     return "\"" + v.replacingOccurrences(of: "\"", with: "\"\"") + "\""
 }
 
@@ -45,45 +55,119 @@ func exportJSON(_ records: [BondRecord], to url: URL = recordsURL) throws {
     try jsonData.write(to: url, options: .atomic)
 }
 
-// MARK: - Automatic Mirror Exports (Debounced Live Sync)
+// MARK: - Automatic Mirror Exports (Debounced Live Sync & Serialized Flush)
 
-private let exportSyncQueue = DispatchQueue(label: "bondscanner.export-sync", qos: .utility)
-private var pendingExportWorkItem: DispatchWorkItem?
-private let exportLock = NSLock()
+final class ExportConfiguration {
+    static let shared = ExportConfiguration()
+    private let lock = NSLock()
+    private var customRecordsURL: URL?
+    private var customCSVURL: URL?
+
+    var recordsURL: URL {
+        lock.lock()
+        defer { lock.unlock() }
+        return customRecordsURL ?? recordsURLDefault
+    }
+
+    var csvURL: URL {
+        lock.lock()
+        defer { lock.unlock() }
+        return customCSVURL ?? csvURLDefault
+    }
+
+    func setCustomDestinations(records: URL?, csv: URL?) {
+        lock.lock()
+        defer { lock.unlock() }
+        customRecordsURL = records
+        customCSVURL = csv
+    }
+
+    func resetToDefaults() {
+        lock.lock()
+        defer { lock.unlock() }
+        customRecordsURL = nil
+        customCSVURL = nil
+    }
+}
+
+/// Serializes and coordinates mirror exports (JSON + CSV).
+/// Enforces single-threaded disk writes, debounces rapid successive updates,
+/// prevents stale snapshots from overwriting newer writes, and executes flushes synchronously.
+final class ExportCoordinator {
+    static let shared = ExportCoordinator()
+
+    private let syncQueue = DispatchQueue(label: "bondscanner.export-sync", qos: .utility)
+    private let lock = NSLock()
+    private var pendingWorkItem: DispatchWorkItem?
+    private var currentScheduledVersion: UInt64 = 0
+    private var lastCompletedVersion: UInt64 = 0
+
+    func schedule(records: [BondRecord], delay: TimeInterval = 0.35) {
+        lock.lock()
+        currentScheduledVersion += 1
+        let version = currentScheduledVersion
+        pendingWorkItem?.cancel()
+        let snapshot = records
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            if version <= self.lastCompletedVersion {
+                self.lock.unlock()
+                return
+            }
+            self.lock.unlock()
+
+            self.performExport(snapshot: snapshot, version: version, logPrefix: "automatic export")
+        }
+
+        pendingWorkItem = item
+        lock.unlock()
+
+        syncQueue.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    func flush(records: [BondRecord]) {
+        lock.lock()
+        currentScheduledVersion += 1
+        let version = currentScheduledVersion
+        pendingWorkItem?.cancel()
+        pendingWorkItem = nil
+        let snapshot = records
+        lock.unlock()
+
+        syncQueue.sync {
+            self.performExport(snapshot: snapshot, version: version, logPrefix: "flush export")
+        }
+    }
+
+    private func performExport(snapshot: [BondRecord], version: UInt64, logPrefix: String) {
+        let destRecordsURL = ExportConfiguration.shared.recordsURL
+        let destCSVURL = ExportConfiguration.shared.csvURL
+        do {
+            try exportJSON(snapshot, to: destRecordsURL)
+            try exportCSV(snapshot, to: destCSVURL)
+            lock.lock()
+            if version > lastCompletedVersion {
+                lastCompletedVersion = version
+            }
+            lock.unlock()
+            ScanLog.shared.write("\(logPrefix) synced count=\(snapshot.count) version=\(version)")
+        } catch {
+            ScanLog.shared.write("\(logPrefix) failed: \(error.localizedDescription)")
+        }
+    }
+}
 
 /// Automatically synchronizes the authoritative record collection to `records.json` and `bonds.csv`.
 /// Uses a short debounce delay to coalesce rapid sequential updates into a single atomic write.
 func scheduleAutomaticExports(records: [BondRecord], delay: TimeInterval = 0.35) {
-    exportLock.lock()
-    defer { exportLock.unlock() }
-    pendingExportWorkItem?.cancel()
-    let snapshot = records
-    let item = DispatchWorkItem {
-        do {
-            try exportJSON(snapshot)
-            try exportCSV(snapshot)
-            ScanLog.shared.write("automatic export synced count=\(snapshot.count)")
-        } catch {
-            ScanLog.shared.write("automatic export failed: \(error.localizedDescription)")
-        }
-    }
-    pendingExportWorkItem = item
-    exportSyncQueue.asyncAfter(deadline: .now() + delay, execute: item)
+    ExportCoordinator.shared.schedule(records: records, delay: delay)
 }
 
 /// Flushes any pending automatic export synchronously (e.g. before application termination).
 func flushAutomaticExports(records: [BondRecord]) {
-    exportLock.lock()
-    pendingExportWorkItem?.cancel()
-    pendingExportWorkItem = nil
-    exportLock.unlock()
-    do {
-        try exportJSON(records)
-        try exportCSV(records)
-        ScanLog.shared.write("flush export synced count=\(records.count)")
-    } catch {
-        ScanLog.shared.write("flush export failed: \(error.localizedDescription)")
-    }
+    ExportCoordinator.shared.flush(records: records)
 }
 
 func saveRecordLive(_ record: BondRecord, allRecords: [BondRecord], sortOrder: Int? = nil) throws {
@@ -122,8 +206,8 @@ func cgImageFromData(_ data: Data) -> CGImage? {
 
 func emptyBondRecord(id: String, capturedAt: String) -> BondRecord {
     return BondRecord(id: id, capturedAt: capturedAt,
-        series: "", serial: "", issueMonth: "", issueYear: "", denomination: "",
-        owner: "", secondName: "", secondRole: "", address: "", taxID: "",
-        issuingAgent: "", datingStamp: "", status: "PROCESSING",
-        notes: "Photograph saved; OCR pending", photo: "", sourcePhoto: "", rawOCR: "")
+                      series: "", serial: "", issueMonth: "", issueYear: "", denomination: "",
+                      owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+                      issuingAgent: "", datingStamp: "", status: "PROCESSING",
+                      notes: "Photograph saved; OCR pending", photo: "", sourcePhoto: "", rawOCR: "")
 }

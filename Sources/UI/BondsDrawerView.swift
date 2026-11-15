@@ -13,9 +13,15 @@ struct BondDrawerRow {
     let record: BondRecord
 
     var issueDateDisplay: String {
-        if record.issueMonth.isEmpty && record.issueYear.isEmpty { return "—" }
-        if record.issueMonth.isEmpty { return record.issueYear }
-        if record.issueYear.isEmpty { return record.issueMonth }
+        if record.issueMonth.isEmpty && record.issueYear.isEmpty {
+            return "—"
+        }
+        if record.issueMonth.isEmpty {
+            return record.issueYear
+        }
+        if record.issueYear.isEmpty {
+            return record.issueMonth
+        }
         return "\(record.issueMonth)/\(record.issueYear)"
     }
 
@@ -34,12 +40,17 @@ func sortedAndFilteredBondRows(
     from records: [BondRecord],
     sortField: BondSortField,
     ascending: Bool,
-    reviewOnly: Bool
+    reviewOnly: Bool,
+    filterCategory: ReviewFilterCategory? = nil
 ) -> [BondDrawerRow] {
     var rows = records.enumerated().map { BondDrawerRow(number: $0.offset + 1, record: $0.element) }
-    if reviewOnly {
+
+    if let cat = filterCategory {
+        rows = rows.filter { cat.matches(record: $0.record) }
+    } else if reviewOnly {
         rows = rows.filter { $0.record.status != "OK" }
     }
+
     rows.sort { lhs, rhs in
         let cmp: ComparisonResult
         switch sortField {
@@ -78,22 +89,31 @@ func sortedAndFilteredBondRows(
     return rows
 }
 
-/// Collapsible right-side database drawer displaying scanned bonds with sorting and review filtering.
+/// Collapsible right-side database drawer displaying scanned bonds with sorting,
+/// detailed review filtering, selection preservation, and keyboard-first review triggers.
 final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     var onCollapseRequested: (() -> Void)?
     var onOpenPhotoRequested: ((BondRecord) -> Void)?
+    var onReviewRequested: ((BondRecord) -> Void)?
+    var onReviewNextRequested: (() -> Void)?
 
     private var allRecords: [BondRecord] = []
     private var displayedRows: [BondDrawerRow] = []
     private var sortField: BondSortField = .date
     private var sortAscending = false
     private var reviewOnly = false
+    private var activeFilterCategory: ReviewFilterCategory = .all
 
     private let titleLabel = NSTextField(labelWithString: "Database (0)")
+    private let reviewNextButton = NSButton(title: "Review Next ›", target: nil, action: nil)
+    private let collapseButton = NSButton(title: "Hide ›", target: nil, action: nil)
+
     private let sortPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let directionButton = NSButton(title: "↓", target: nil, action: nil)
     private let filterControl = NSSegmentedControl(labels: ["All", "Review"], trackingMode: .selectOne, target: nil, action: nil)
-    private let tableView = NSTableView()
+    private let categoryPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+
+    private let tableView = DrawerTableView()
     private let scrollView = NSScrollView()
 
     private let isoParserWithFractional: ISO8601DateFormatter = {
@@ -101,17 +121,20 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
+
     private let isoParser: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f
     }()
+
     private let todayTimeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateStyle = .none
         f.timeStyle = .short
         return f
     }()
+
     private let shortDateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "MMM d, HH:mm"
@@ -149,9 +172,18 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let collapseButton = NSButton(title: "Hide ›", target: self, action: #selector(collapseClicked))
+        reviewNextButton.bezelStyle = .rounded
+        reviewNextButton.controlSize = .small
+        reviewNextButton.target = self
+        reviewNextButton.action = #selector(reviewNextClicked)
+        reviewNextButton.font = .systemFont(ofSize: 11, weight: .semibold)
+        reviewNextButton.toolTip = "Start or continue reviewing unresolved records"
+        reviewNextButton.translatesAutoresizingMaskIntoConstraints = false
+
         collapseButton.bezelStyle = .rounded
         collapseButton.controlSize = .small
+        collapseButton.target = self
+        collapseButton.action = #selector(collapseClicked)
         collapseButton.translatesAutoresizingMaskIntoConstraints = false
 
         let sortLabel = NSTextField(labelWithString: "Sort:")
@@ -181,7 +213,25 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         filterControl.action = #selector(filterChanged)
         filterControl.translatesAutoresizingMaskIntoConstraints = false
 
-        let controlsRow = NSStackView(views: [sortLabel, sortPopup, directionButton, filterControl])
+        // Review Category Subfilter Popup
+        for cat in ReviewFilterCategory.allCases where cat != .all {
+            categoryPopup.addItem(withTitle: cat.shortTitle)
+        }
+        categoryPopup.selectItem(withTitle: ReviewFilterCategory.allReview.shortTitle)
+        categoryPopup.controlSize = .small
+        categoryPopup.target = self
+        categoryPopup.action = #selector(categoryPopupChanged)
+        categoryPopup.toolTip = "Filter review queue by specific issue type"
+        categoryPopup.isHidden = true
+        categoryPopup.translatesAutoresizingMaskIntoConstraints = false
+
+        let headerRow = NSStackView(views: [titleLabel, reviewNextButton, NSView(), collapseButton])
+        headerRow.orientation = .horizontal
+        headerRow.alignment = .centerY
+        headerRow.spacing = 6
+        headerRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let controlsRow = NSStackView(views: [sortLabel, sortPopup, directionButton, filterControl, categoryPopup])
         controlsRow.orientation = .horizontal
         controlsRow.alignment = .centerY
         controlsRow.spacing = 6
@@ -196,6 +246,7 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         tableView.allowsMultipleSelection = false
         tableView.target = self
         tableView.doubleAction = #selector(rowDoubleClicked)
+        tableView.onEnterPressed = { [weak self] in self?.openSelectedRecordInReview() }
 
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
@@ -203,13 +254,12 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         scrollView.borderType = .bezelBorder
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        let hintLabel = NSTextField(labelWithString: "Double-click a row to open its saved bond photo.")
+        let hintLabel = NSTextField(labelWithString: "Double-click a row to open Review. Press Return to edit.")
         hintLabel.font = .systemFont(ofSize: 11)
         hintLabel.textColor = .secondaryLabelColor
         hintLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        addSubview(titleLabel)
-        addSubview(collapseButton)
+        addSubview(headerRow)
         addSubview(controlsRow)
         addSubview(scrollView)
         addSubview(hintLabel)
@@ -220,13 +270,12 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
             divider.bottomAnchor.constraint(equalTo: bottomAnchor),
             divider.widthAnchor.constraint(equalToConstant: 1),
 
-            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 14),
-            titleLabel.leadingAnchor.constraint(equalTo: divider.trailingAnchor, constant: 12),
+            headerRow.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            headerRow.leadingAnchor.constraint(equalTo: divider.trailingAnchor, constant: 12),
+            headerRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            headerRow.heightAnchor.constraint(equalToConstant: 26),
 
-            collapseButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            collapseButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-
-            controlsRow.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
+            controlsRow.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 8),
             controlsRow.leadingAnchor.constraint(equalTo: divider.trailingAnchor, constant: 12),
             controlsRow.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
 
@@ -237,7 +286,7 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
 
             hintLabel.leadingAnchor.constraint(equalTo: divider.trailingAnchor, constant: 12),
             hintLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            hintLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12)
+            hintLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
         ])
 
         syncSortDescriptors()
@@ -250,7 +299,7 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
             (ColumnID.issue, "Issue", 62, "issueDate"),
             (ColumnID.denom, "Denom", 50, "denom"),
             (ColumnID.status, "Status", 72, "status"),
-            (ColumnID.date, "Scanned", 94, "date")
+            (ColumnID.date, "Scanned", 94, "date"),
         ]
         for (id, title, width, sortKey) in specs {
             let col = NSTableColumn(identifier: id)
@@ -262,24 +311,46 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         }
     }
 
+    var selectedRecord: BondRecord? {
+        let row = tableView.selectedRow
+        guard row >= 0, row < displayedRows.count else { return nil }
+        return displayedRows[row].record
+    }
+
     func updateRecords(_ records: [BondRecord]) {
         self.allRecords = records
         refreshDisplayedRows()
     }
 
     private func refreshDisplayedRows() {
+        let selectedId = selectedRecord?.id
+
+        let effectiveCat: ReviewFilterCategory? = reviewOnly ? activeFilterCategory : nil
         displayedRows = sortedAndFilteredBondRows(
             from: allRecords,
             sortField: sortField,
             ascending: sortAscending,
-            reviewOnly: reviewOnly
+            reviewOnly: reviewOnly,
+            filterCategory: effectiveCat
         )
+
+        let reviewCount = allRecords.filter { $0.status == "REVIEW" || $0.status == "DUPLICATE" }.count
         if reviewOnly {
-            titleLabel.stringValue = "Review (\(displayedRows.count) of \(allRecords.count))"
+            titleLabel.stringValue = "Review (\(displayedRows.count) of \(reviewCount))"
         } else {
             titleLabel.stringValue = "Database (\(allRecords.count))"
         }
+
+        reviewNextButton.isHidden = (reviewCount == 0)
+        reviewNextButton.title = "Review Next (\(reviewCount)) ›"
+
         tableView.reloadData()
+
+        // Selection stability: restore selection by record ID
+        if let selId = selectedId, let newIndex = displayedRows.firstIndex(where: { $0.record.id == selId }) {
+            tableView.selectRowIndexes(IndexSet(integer: newIndex), byExtendingSelection: false)
+            tableView.scrollRowToVisible(newIndex)
+        }
     }
 
     private func syncSortDescriptors() {
@@ -300,10 +371,17 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         onCollapseRequested?()
     }
 
+    @objc private func reviewNextClicked() {
+        if onReviewNextRequested != nil {
+            onReviewNextRequested?()
+        } else if let firstReview = displayedRows.first(where: { $0.record.status == "REVIEW" || $0.record.status == "DUPLICATE" })?.record {
+            onReviewRequested?(firstReview)
+        }
+    }
+
     @objc private func sortFieldChanged() {
         guard let title = sortPopup.selectedItem?.title, let selected = BondSortField(rawValue: title) else { return }
         sortField = selected
-        // Default to descending for Date/Number, ascending for Serial/Issue/Status when switched via dropdown.
         sortAscending = (selected == .serial || selected == .issueDate || selected == .status)
         syncSortDescriptors()
         refreshDisplayedRows()
@@ -317,13 +395,36 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
 
     @objc private func filterChanged() {
         reviewOnly = (filterControl.selectedSegment == 1)
+        categoryPopup.isHidden = !reviewOnly
+        if !reviewOnly {
+            activeFilterCategory = .all
+        } else {
+            activeFilterCategory = .allReview
+            categoryPopup.selectItem(withTitle: ReviewFilterCategory.allReview.shortTitle)
+        }
+        refreshDisplayedRows()
+    }
+
+    @objc private func categoryPopupChanged() {
+        guard let title = categoryPopup.selectedItem?.title,
+              let match = ReviewFilterCategory.allCases.first(where: { $0.shortTitle == title }) else { return }
+        activeFilterCategory = match
         refreshDisplayedRows()
     }
 
     @objc private func rowDoubleClicked() {
-        let row = tableView.clickedRow
-        guard row >= 0 && row < displayedRows.count else { return }
-        onOpenPhotoRequested?(displayedRows[row].record)
+        openSelectedRecordInReview()
+    }
+
+    private func openSelectedRecordInReview() {
+        let row = tableView.clickedRow >= 0 ? tableView.clickedRow : tableView.selectedRow
+        guard row >= 0, row < displayedRows.count else { return }
+        let record = displayedRows[row].record
+        if onReviewRequested != nil {
+            onReviewRequested?(record)
+        } else {
+            onOpenPhotoRequested?(record)
+        }
     }
 
     // MARK: - NSTableViewDataSource
@@ -351,7 +452,7 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
     // MARK: - NSTableViewDelegate
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard let colId = tableColumn?.identifier, row >= 0 && row < displayedRows.count else { return nil }
+        guard let colId = tableColumn?.identifier, row >= 0, row < displayedRows.count else { return nil }
         let entry = displayedRows[row]
         let cellId = NSUserInterfaceItemIdentifier("cell_\(colId.rawValue)")
         let cell: NSTableCellView
@@ -368,7 +469,7 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
             NSLayoutConstraint.activate([
                 tf.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
                 tf.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-                tf.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+                tf.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
             ])
         }
 
@@ -384,7 +485,9 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         case ColumnID.serial:
             tf.stringValue = entry.record.serial.isEmpty ? "(pending)" : entry.record.serial
             tf.font = .monospacedSystemFont(ofSize: 11.5, weight: entry.record.serial.isEmpty ? .regular : .medium)
-            if entry.record.serial.isEmpty { tf.textColor = .secondaryLabelColor }
+            if entry.record.serial.isEmpty {
+                tf.textColor = .secondaryLabelColor
+            }
         case ColumnID.issue:
             tf.stringValue = entry.issueDateDisplay
             tf.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
@@ -418,5 +521,18 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
             return todayTimeFormatter.string(from: date)
         }
         return shortDateFormatter.string(from: date)
+    }
+}
+
+/// Custom NSTableView supporting Return / Enter key press to open review.
+private final class DrawerTableView: NSTableView {
+    var onEnterPressed: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 76 { // Return / Enter
+            onEnterPressed?()
+            return
+        }
+        super.keyDown(with: event)
     }
 }

@@ -15,8 +15,8 @@
 // PRIMARY TEST SCOPE: Issue dates 1965–2010.
 // PUBLIC APP ARCHITECTURE: Full historically valid dates (Series A-D, E, EE, I, H, HH).
 
-import Foundation
 import CoreGraphics
+import Foundation
 
 // MARK: - Privacy-Safe Masking (Rule 9)
 
@@ -33,10 +33,16 @@ public func maskSerial(_ raw: String) -> String {
     while prefixEnd < chars.count && chars[prefixEnd].isLetter {
         prefixEnd += 1
         // Prefixes are at most 2 letters (typically 1)
-        if prefixEnd >= 2 && !s.hasPrefix("EE") { break }
-        if s.hasPrefix("EE") && prefixEnd >= 2 { break }
+        if prefixEnd >= 2 && !s.hasPrefix("EE") {
+            break
+        }
+        if s.hasPrefix("EE") && prefixEnd >= 2 {
+            break
+        }
     }
-    if prefixEnd == 0 { prefixEnd = 1 }
+    if prefixEnd == 0 {
+        prefixEnd = 1
+    }
 
     var suffixStart = chars.count
     if s.hasSuffix("EE") || s.hasSuffix("HH") {
@@ -50,8 +56,8 @@ public func maskSerial(_ raw: String) -> String {
         return String(chars.prefix(1)) + String(repeating: "•", count: max(1, chars.count - 2)) + String(chars.suffix(1))
     }
 
-    let prefixStr = String(chars[0..<prefixEnd])
-    let suffixStr = String(chars[suffixStart..<chars.count])
+    let prefixStr = String(chars[0 ..< prefixEnd])
+    let suffixStr = String(chars[suffixStart ..< chars.count])
     let maskedDigits = String(repeating: "•", count: suffixStart - prefixEnd)
     return prefixStr + maskedDigits + suffixStr
 }
@@ -85,7 +91,7 @@ public enum BondSeries: Equatable, Hashable {
         case .I: return "I"
         case .H: return "H"
         case .HH: return "HH"
-        case .other(let name): return name
+        case let .other(name): return name
         }
     }
 
@@ -97,33 +103,33 @@ public enum BondSeries: Equatable, Hashable {
     /// Series HH: January 1, 1980 to August 31, 2004
     public var historicalOfferingYears: ClosedRange<Int> {
         switch self {
-        case .E: return 1941...1980
-        case .EE: return 1980...2011
-        case .I: return 1998...2026 // Active issue era through current year
-        case .H: return 1952...1979
-        case .HH: return 1980...2004
-        case .other: return 1935...2026
+        case .E: return 1941 ... 1980
+        case .EE: return 1980 ... 2011
+        case .I: return 1998 ... 2026 // Active issue era through current year
+        case .H: return 1952 ... 1979
+        case .HH: return 1980 ... 2004
+        case .other: return 1935 ... 2026
         }
     }
 
     /// Offering era specifically for physical paper bonds.
     public var paperOfferingYears: ClosedRange<Int> {
         switch self {
-        case .E: return 1941...1980 // Discontinued June 30, 1980
-        case .EE: return 1980...2011 // General over-the-counter paper ended Dec 31, 2011
-        case .I: return 1998...2024 // OTC paper ended Dec 31, 2011; IRS tax refund paper ended Dec 31, 2024
-        case .H: return 1952...1979
-        case .HH: return 1980...2004
-        case .other: return 1935...2026
+        case .E: return 1941 ... 1980 // Discontinued June 30, 1980
+        case .EE: return 1980 ... 2011 // General over-the-counter paper ended Dec 31, 2011
+        case .I: return 1998 ... 2024 // OTC paper ended Dec 31, 2011; IRS tax refund paper ended Dec 31, 2024
+        case .H: return 1952 ... 1979
+        case .HH: return 1980 ... 2004
+        case .other: return 1935 ... 2026
         }
     }
 
     /// Offering era for electronic book-entry bonds (TreasuryDirect).
     public var electronicOfferingYears: ClosedRange<Int>? {
         switch self {
-        case .EE: return 2003...2026 // Active today on TreasuryDirect
-        case .I: return 2002...2026  // Active today on TreasuryDirect
-        default: return nil         // Series E, H, HH were never offered as electronic bonds
+        case .EE: return 2003 ... 2026 // Active today on TreasuryDirect
+        case .I: return 2002 ... 2026 // Active today on TreasuryDirect
+        default: return nil // Series E, H, HH were never offered as electronic bonds
         }
     }
 
@@ -145,11 +151,11 @@ public enum BondSeries: Equatable, Hashable {
     /// Series I: 10 digits.
     public var plausibleNumericLengths: ClosedRange<Int> {
         switch self {
-        case .E: return 8...10
-        case .EE: return 10...10
-        case .I: return 10...10
-        case .H, .HH: return 8...10
-        case .other: return 7...11
+        case .E: return 8 ... 10
+        case .EE: return 10 ... 10
+        case .I: return 10 ... 10
+        case .H, .HH: return 8 ... 10
+        case .other: return 7 ... 11
         }
     }
 
@@ -175,7 +181,6 @@ public enum BondSeries: Equatable, Hashable {
 // MARK: - Authoritative Series-Specific Denomination-Prefix Tables (Requirement 1)
 
 public enum BondValidationRules {
-
     /// Bureau of the Fiscal Service & Bureau of Engraving and Printing denomination prefix mapping.
     /// Roman numerals & single-character abbreviations:
     /// - $10: X (Roman numeral 10, 1944 Soldier's Bond)
@@ -447,10 +452,9 @@ public struct BondValidationReport: Codable, Equatable {
 
 // MARK: - Validation Engine Implementation
 
-extension BondValidationRules {
-
+public extension BondValidationRules {
     /// Validate serial syntax strictly without inventing missing digits.
-    public static func validateSyntacticSerial(_ rawSerial: String, expectedSeries: String = "") -> SyntacticSerialResult {
+    static func validateSyntacticSerial(_ rawSerial: String, expectedSeries: String = "") -> SyntacticSerialResult {
         let norm = normalizeSerial(rawSerial)
         guard !norm.isEmpty else {
             return SyntacticSerialResult(isValid: false, normalizedSerial: "", prefix: "", digits: "", suffix: "", failureReason: "Empty serial number")
@@ -458,7 +462,9 @@ extension BondValidationRules {
 
         let chars = Array(norm)
         var start = 0
-        while start < chars.count && chars[start].isLetter { start += 1 }
+        while start < chars.count && chars[start].isLetter {
+            start += 1
+        }
         guard start > 0 else {
             return SyntacticSerialResult(isValid: false, normalizedSerial: norm, prefix: "", digits: "", suffix: "", failureReason: "Missing letter prefix in serial '\(maskSerial(norm))'")
         }
@@ -466,15 +472,19 @@ extension BondValidationRules {
         var end = chars.count
         if end > start && chars[end - 1] == "E" {
             end -= 1
-            if end > start && chars[end - 1] == "E" { end -= 1 }
+            if end > start && chars[end - 1] == "E" {
+                end -= 1
+            }
         } else if end > start && (chars[end - 1] == "I" || chars[end - 1] == "H") {
             end -= 1
-            if end > start && chars[end - 1] == "H" { end -= 1 }
+            if end > start && chars[end - 1] == "H" {
+                end -= 1
+            }
         }
 
-        let prefix = String(chars[0..<start])
-        let suffix = String(chars[end..<chars.count])
-        let digits = String(chars[start..<end])
+        let prefix = String(chars[0 ..< start])
+        let suffix = String(chars[end ..< chars.count])
+        let digits = String(chars[start ..< end])
 
         guard !digits.isEmpty, digits.allSatisfy({ $0.isNumber }) else {
             return SyntacticSerialResult(isValid: false, normalizedSerial: norm, prefix: prefix, digits: digits, suffix: suffix, failureReason: "Non-numeric characters in serial body '\(maskSerial(norm))'")
@@ -483,9 +493,9 @@ extension BondValidationRules {
         let series = BondSeries(fromString: expectedSeries)
         let allowedLengths: ClosedRange<Int>
         switch series {
-        case .E: allowedLengths = 8...10
-        case .EE, .I: allowedLengths = 10...10
-        default: allowedLengths = 8...10
+        case .E: allowedLengths = 8 ... 10
+        case .EE, .I: allowedLengths = 10 ... 10
+        default: allowedLengths = 8 ... 10
         }
 
         // Validate suffix matches expected series if series is provided
@@ -507,7 +517,7 @@ extension BondValidationRules {
 
     /// Validate prefix / denomination consistency.
     /// Distinguishes between hard authoritative mismatches and uncertain warnings (Requirement 8).
-    public static func validatePrefixDenomination(prefix: String, denomination: String, series: String) -> PrefixDenominationConsistencyResult {
+    static func validatePrefixDenomination(prefix: String, denomination: String, series: String) -> PrefixDenominationConsistencyResult {
         let cleanDenom = denomination.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespaces)
         let p = prefix.trimmingCharacters(in: .whitespaces).uppercased()
         let bSeries = BondSeries(fromString: series)
@@ -564,7 +574,7 @@ extension BondValidationRules {
 
     /// Validate Series / Issue Date consistency.
     /// Strict enforcement for authoritatively closed offering eras; warnings for boundaries (Requirement 8).
-    public static func validateSeriesIssueDate(series: String, month: String, year: String) -> SeriesIssueDateConsistencyResult {
+    static func validateSeriesIssueDate(series: String, month: String, year: String) -> SeriesIssueDateConsistencyResult {
         let bSeries = BondSeries(fromString: series)
         guard let y = Int(year), year.count == 4 else {
             return SeriesIssueDateConsistencyResult(status: .indeterminate, validYearRange: nil, message: "Missing or invalid 4-digit issue year")
@@ -734,7 +744,7 @@ extension BondValidationRules {
     }
 
     /// Full evidence-based validation evaluating all separate dimensions.
-    static func validateBond(record: BondRecord, userConfirmedFields: Set<String> = []) -> BondValidationReport {
+    internal static func validateBond(record: BondRecord, userConfirmedFields: Set<String> = []) -> BondValidationReport {
         var hardErrors: [String] = []
         var warnings: [String] = []
 
@@ -751,17 +761,25 @@ extension BondValidationRules {
         // 2. Prefix / Denomination Consistency
         let prefixResult = validatePrefixDenomination(prefix: serialResult.prefix, denomination: record.denomination, series: record.series)
         if prefixResult.status == .inconsistent {
-            if let msg = prefixResult.message { hardErrors.append(msg) }
+            if let msg = prefixResult.message {
+                hardErrors.append(msg)
+            }
         } else if prefixResult.status == .warning {
-            if let msg = prefixResult.message { warnings.append(msg) }
+            if let msg = prefixResult.message {
+                warnings.append(msg)
+            }
         }
 
         // 3. Series / Issue Date Consistency
         let dateResult = validateSeriesIssueDate(series: record.series, month: record.issueMonth, year: record.issueYear)
         if dateResult.status == .inconsistent {
-            if let msg = dateResult.message { hardErrors.append(msg) }
+            if let msg = dateResult.message {
+                hardErrors.append(msg)
+            }
         } else if dateResult.status == .warning {
-            if let msg = dateResult.message { warnings.append(msg) }
+            if let msg = dateResult.message {
+                warnings.append(msg)
+            }
         }
 
         // 4. OCR Confidence Evaluation

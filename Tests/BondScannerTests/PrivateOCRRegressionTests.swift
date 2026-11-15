@@ -1,12 +1,12 @@
-import XCTest
-import CoreGraphics
 @testable import BondScanner
+import CoreGraphics
+import XCTest
 
 // MARK: - Dataset Specification
 
 enum FixtureDataset: String, CaseIterable {
-    case synthetic = "synthetic"
-    case real = "real"
+    case synthetic
+    case real
 
     var displayName: String {
         switch self {
@@ -128,7 +128,7 @@ enum PrivateFixturesEnvironment {
             datasetDir.appendingPathComponent("images").appendingPathComponent(filename),
             datasetDir.appendingPathComponent("bonds").appendingPathComponent(filename),
             datasetDir.appendingPathComponent("photographs").appendingPathComponent(filename),
-            datasetDir.appendingPathComponent(filename)
+            datasetDir.appendingPathComponent(filename),
         ]
         for candidate in candidates {
             if FileManager.default.fileExists(atPath: candidate.path) {
@@ -163,7 +163,6 @@ enum PrivateFixturesEnvironment {
 // MARK: - Test Suite
 
 final class PrivateOCRRegressionTests: XCTestCase {
-
     override func setUp() {
         super.setUp()
         // Ensure test runs do not write debug events to ~/BondScans/scan-debug.log
@@ -220,174 +219,175 @@ final class PrivateOCRRegressionTests: XCTestCase {
                 let record = ocrResult.record
                 var falseHighConfFields: [String] = []
 
-            // 1. Evaluate Series
-            var seriesEvaluated = false
-            var seriesMatch = false
-            var seriesMisclassified = false
-            if let expectedSeries = item.series, !expectedSeries.isEmpty {
-                seriesEvaluated = true
-                totalSeriesEval += 1
-                if record.series.caseInsensitiveCompare(expectedSeries) == .orderedSame {
-                    seriesMatch = true
-                    matchedSeries += 1
-                } else {
-                    // Check for Series E vs EE confusion
-                    if (expectedSeries == "E" && record.series == "EE") ||
-                       (expectedSeries == "EE" && record.series == "E") {
-                        seriesMisclassified = true
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Series classification mismatch: E vs EE confusion")
+                // 1. Evaluate Series
+                var seriesEvaluated = false
+                var seriesMatch = false
+                var seriesMisclassified = false
+                if let expectedSeries = item.series, !expectedSeries.isEmpty {
+                    seriesEvaluated = true
+                    totalSeriesEval += 1
+                    if record.series.caseInsensitiveCompare(expectedSeries) == .orderedSame {
+                        seriesMatch = true
+                        matchedSeries += 1
                     } else {
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Series mismatch")
-                    }
+                        // Check for Series E vs EE confusion
+                        if (expectedSeries == "E" && record.series == "EE") ||
+                            (expectedSeries == "EE" && record.series == "E")
+                        {
+                            seriesMisclassified = true
+                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Series classification mismatch: E vs EE confusion")
+                        } else {
+                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Series mismatch")
+                        }
 
-                    if fieldConfidenceIsHigh(record, "series") {
-                        falseHighConfFields.append("series")
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for series")
-                    }
-                }
-            }
-
-            // 2. Evaluate Denomination
-            var denomEvaluated = false
-            var denomMatch = false
-            if let expectedDenom = item.denomination, !expectedDenom.isEmpty {
-                denomEvaluated = true
-                totalDenomEval += 1
-                let normExpected = expectedDenom.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespaces)
-                let normActual = record.denomination.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespaces)
-                if normActual == normExpected {
-                    denomMatch = true
-                    matchedDenom += 1
-                } else {
-                    XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Denomination mismatch")
-                    if fieldConfidenceIsHigh(record, "denomination") {
-                        falseHighConfFields.append("denomination")
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for denomination")
+                        if fieldConfidenceIsHigh(record, "series") {
+                            falseHighConfFields.append("series")
+                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for series")
+                        }
                     }
                 }
-            }
 
-            // 3. Evaluate Serial
-            var serialEvaluated = false
-            var serialMatch = false
-            if let expectedSerial = item.serial, !expectedSerial.isEmpty {
-                serialEvaluated = true
-                totalSerialEval += 1
-                let normExpected = normalizeSerial(expectedSerial)
-                let normActual = normalizeSerial(record.serial)
-                if normActual == normExpected {
-                    serialMatch = true
-                    matchedSerial += 1
-                } else {
-                    // Check if selected serial looks like routing/account number (e.g. numeric without valid bond suffix)
-                    if !normActual.isEmpty && (normActual.rangeOfCharacter(from: CharacterSet.letters) == nil || !normActual.hasSuffix("E")) {
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Serial mismatch (possible routing/account number confusion)")
+                // 2. Evaluate Denomination
+                var denomEvaluated = false
+                var denomMatch = false
+                if let expectedDenom = item.denomination, !expectedDenom.isEmpty {
+                    denomEvaluated = true
+                    totalDenomEval += 1
+                    let normExpected = expectedDenom.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespaces)
+                    let normActual = record.denomination.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespaces)
+                    if normActual == normExpected {
+                        denomMatch = true
+                        matchedDenom += 1
                     } else {
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Serial mismatch")
-                    }
-
-                    if fieldConfidenceIsHigh(record, "serial") {
-                        falseHighConfFields.append("serial")
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for serial")
+                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Denomination mismatch")
+                        if fieldConfidenceIsHigh(record, "denomination") {
+                            falseHighConfFields.append("denomination")
+                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for denomination")
+                        }
                     }
                 }
-            }
 
-            // 4. Evaluate Issue Date
-            var issueDateEvaluated = false
-            var issueDateMatch = false
-            var datingStampConfused = false
-            if (item.issueMonth != nil && !item.issueMonth!.isEmpty) || (item.issueYear != nil && !item.issueYear!.isEmpty) {
-                issueDateEvaluated = true
-                totalDateEval += 1
-                let expMonth = item.issueMonth ?? ""
-                let expYear = item.issueYear ?? ""
-                let actMonth = record.issueMonth
-                let actYear = record.issueYear
+                // 3. Evaluate Serial
+                var serialEvaluated = false
+                var serialMatch = false
+                if let expectedSerial = item.serial, !expectedSerial.isEmpty {
+                    serialEvaluated = true
+                    totalSerialEval += 1
+                    let normExpected = normalizeSerial(expectedSerial)
+                    let normActual = normalizeSerial(record.serial)
+                    if normActual == normExpected {
+                        serialMatch = true
+                        matchedSerial += 1
+                    } else {
+                        // Check if selected serial looks like routing/account number (e.g. numeric without valid bond suffix)
+                        if !normActual.isEmpty, normActual.rangeOfCharacter(from: CharacterSet.letters) == nil || !normActual.hasSuffix("E") {
+                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Serial mismatch (possible routing/account number confusion)")
+                        } else {
+                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Serial mismatch")
+                        }
 
-                let monthMatches = expMonth.isEmpty || (actMonth == expMonth || monthNumber(actMonth) == monthNumber(expMonth))
-                let yearMatches = expYear.isEmpty || (actYear == expYear)
+                        if fieldConfidenceIsHigh(record, "serial") {
+                            falseHighConfFields.append("serial")
+                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for serial")
+                        }
+                    }
+                }
 
-                if monthMatches && yearMatches {
-                    issueDateMatch = true
-                    matchedDate += 1
-                } else {
-                    // Check for confusion with bank dating stamp
-                    if let stamp = item.datingStamp, !stamp.isEmpty {
-                        let normStamp = stamp.uppercased()
-                        if (!actMonth.isEmpty && normStamp.contains(actMonth)) || (!actYear.isEmpty && normStamp.contains(actYear)) {
-                            datingStampConfused = true
-                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Issue date confused with bank dating stamp")
+                // 4. Evaluate Issue Date
+                var issueDateEvaluated = false
+                var issueDateMatch = false
+                var datingStampConfused = false
+                if (item.issueMonth != nil && !item.issueMonth!.isEmpty) || (item.issueYear != nil && !item.issueYear!.isEmpty) {
+                    issueDateEvaluated = true
+                    totalDateEval += 1
+                    let expMonth = item.issueMonth ?? ""
+                    let expYear = item.issueYear ?? ""
+                    let actMonth = record.issueMonth
+                    let actYear = record.issueYear
+
+                    let monthMatches = expMonth.isEmpty || (actMonth == expMonth || monthNumber(actMonth) == monthNumber(expMonth))
+                    let yearMatches = expYear.isEmpty || (actYear == expYear)
+
+                    if monthMatches, yearMatches {
+                        issueDateMatch = true
+                        matchedDate += 1
+                    } else {
+                        // Check for confusion with bank dating stamp
+                        if let stamp = item.datingStamp, !stamp.isEmpty {
+                            let normStamp = stamp.uppercased()
+                            if (!actMonth.isEmpty && normStamp.contains(actMonth)) || (!actYear.isEmpty && normStamp.contains(actYear)) {
+                                datingStampConfused = true
+                                XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Issue date confused with bank dating stamp")
+                            } else {
+                                XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Issue date mismatch")
+                            }
                         } else {
                             XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Issue date mismatch")
                         }
+
+                        if fieldConfidenceIsHigh(record, "issueDate") {
+                            falseHighConfFields.append("issueDate")
+                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for issueDate")
+                        }
+                    }
+                }
+
+                // 5. Evaluate Expected Confidence
+                if let expectedConf = item.expectedConfidence {
+                    for (fieldKey, expectedLevel) in expectedConf {
+                        let actualLevel = record.fieldConfidence?[fieldKey] ?? "none"
+                        if actualLevel.caseInsensitiveCompare(expectedLevel) != .orderedSame {
+                            XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Confidence mismatch for '\(fieldKey)'")
+                        }
+                    }
+                }
+
+                // 6. Evaluate Status & Incorrect OK Detection
+                var statusEvaluated = false
+                var statusMatch = false
+                var isIncorrectOK = false
+                let hasAnyMismatch = (seriesEvaluated && !seriesMatch) ||
+                    (denomEvaluated && !denomMatch) ||
+                    (serialEvaluated && !serialMatch) ||
+                    (issueDateEvaluated && !issueDateMatch)
+
+                if record.status.uppercased() == "OK" && hasAnyMismatch {
+                    isIncorrectOK = true
+                    totalIncorrectOK += 1
+                    XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Incorrect OK status assigned despite field mismatches")
+                }
+
+                if let expStatus = item.expectedStatus, !expStatus.isEmpty {
+                    statusEvaluated = true
+                    if record.status.caseInsensitiveCompare(expStatus) == .orderedSame {
+                        statusMatch = true
                     } else {
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Issue date mismatch")
-                    }
-
-                    if fieldConfidenceIsHigh(record, "issueDate") {
-                        falseHighConfFields.append("issueDate")
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence reading for issueDate")
+                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Status mismatch")
                     }
                 }
-            }
 
-            // 5. Evaluate Expected Confidence
-            if let expectedConf = item.expectedConfidence {
-                for (fieldKey, expectedLevel) in expectedConf {
-                    let actualLevel = record.fieldConfidence?[fieldKey] ?? "none"
-                    if actualLevel.caseInsensitiveCompare(expectedLevel) != .orderedSame {
-                        XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Confidence mismatch for '\(fieldKey)'")
-                    }
-                }
-            }
+                totalFalseHighConf += falseHighConfFields.count
 
-            // 6. Evaluate Status & Incorrect OK Detection
-            var statusEvaluated = false
-            var statusMatch = false
-            var isIncorrectOK = false
-            let hasAnyMismatch = (seriesEvaluated && !seriesMatch) ||
-                                 (denomEvaluated && !denomMatch) ||
-                                 (serialEvaluated && !serialMatch) ||
-                                 (issueDateEvaluated && !issueDateMatch)
-
-            if record.status.uppercased() == "OK" && hasAnyMismatch {
-                isIncorrectOK = true
-                totalIncorrectOK += 1
-                XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Incorrect OK status assigned despite field mismatches")
-            }
-
-            if let expStatus = item.expectedStatus, !expStatus.isEmpty {
-                statusEvaluated = true
-                if record.status.caseInsensitiveCompare(expStatus) == .orderedSame {
-                    statusMatch = true
-                } else {
-                    XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: Status mismatch")
-                }
-            }
-
-            totalFalseHighConf += falseHighConfFields.count
-
-            fixtureMetrics.append(FixtureMetric(
-                id: item.id,
-                scenario: item.scenario ?? "Scenario \(item.id)",
-                durationSeconds: duration,
-                seriesEvaluated: seriesEvaluated,
-                seriesMatch: seriesMatch,
-                denominationEvaluated: denomEvaluated,
-                denominationMatch: denomMatch,
-                serialEvaluated: serialEvaluated,
-                serialMatch: serialMatch,
-                issueDateEvaluated: issueDateEvaluated,
-                issueDateMatch: issueDateMatch,
-                statusEvaluated: statusEvaluated,
-                statusMatch: statusMatch,
-                falseHighConfidenceFields: falseHighConfFields,
-                isIncorrectOKStatus: isIncorrectOK,
-                datingStampConfused: datingStampConfused,
-                seriesMisclassified: seriesMisclassified,
-                recordedStatus: record.status
-            ))
+                fixtureMetrics.append(FixtureMetric(
+                    id: item.id,
+                    scenario: item.scenario ?? "Scenario \(item.id)",
+                    durationSeconds: duration,
+                    seriesEvaluated: seriesEvaluated,
+                    seriesMatch: seriesMatch,
+                    denominationEvaluated: denomEvaluated,
+                    denominationMatch: denomMatch,
+                    serialEvaluated: serialEvaluated,
+                    serialMatch: serialMatch,
+                    issueDateEvaluated: issueDateEvaluated,
+                    issueDateMatch: issueDateMatch,
+                    statusEvaluated: statusEvaluated,
+                    statusMatch: statusMatch,
+                    falseHighConfidenceFields: falseHighConfFields,
+                    isIncorrectOKStatus: isIncorrectOK,
+                    datingStampConfused: datingStampConfused,
+                    seriesMisclassified: seriesMisclassified,
+                    recordedStatus: record.status
+                ))
             }
         }
 
@@ -426,16 +426,13 @@ final class PrivateOCRRegressionTests: XCTestCase {
             (1, "0°"),
             (6, "90° CW"),
             (3, "180°"),
-            (8, "270° CW")
+            (8, "270° CW"),
         ]
 
         var testedImagesCount = 0
 
         for item in items {
-            guard let imageURL = PrivateFixturesEnvironment.imageURL(for: item.filename, dataset: dataset) else {
-                continue
-            }
-            guard let baseImage = cgImageFromFile(imageURL) else { continue }
+            guard let imageURL = PrivateFixturesEnvironment.imageURL(for: item.filename, dataset: dataset), let baseImage = cgImageFromFile(imageURL) else { continue }
             testedImagesCount += 1
 
             for (exif, desc) in orientationExifs {
@@ -454,7 +451,7 @@ final class PrivateOCRRegressionTests: XCTestCase {
                     if let expSerial = item.serial, !expSerial.isEmpty {
                         let normExpected = normalizeSerial(expSerial)
                         let normActual = normalizeSerial(result.record.serial)
-                        if normActual != normExpected && fieldConfidenceIsHigh(result.record, "serial") {
+                        if normActual != normExpected, fieldConfidenceIsHigh(result.record, "serial") {
                             XCTFail("[\(dataset.displayName)] Fixture [\(item.id)]: False high-confidence serial at orientation \(desc)")
                         }
                     }

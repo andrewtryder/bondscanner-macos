@@ -1,5 +1,5 @@
-import Foundation
 import CoreGraphics
+import Foundation
 
 struct OCRLine {
     let text: String
@@ -21,8 +21,13 @@ struct FieldReading {
     var value: String = ""
     var confidence: String = "" // "high" or "uncertain"
     var source: String = ""
-    var isHigh: Bool { confidence == "high" && !value.isEmpty }
-    var isUncertain: Bool { confidence == "uncertain" && !value.isEmpty }
+    var isHigh: Bool {
+        confidence == "high" && !value.isEmpty
+    }
+
+    var isUncertain: Bool {
+        confidence == "uncertain" && !value.isEmpty
+    }
 }
 
 /// Bank dating stamp: day + month name + year (e.g. "12 AUG 1966").

@@ -15,8 +15,8 @@
 // Pre-1985 bonds (Series E and early Series EE) were issued without MICR lines.
 // Operates as an independent, non-destructive secondary pass to corroborate optical candidates.
 
-import Foundation
 import CoreGraphics
+import Foundation
 import Vision
 
 public struct MICRLineAnalysis: Codable, Equatable {
@@ -42,7 +42,6 @@ public struct MICRLineAnalysis: Codable, Equatable {
 }
 
 public enum MICRLineDetector {
-
     /// Standard Treasury / Bureau of the Fiscal Service savings bond routing transit number.
     public static let treasuryRoutingNumber = "000090007"
 
@@ -56,12 +55,20 @@ public enum MICRLineDetector {
             return cleanSeries == "EE" || cleanSeries == "I"
         }
 
-        if y > 1985 { return true }
-        if y < 1985 { return false }
+        if y > 1985 {
+            return true
+        }
+        if y < 1985 {
+            return false
+        }
 
         // Year 1985: Introduced in March 1985
-        if let m = Int(month), m >= 3 { return true }
-        if month.isEmpty { return true } // Assume possible compatibility if month unread
+        if let m = Int(month), m >= 3 {
+            return true
+        }
+        if month.isEmpty {
+            return true
+        } // Assume possible compatibility if month unread
         return false
     }
 

@@ -1,16 +1,17 @@
-import Foundation
 import AVFoundation
 import CoreMedia
+import Foundation
 
 func fourCharCodeString(_ code: FourCharCode) -> String {
     let bytes: [UInt8] = [
-        UInt8((code >> 24) & 0xff),
-        UInt8((code >> 16) & 0xff),
-        UInt8((code >> 8) & 0xff),
-        UInt8(code & 0xff)
+        UInt8((code >> 24) & 0xFF),
+        UInt8((code >> 16) & 0xFF),
+        UInt8((code >> 8) & 0xFF),
+        UInt8(code & 0xFF),
     ]
     if let s = String(bytes: bytes, encoding: .ascii),
-       s.unicodeScalars.allSatisfy({ $0.isASCII && $0.value >= 32 && $0.value < 127 }) {
+       s.unicodeScalars.allSatisfy({ $0.isASCII && $0.value >= 32 && $0.value < 127 })
+    {
         return s
     }
     return String(format: "0x%08X", code)
@@ -63,9 +64,15 @@ func selectBestCaptureFormat(from formats: [AVCaptureDevice.Format]) -> AVCaptur
     }
     return usable.max { a, b in
         let sa = score(a), sb = score(b)
-        if sa.0 != sb.0 { return sa.0 < sb.0 }
-        if sa.1 != sb.1 { return sa.1 < sb.1 }
-        if sa.2 != sb.2 { return sa.2 < sb.2 }
+        if sa.0 != sb.0 {
+            return sa.0 < sb.0
+        }
+        if sa.1 != sb.1 {
+            return sa.1 < sb.1
+        }
+        if sa.2 != sb.2 {
+            return sa.2 < sb.2
+        }
         return sa.3 < sb.3
     }
 }
@@ -141,7 +148,7 @@ func preferredFrameDuration(for format: AVCaptureDevice.Format, desiredFPS: Doub
     var bestDelta = abs(bestFPS - desiredFPS)
     for range in ranges {
         let fps: Double
-        if range.minFrameRate <= desiredFPS && desiredFPS <= range.maxFrameRate {
+        if range.minFrameRate <= desiredFPS, desiredFPS <= range.maxFrameRate {
             fps = desiredFPS
         } else if range.maxFrameRate <= desiredFPS {
             fps = range.maxFrameRate
@@ -156,16 +163,24 @@ func preferredFrameDuration(for format: AVCaptureDevice.Format, desiredFPS: Doub
         }
     }
     var duration = CMTime(seconds: 1.0 / max(bestFPS, 1), preferredTimescale: 600)
-    if CMTimeCompare(duration, bestRange.minFrameDuration) < 0 { duration = bestRange.minFrameDuration }
-    if CMTimeCompare(duration, bestRange.maxFrameDuration) > 0 { duration = bestRange.maxFrameDuration }
+    if CMTimeCompare(duration, bestRange.minFrameDuration) < 0 {
+        duration = bestRange.minFrameDuration
+    }
+    if CMTimeCompare(duration, bestRange.maxFrameDuration) > 0 {
+        duration = bestRange.maxFrameDuration
+    }
     let fps = 1.0 / CMTimeGetSeconds(duration)
     return (duration, fps)
 }
 
 func desiredFPSForFormatDimensions(_ width: Int32, _ height: Int32) -> Double {
     let pixels = Int(width) * Int(height)
-    if pixels >= 2592 * 1944 { return 10 }
-    if pixels >= 2048 * 1536 { return 15 }
+    if pixels >= 2592 * 1944 {
+        return 10
+    }
+    if pixels >= 2048 * 1536 {
+        return 15
+    }
     return 30
 }
 

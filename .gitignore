@@ -1,4 +1,5 @@
 # Build outputs
+/.build/
 /build/
 /build.log
 /compile-log.txt

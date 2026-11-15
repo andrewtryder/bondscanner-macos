@@ -1,0 +1,21 @@
+# SwiftLint Configuration
+
+excluded:
+  - .build
+  - build
+  - local-fixtures
+  - scripts
+  - Package.swift
+
+disabled_rules:
+  # Disabled to fit existing codebase structure
+  - type_body_length         # Large app & view classes
+  - file_length              # Files like BondScannerApp.swift exceed 1000 lines
+  - function_body_length     # Complex drawing and parsing routines
+  - cyclomatic_complexity    # Bond validation matrices have large switch statements
+  - large_tuple              # Geometry/OCR tuples with 3-4 elements
+  - identifier_name          # Short coordinate and UI names (x, y, f, b, tf, etc.)
+  - line_length              # Detailed log statements and regex definitions
+  - statement_position       # Formatting handled primarily by SwiftFormat
+  - trailing_comma           # Formatting handled primarily by SwiftFormat
+  - opening_brace            # Formatting handled primarily by SwiftFormat

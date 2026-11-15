@@ -12,8 +12,8 @@
 // 5. Never invent missing serial digits or silently replace user-confirmed values.
 // 9. Privacy-safe handling: never expose raw private serial numbers in summaries.
 
-import Foundation
 import CoreGraphics
+import Foundation
 
 public struct SerialCandidate: Codable, Equatable {
     public let rawText: String
@@ -60,7 +60,6 @@ public struct SerialCandidate: Codable, Equatable {
 }
 
 public enum SerialCandidateRanker {
-
     /// Extract serial candidates from a set of OCR lines from a specific pass.
     static func extractCandidates(
         from lines: [OCRLine],
@@ -79,7 +78,7 @@ public enum SerialCandidateRanker {
                 "[A-Z][0-9]{10}EE",
                 "[A-Z][0-9]{8,10}E\\b",
                 "[A-Z][0-9]{10}I\\b",
-                "[A-Z][0-9]{7,11}(?:EE|E|I)"
+                "[A-Z][0-9]{7,11}(?:EE|E|I)",
             ]
 
             var seenNormsInLine = Set<String>()
@@ -88,19 +87,26 @@ public enum SerialCandidateRanker {
                 let matches = regexMatches(pattern, in: normLine)
                 for hit in matches {
                     // Prevent duplicate hits for the same token in a single line
-                    if seenNormsInLine.contains(hit) { continue }
+                    if seenNormsInLine.contains(hit) {
+                        continue
+                    }
                     seenNormsInLine.insert(hit)
 
                     let chars = Array(hit)
                     var pEnd = 0
-                    while pEnd < chars.count && chars[pEnd].isLetter { pEnd += 1 }
+                    while pEnd < chars.count, chars[pEnd].isLetter {
+                        pEnd += 1
+                    }
                     var sStart = chars.count
-                    if hit.hasSuffix("EE") { sStart -= 2 }
-                    else if hit.hasSuffix("E") || hit.hasSuffix("I") { sStart -= 1 }
+                    if hit.hasSuffix("EE") {
+                        sStart -= 2
+                    } else if hit.hasSuffix("E") || hit.hasSuffix("I") {
+                        sStart -= 1
+                    }
 
-                    let prefix = String(chars[0..<pEnd])
-                    let suffix = String(chars[sStart..<chars.count])
-                    let digits = String(chars[pEnd..<sStart])
+                    let prefix = String(chars[0 ..< pEnd])
+                    let suffix = String(chars[sStart ..< chars.count])
+                    let digits = String(chars[pEnd ..< sStart])
 
                     let candidate = SerialCandidate(
                         rawText: line.text,
@@ -125,24 +131,29 @@ public enum SerialCandidateRanker {
 
                 let chars = Array(normToken)
                 var pEnd = 0
-                while pEnd < chars.count && chars[pEnd].isLetter { pEnd += 1 }
+                while pEnd < chars.count && chars[pEnd].isLetter {
+                    pEnd += 1
+                }
                 guard pEnd > 0 else { continue }
 
                 var sStart = chars.count
-                if normToken.hasSuffix("EE") { sStart -= 2 }
-                else if normToken.hasSuffix("E") || normToken.hasSuffix("I") { sStart -= 1 }
+                if normToken.hasSuffix("EE") {
+                    sStart -= 2
+                } else if normToken.hasSuffix("E") || normToken.hasSuffix("I") {
+                    sStart -= 1
+                }
 
                 guard sStart > pEnd else { continue }
-                let digits = String(chars[pEnd..<sStart])
+                let digits = String(chars[pEnd ..< sStart])
                 guard digits.allSatisfy({ $0.isNumber }), digits.count >= 7 else { continue }
 
                 seenNormsInLine.insert(normToken)
                 let candidate = SerialCandidate(
                     rawText: token,
                     normalized: normToken,
-                    prefix: String(chars[0..<pEnd]),
+                    prefix: String(chars[0 ..< pEnd]),
                     digits: digits,
-                    suffix: String(chars[sStart..<chars.count]),
+                    suffix: String(chars[sStart ..< chars.count]),
                     box: line.box,
                     sourcePasses: [passName],
                     visionConfidence: line.confidence,
@@ -175,7 +186,7 @@ public enum SerialCandidateRanker {
                 }
                 prev.visionConfidence = max(prev.visionConfidence, cand.visionConfidence)
                 // Keep the bounding box with stronger corner positioning
-                if isPreferredSerialPosition(cand.box) && !isPreferredSerialPosition(prev.box) {
+                if isPreferredSerialPosition(cand.box), !isPreferredSerialPosition(prev.box) {
                     prev = SerialCandidate(
                         rawText: cand.rawText,
                         normalized: prev.normalized,
@@ -221,7 +232,7 @@ public enum SerialCandidateRanker {
         let bSeries = BondSeries(fromString: series)
 
         let ranked = candidates.map { cand -> SerialCandidate in
-            var score: Double = 0.0
+            var score = 0.0
             var reasons: [String] = []
 
             // 1. Vision Base Confidence (0-15 pts)
@@ -257,7 +268,7 @@ public enum SerialCandidateRanker {
 
                 // Bonus if prefix matches known denomination
                 let cleanDenom = denomination.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespaces)
-                if !cleanDenom.isEmpty && expectedDenoms.contains(cleanDenom) {
+                if !cleanDenom.isEmpty, expectedDenoms.contains(cleanDenom) {
                     score += 20.0
                     reasons.append("Prefix matches $\(cleanDenom) face value: +20")
                 }
@@ -318,12 +329,12 @@ public enum SerialCandidateRanker {
                     micr.contains("00090007") || micr.contains("00009007") ||
                     (micr.hasPrefix("0000") && micr.contains("9000")))
 
-                if !isRoutingNumber && cand.digits.count >= 8 && micr.count >= 8 {
-                    // Must be actual serial agreement (exact match or full serial containment of >= 9 digits)
-                    if cand.digits == micr || (cand.digits.count == 10 && micr.count >= 9 && cand.digits.contains(micr)) {
-                        score += 30.0
-                        reasons.append("Corroborated by independent MICR serial reading: +30")
-                    }
+                if !isRoutingNumber, cand.digits.count >= 8, micr.count >= 8,
+                   // Must be actual serial agreement (exact match or full serial containment of >= 9 digits)
+                   cand.digits == micr || (cand.digits.count == 10 && micr.count >= 9 && cand.digits.contains(micr))
+                {
+                    score += 30.0
+                    reasons.append("Corroborated by independent MICR serial reading: +30")
                 }
             }
 
