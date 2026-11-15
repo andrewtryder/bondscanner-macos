@@ -1,20 +1,45 @@
 import AppKit
 
+/// Custom window subclass ensuring command key equivalents (⌘S, ⌘⏎, ⌘[, ⌘], ⌘K, etc.)
+/// route reliably through `ReviewWindowController` even when a field editor (`NSTextField`)
+/// or popup button currently holds first-responder focus.
+final class ReviewWindow: NSWindow {
+    weak var reviewController: ReviewWindowController?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if let controller = reviewController, controller.handleKeyEquivalent(event) {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 /// Dedicated side-by-side Review & Correction Window Controller.
 /// Combines full interactive photograph inspection on the left with rich
 /// field correction, duplicate resolution, and keyboard shortcuts on the right.
 final class ReviewWindowController: NSWindowController, NSWindowDelegate, ReviewCoordinatorDelegate, ReviewEditorViewDelegate {
     let coordinator: ReviewCoordinator
     private let splitView = NSSplitView()
-    private let photoView = ReviewPhotoView()
-    private let editorView = ReviewEditorView()
+    let photoView = ReviewPhotoView()
+    let editorView = ReviewEditorView()
 
     var onRecordsChanged: (([BondRecord]) -> Void)?
+    var unsavedChangesPromptHandler: (() -> NSApplication.ModalResponse)?
+    var suppressModalAlerts: Bool = false
+    private(set) var lastErrorAlertMessage: String?
+
+    /// Logic tests exercise the controller and key-routing methods directly. Keeping
+    /// its NSWindow ordered out prevents XCTest from leaving review windows on the
+    /// desktop while preserving the same view/controller behavior under test.
+    private var isRunningUnitTests: Bool {
+        NSClassFromString("XCTestCase") != nil
+            || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
 
     init(coordinator: ReviewCoordinator) {
         self.coordinator = coordinator
 
-        let window = NSWindow(
+        let window = ReviewWindow(
             contentRect: NSRect(x: 100, y: 100, width: 1180, height: 740),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
@@ -25,6 +50,7 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
         window.isReleasedWhenClosed = false
 
         super.init(window: window)
+        window.reviewController = self
         window.delegate = self
 
         coordinator.delegate = self
@@ -85,6 +111,10 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
                 coordinator.selectRecord(id: first.id)
             }
         }
+        guard !isRunningUnitTests else {
+            window?.orderOut(nil)
+            return
+        }
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -103,6 +133,7 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
 
     func reviewCoordinator(_ coordinator: ReviewCoordinator, didUpdateRecords records: [BondRecord]) {
         onRecordsChanged?(records)
+        editorView.updateAIProgress(coordinator.aiProgressText)
     }
 
     func reviewCoordinator(_ coordinator: ReviewCoordinator, didSelectRecord record: BondRecord?) {
@@ -114,27 +145,34 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
         loadRecordIntoViews(rec)
     }
 
+    func reviewCoordinator(_ coordinator: ReviewCoordinator, didUpdateSelectedRecord record: BondRecord) {
+        let candidate = coordinator.findDuplicateCandidate(for: record)
+        editorView.updateExternalRecord(record, candidate: candidate, progress: coordinator.progress)
+    }
+
     func reviewCoordinator(_ coordinator: ReviewCoordinator, didChangeProgress progress: ReviewProgress) {
-        if let rec = coordinator.currentRecord {
-            let cand = coordinator.findDuplicateCandidate(for: rec)
-            editorView.setRecord(rec, candidate: cand, progress: progress)
-        }
+        editorView.updateProgress(progress)
+        editorView.updateAIProgress(coordinator.aiProgressText)
     }
 
     // MARK: - ReviewEditorViewDelegate
 
-    func reviewEditorDidRequestSave(_ editor: ReviewEditorView, andNext: Bool) {
-        guard let current = coordinator.currentRecord else { return }
+    @discardableResult
+    func reviewEditorDidRequestSave(_ editor: ReviewEditorView, andNext: Bool) -> Bool {
+        guard let current = coordinator.currentRecord else { return false }
 
         do {
             if andNext {
-                _ = try coordinator.saveAndNext(
+                let next = try coordinator.saveAndNext(
                     record: current,
                     userEdits: editor.pendingEdits,
                     confirmedFields: editor.pendingConfirmedFields,
                     resolvedReasons: editor.pendingResolvedReasons,
                     acknowledgedWarnings: editor.pendingAcknowledgedWarnings
                 )
+                if next == nil {
+                    editor.showQueueCompleted(message: "All items in this review queue have been reviewed.")
+                }
             } else {
                 _ = try coordinator.saveRecord(
                     record: current,
@@ -144,8 +182,10 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
                     acknowledgedWarnings: editor.pendingAcknowledgedWarnings
                 )
             }
+            return true
         } catch {
             showErrorAlert(title: "Save Failed", message: error.localizedDescription)
+            return false
         }
     }
 
@@ -161,18 +201,21 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
 
     func reviewEditorDidRequestRevert(_ editor: ReviewEditorView) {
         guard let current = coordinator.currentRecord else { return }
+        editor.discardDraft()
         loadRecordIntoViews(current)
     }
 
     func reviewEditorDidRequestReprocess(_ editor: ReviewEditorView) {
         guard let current = coordinator.currentRecord else { return }
         editor.setReprocessing(true)
+        let activeEdits = editor.pendingEdits
 
         Task { @MainActor in
             defer { editor.setReprocessing(false) }
             do {
-                let result = try await coordinator.reprocessPhoto(for: current)
+                let result = try await coordinator.reprocessPhoto(for: current, userActiveEdits: activeEdits)
                 if !result.suggestions.isEmpty {
+                    editor.showSuggestionsBanner(suggestions: result.suggestions)
                     let fields = result.suggestions.map { "\($0.key): \($0.value)" }.joined(separator: ", ")
                     showInfoAlert(title: "Reprocess Completed", message: "Newly detected fields preserved as suggestions for your review: \(fields)")
                 }
@@ -180,6 +223,15 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
                 showErrorAlert(title: "Reprocessing Error", message: error.localizedDescription)
             }
         }
+    }
+
+    func reviewEditorDidRequestAIAnalysis(_ editor: ReviewEditorView) {
+        guard let current = coordinator.currentRecord else { return }
+        coordinator.enqueueAIReview(recordID: current.id, force: true)
+    }
+
+    func reviewEditorDidRequestAnalyzeExistingAI(_ editor: ReviewEditorView) {
+        coordinator.analyzeExistingReviews()
     }
 
     func reviewEditor(_ editor: ReviewEditorView, didResolveReason reason: String) {
@@ -219,13 +271,15 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
 
     func reviewEditor(_ editor: ReviewEditorView, didRequestMergeCandidate candidate: BondRecord) {
         guard let current = coordinator.currentRecord else { return }
-        let alert = NSAlert()
-        alert.messageText = "Confirm Consolidating Same Bond?"
-        alert.informativeText = "This will merge candidate bond #\(candidate.id.prefix(8)) into #\(current.id.prefix(8)). Both photographs will be preserved durably, and user-confirmed values will be kept."
-        alert.addButton(withTitle: "Merge Bonds")
-        alert.addButton(withTitle: "Cancel")
-        let resp = alert.runModal()
-        guard resp == .alertFirstButtonReturn else { return }
+        if !suppressModalAlerts {
+            let alert = NSAlert()
+            alert.messageText = "Confirm Consolidating Same Bond?"
+            alert.informativeText = "This will merge candidate bond #\(candidate.id.prefix(8)) into #\(current.id.prefix(8)). Both photographs will be preserved durably, and user-confirmed values will be kept."
+            alert.addButton(withTitle: "Merge Bonds")
+            alert.addButton(withTitle: "Cancel")
+            let resp = alert.runModal()
+            guard resp == .alertFirstButtonReturn else { return }
+        }
 
         do {
             _ = try coordinator.confirmSameBond(
@@ -246,19 +300,24 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
 
     // MARK: - Keyboard Shortcuts & Navigation Safety
 
-    private func confirmDiscardUnsavedChangesIfNeeded() -> Bool {
+    func confirmDiscardUnsavedChangesIfNeeded() -> Bool {
         guard editorView.hasUnsavedChanges else { return true }
-        let alert = NSAlert()
-        alert.messageText = "Unsaved Changes"
-        alert.informativeText = "You have unsaved field changes on this bond. Save before proceeding?"
-        alert.addButton(withTitle: "Save Changes")
-        alert.addButton(withTitle: "Discard Changes")
-        alert.addButton(withTitle: "Cancel")
-        let resp = alert.runModal()
+        let resp: NSApplication.ModalResponse
+        if let customHandler = unsavedChangesPromptHandler {
+            resp = customHandler()
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "Unsaved Changes"
+            alert.informativeText = "You have unsaved field changes on this bond. Save before proceeding?"
+            alert.addButton(withTitle: "Save Changes")
+            alert.addButton(withTitle: "Discard Changes")
+            alert.addButton(withTitle: "Cancel")
+            resp = alert.runModal()
+        }
         if resp == .alertFirstButtonReturn {
-            reviewEditorDidRequestSave(editorView, andNext: false)
-            return true
+            return reviewEditorDidRequestSave(editorView, andNext: false)
         } else if resp == .alertSecondButtonReturn {
+            editorView.discardDraft()
             return true
         } else {
             return false
@@ -266,6 +325,8 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
     }
 
     private func showErrorAlert(title: String, message: String) {
+        lastErrorAlertMessage = message
+        guard !suppressModalAlerts else { return }
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
@@ -274,6 +335,7 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
     }
 
     private func showInfoAlert(title: String, message: String) {
+        guard !suppressModalAlerts else { return }
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
@@ -281,42 +343,58 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
         alert.runModal()
     }
 
-    /// Handle key shortcuts globally for this window
-    override func keyDown(with event: NSEvent) {
+    /// Routes key equivalents (⌘S, ⌘⏎, ⌘[, ⌘], ⌘K, ⌘P, ⌘R, ⌘T, ⌘=, ⌘-, ⌘0)
+    /// reliably even when a text field or popup button holds focus.
+    @discardableResult
+    func handleKeyEquivalent(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command) else { return false }
 
-        if flags == .command {
-            switch event.charactersIgnoringModifiers {
-            case "s":
-                reviewEditorDidRequestSave(editorView, andNext: false)
-                return
-            case "\r": // Cmd+Return
-                reviewEditorDidRequestSave(editorView, andNext: true)
-                return
-            case "[":
-                reviewEditorDidRequestPrevious(editorView)
-                return
-            case "]":
-                reviewEditorDidRequestNext(editorView)
-                return
-            case "=":
-                photoView.zoomIn()
-                return
-            case "-":
-                photoView.zoomOut()
-                return
-            case "0":
-                photoView.zoomToFit()
-                return
-            case "r":
-                photoView.rotateClockwise()
-                return
-            case "p":
-                reviewEditorDidRequestReprocess(editorView)
-                return
-            default:
-                break
-            }
+        let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        if event.keyCode == 36 || event.keyCode == 76 || chars == "\r" || chars == "\n" {
+            reviewEditorDidRequestSave(editorView, andNext: true)
+            return true
+        }
+
+        switch chars {
+        case "s":
+            reviewEditorDidRequestSave(editorView, andNext: false)
+            return true
+        case "[":
+            reviewEditorDidRequestPrevious(editorView)
+            return true
+        case "]":
+            reviewEditorDidRequestNext(editorView)
+            return true
+        case "k":
+            editorView.confirmCurrentOrAllValidFields()
+            return true
+        case "p":
+            reviewEditorDidRequestReprocess(editorView)
+            return true
+        case "r":
+            photoView.rotateClockwise()
+            return true
+        case "t":
+            photoView.togglePhoto()
+            return true
+        case "=", "+":
+            photoView.zoomIn()
+            return true
+        case "-":
+            photoView.zoomOut()
+            return true
+        case "0":
+            photoView.zoomToFit()
+            return true
+        default:
+            return false
+        }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if handleKeyEquivalent(event) {
+            return
         }
         super.keyDown(with: event)
     }

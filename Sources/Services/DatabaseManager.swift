@@ -549,6 +549,22 @@ final class DatabaseManager {
         }
     }
 
+    /// Atomically updates two records within a single SQLite transaction (e.g. for Keep Separate resolution).
+    /// Either both records persist successfully, or neither does (complete rollback).
+    func atomicUpdateKeepSeparate(recordA: BondRecord, recordB: BondRecord) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try execute("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            try upsertRecordInternal(recordA, sortOrder: nil)
+            try upsertRecordInternal(recordB, sortOrder: nil)
+            try execute("COMMIT;")
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
     /// Creates an atomic online backup of the SQLite database to `destinationURL`.
     /// Validates the created backup with SQLite `integrity_check` before returning.
     ///

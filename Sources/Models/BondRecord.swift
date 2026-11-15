@@ -49,4 +49,8 @@ struct BondRecord: Codable {
     var resolvedReviewReasons: [String]?
     /// ID of potential duplicate / near-match candidate record if known.
     var duplicateCandidateId: String?
+    /// Optimistic concurrency revision counter. Incremented on every mutation.
+    var revision: Int?
+    /// Unverified, local-only AI review output. It is intentionally separate from bond fields.
+    var aiAnalysis: BondAIAnalysis?
 }

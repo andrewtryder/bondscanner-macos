@@ -93,8 +93,6 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var stableFrames = 0
     private var lastAnalyzeAt: TimeInterval = 0
     private var keyMonitor: Any?
-    private var aiPending: [UUID] = []
-    private var aiBusy = false
     private let cameraQueue = DispatchQueue(label: "bondscanner.camera", qos: .userInitiated)
     private let analysisQueue = DispatchQueue(label: "bondscanner.analysis", qos: .userInitiated)
     private let ocrQueue = DispatchQueue(label: "bondscanner.ocr", qos: .userInitiated)
@@ -231,6 +229,27 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         fileMenu.addItem(exportCSVMenuItem)
         fileItem.submenu = fileMenu
         bar.addItem(fileItem)
+        let reviewAIItem = NSMenuItem(title: "On-Device AI", action: nil, keyEquivalent: "")
+        let reviewAIMenu = NSMenu(title: "On-Device AI")
+        let automaticAI = NSMenuItem(title: "Automatically Analyze REVIEW Records", action: #selector(toggleAutomaticAIReview(_:)), keyEquivalent: "")
+        automaticAI.target = self
+        automaticAI.state = ReviewCoordinator.automaticAIEnabled ? .on : .off
+        automaticAI.toolTip = "Uses Apple’s on-device model only. It creates unverified suggestions and never changes bond fields automatically."
+        reviewAIMenu.addItem(automaticAI)
+        let analyzeBacklog = NSMenuItem(title: "Analyze Existing Reviews", action: #selector(analyzeExistingReviews), keyEquivalent: "")
+        analyzeBacklog.target = self
+        reviewAIMenu.addItem(analyzeBacklog)
+        let pauseAI = NSMenuItem(title: "Pause AI Review Queue", action: #selector(pauseAIReviewQueue), keyEquivalent: "")
+        pauseAI.target = self
+        reviewAIMenu.addItem(pauseAI)
+        let resumeAI = NSMenuItem(title: "Resume AI Review Queue", action: #selector(resumeAIReviewQueue), keyEquivalent: "")
+        resumeAI.target = self
+        reviewAIMenu.addItem(resumeAI)
+        let cancelAI = NSMenuItem(title: "Cancel AI Review Queue", action: #selector(cancelAIReviewQueue), keyEquivalent: "")
+        cancelAI.target = self
+        reviewAIMenu.addItem(cancelAI)
+        reviewAIItem.submenu = reviewAIMenu
+        bar.addItem(reviewAIItem)
         let debugItem = NSMenuItem()
         let debugMenu = NSMenu(title: "Debug")
         let open = NSMenuItem(title: "Open Debug Log", action: #selector(openDebugLog), keyEquivalent: "")
@@ -255,6 +274,23 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     @objc private func openReviewWorkflow() {
         reviewWindowController?.showReviewWindow(selectingRecordId: nil, filter: .allReview)
     }
+
+    @objc private func toggleAutomaticAIReview(_ sender: NSMenuItem) {
+        ReviewCoordinator.automaticAIEnabled.toggle()
+        sender.state = ReviewCoordinator.automaticAIEnabled ? .on : .off
+        status(ReviewCoordinator.automaticAIEnabled
+            ? "On-device AI will prepare suggestions for new REVIEW records."
+            : "Automatic on-device AI review is off. Manual analysis remains available.")
+    }
+
+    @objc private func analyzeExistingReviews() {
+        reviewWindowController?.coordinator.analyzeExistingReviews()
+        reviewWindowController?.showReviewWindow(selectingRecordId: nil, filter: .allReview)
+    }
+
+    @objc private func pauseAIReviewQueue() { reviewWindowController?.coordinator.pauseAIReview() }
+    @objc private func resumeAIReviewQueue() { reviewWindowController?.coordinator.resumeAIReview() }
+    @objc private func cancelAIReviewQueue() { reviewWindowController?.coordinator.cancelAIReview() }
 
     @objc private func refocusCamera() {
         guard let camera = captureDevice else { status("No webcam available to refocus."); return }
@@ -1426,8 +1462,10 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         preview.captureFlash(color: flash)
         status(message)
         emptyFrames = 0
-        if contributed {
-            enrichRecordInBackground(record)
+        // AI is suggestion-only and queued after normal OCR/capture has completed.
+        // It never runs on the capture or Vision queues.
+        if contributed, record.status == "REVIEW" {
+            reviewWindowController?.coordinator.automaticallyReviewIfEligible(record)
         }
         if automatic {
             if isNew {
@@ -1765,50 +1803,6 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         }
     }
 
-    private func enrichRecordInBackground(_ record: BondRecord) {
-        #if canImport(FoundationModels)
-            if #available(macOS 26.0, *), SystemLanguageModel.default.isAvailable,
-               let id = UUID(uuidString: record.id)
-            {
-                aiPending.append(id)
-                processNextAIRecord()
-            }
-        #endif
-    }
-
-    private func processNextAIRecord() {
-        #if canImport(FoundationModels)
-            guard !aiBusy, !aiPending.isEmpty, #available(macOS 26.0, *) else { return }
-            let id = aiPending.removeFirst().uuidString
-            guard let record = records.first(where: { $0.id == id }) else {
-                processNextAIRecord()
-                return
-            }
-            aiBusy = true
-            Task {
-                let updated = await enrichWithAppleIntelligence(record)
-                await MainActor.run {
-                    if let index = self.records.firstIndex(where: { $0.id == updated.id }) {
-                        var current = self.records[index]
-                        // Do not clobber user-confirmed or already populated fields with lower confidence
-                        _ = mergeBondRecord(from: updated, into: &current,
-                                            contributingPhoto: current.photo,
-                                            contributingSource: current.sourcePhoto,
-                                            captureId: current.id)
-                        self.records[index] = current
-                        do {
-                            try saveRecordLive(current, allRecords: self.records, sortOrder: index)
-                            self.updateCount()
-                        } catch {
-                            self.status("AI update could not be saved: \(error.localizedDescription)")
-                        }
-                    }
-                    self.aiBusy = false
-                    self.processNextAIRecord()
-                }
-            }
-        #endif
-    }
 
     private func updateCount() {
         let processing = records.filter { $0.status == "PROCESSING" }.count

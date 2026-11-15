@@ -388,7 +388,6 @@ final class BondScannerTests: XCTestCase {
         // Part 2: INJECT FAILURE to test genuine SQLite transaction rollback
         // Install a trigger that aborts transactions on bonds updates when id == 'rec-A'
         let createTriggerSQL = "CREATE TRIGGER fail_rollback_injection BEFORE INSERT ON bonds WHEN NEW.id = 'rec-A' BEGIN SELECT RAISE(ABORT, 'injected transaction failure'); END;"
-        var stmt: OpaquePointer?
         // Open low-level connection to execute DDL trigger
         var rawHandle: OpaquePointer?
         XCTAssertEqual(sqlite3_open_v2(dbURL.path, &rawHandle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)

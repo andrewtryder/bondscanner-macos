@@ -1,5 +1,54 @@
 import Foundation
 
+/// Versioned, review-only output from the on-device model. None of these values are
+/// treated as verified facts until the reviewer saves an explicit edit.
+struct BondAIAnalysis: Codable, Equatable {
+    static let currentPromptVersion = "bond-review-v1"
+    var recordID: String
+    var recordRevision: Int
+    var analyzedAt: Date
+    var runtime: String
+    var promptVersion: String
+    var status: Status
+    var suggestions: [BondAISuggestion]
+    var summary: String
+    var failureKind: String?
+
+    enum Status: String, Codable { case ready, abstained, unavailable, failed, cancelled }
+
+    var isCurrentForRecord: Bool {
+        recordRevision >= 0 && promptVersion == Self.currentPromptVersion && status == .ready ||
+            (promptVersion == Self.currentPromptVersion && status == .abstained)
+    }
+}
+
+struct BondAISuggestion: Codable, Equatable, Identifiable {
+    enum Assessment: String, Codable, CaseIterable { case strongEvidence, conflictingEvidence, insufficientEvidence }
+    var id: String { field }
+    var field: String
+    var existingValue: String
+    var proposedValue: String?
+    var abstained: Bool
+    var evidence: String
+    var imageRegion: String?
+    var ambiguity: String
+    var assessment: Assessment
+    var requiresOriginalInspection: Bool
+}
+
+/// Dependency boundary used by tests and by the queue. Implementations must never
+/// mutate a `BondRecord`; they only return an analysis envelope.
+protocol BondAIAnalyzing: Sendable {
+    func analyze(record: BondRecord, imageURL: URL) async -> BondAIAnalysis
+}
+
+struct UnavailableBondAIAnalyzer: BondAIAnalyzing {
+    let reason: String
+    func analyze(record: BondRecord, imageURL: URL) async -> BondAIAnalysis {
+        BondAIAnalysis(recordID: record.id, recordRevision: record.revision ?? 0, analyzedAt: Date(), runtime: "unavailable", promptVersion: BondAIAnalysis.currentPromptVersion, status: .unavailable, suggestions: [], summary: "On-device AI analysis is unavailable. Manual review remains available.", failureKind: reason)
+    }
+}
+
 /// Filter categories for the Review queue and drawer.
 enum ReviewFilterCategory: String, CaseIterable {
     case all = "All Records"
@@ -65,7 +114,7 @@ enum ReviewFilterCategory: String, CaseIterable {
             }
             let hasNearMatchReason = (record.reviewReasons ?? []).contains { $0.hasPrefix("near_match") }
             let hasNearMatchNote = record.notes.lowercased().contains("near-match")
-            let isResolved = (record.resolvedReviewReasons ?? []).contains("near_match")
+            let isResolved = (record.resolvedReviewReasons ?? []).contains { $0 == "near_match" || $0.hasPrefix("keep_separate:") || $0.hasPrefix("near_match:") }
             return (hasNearMatchReason || hasNearMatchNote) && !isResolved
 
         case .validationErrors:

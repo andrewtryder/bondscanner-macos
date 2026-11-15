@@ -17,8 +17,12 @@ final class ReviewPhotoView: NSView {
 
     private var originalImage: NSImage?
     private var processedImage: NSImage?
-    private var showingProcessed = false
-    private var rotationQuarterTurns: Int = 0 // 0, 1, 2, 3 -> 0, 90, 180, 270 degrees
+    private(set) var showingProcessed = false
+    private(set) var rotationQuarterTurns: Int = 0 // 0, 1, 2, 3 -> 0, 90, 180, 270 degrees
+
+    var currentZoomScale: CGFloat {
+        innerImageView.currentZoomScale
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -180,10 +184,14 @@ final class ReviewPhotoView: NSView {
         rotateClockwise()
     }
 
-    @objc private func togglePhotoClicked() {
+    func togglePhoto() {
         showingProcessed.toggle()
         togglePhotoBtn.title = showingProcessed ? "Photo: Processed" : "Photo: Original"
         displayActiveImage(fitInitially: false)
+    }
+
+    @objc private func togglePhotoClicked() {
+        togglePhoto()
     }
 
     private func updateZoomLabel(_ scale: CGFloat) {
@@ -208,6 +216,10 @@ private final class ZoomableImageView: NSView {
     private var image: NSImage?
     private var quarterTurns: Int = 0
     private var zoomScale: CGFloat = 1.0
+
+    var currentZoomScale: CGFloat {
+        zoomScale
+    }
 
     private var dragStartLocation: NSPoint?
     private var dragStartOrigin: NSPoint?

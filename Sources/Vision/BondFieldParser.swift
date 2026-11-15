@@ -104,6 +104,23 @@ func findNearMatchRecord(_ incoming: BondRecord, in records: [BondRecord], exclu
         if existing.id == incoming.id {
             continue
         }
+        // Skip pairs that have already been resolved to keep separate
+        let incomingResolved = incoming.resolvedReviewReasons ?? []
+        let existingResolved = existing.resolvedReviewReasons ?? []
+        let incomingHasResolvedPair = incomingResolved.contains(where: { key in
+            guard key.hasPrefix("keep_separate:") else { return false }
+            let cand = key.replacingOccurrences(of: "keep_separate:", with: "").trimmingCharacters(in: .whitespaces)
+            return cand == existing.id || existing.id.hasPrefix(cand) || cand.hasPrefix(existing.id)
+        })
+        let existingHasResolvedPair = existingResolved.contains(where: { key in
+            guard key.hasPrefix("keep_separate:") else { return false }
+            let cand = key.replacingOccurrences(of: "keep_separate:", with: "").trimmingCharacters(in: .whitespaces)
+            return cand == incoming.id || incoming.id.hasPrefix(cand) || cand.hasPrefix(incoming.id)
+        })
+        if incomingHasResolvedPair || existingHasResolvedPair {
+            continue
+        }
+
         let existingSerial = normalizeSerial(existing.serial)
         guard !existingSerial.isEmpty, !validatedSerial(existing.serial, series: existing.series).value.isEmpty else { continue }
         let match = serialsMatchForMerge(incoming.serial, existing.serial)
@@ -354,7 +371,8 @@ func applyRequiredStatus(_ record: inout BondRecord) {
     reasons = reasons.filter { !$0.hasPrefix("validation:") && !$0.hasPrefix("missing_required:") }
 
     // If notes historically indicated a near-match, ensure it is recorded in structured reasons
-    if record.notes.contains("Near-match") || record.notes.contains("near-match"), !resolved.contains("near_match"), !reasons.contains(where: { $0.hasPrefix("near_match") }) {
+    let hasResolvedNearMatchOrKeepSeparate = resolved.contains("near_match") || resolved.contains(where: { $0.hasPrefix("keep_separate:") || $0.hasPrefix("near_match:") })
+    if record.notes.contains("Near-match") || record.notes.contains("near-match"), !hasResolvedNearMatchOrKeepSeparate, !reasons.contains(where: { $0.hasPrefix("near_match") }) {
         reasons.insert("near_match")
     }
 
@@ -381,6 +399,20 @@ func applyRequiredStatus(_ record: inout BondRecord) {
     // Remove any explicitly resolved reasons
     for r in resolved {
         reasons.remove(r)
+        if r.hasPrefix("keep_separate:") || r.hasPrefix("near_match:") {
+            let candId = r.replacingOccurrences(of: "keep_separate:", with: "")
+                .replacingOccurrences(of: "near_match:", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            reasons = reasons.filter { reason in
+                if reason.hasPrefix("near_match: \(candId)") || reason == "near_match: \(candId)" || reason.hasPrefix("near_match:\(candId)") {
+                    return false
+                }
+                return true
+            }
+        }
+    }
+    if resolved.contains("near_match") || !reasons.contains(where: { $0.hasPrefix("near_match:") }), resolved.contains(where: { $0.hasPrefix("keep_separate:") || $0.hasPrefix("near_match") }) {
+        reasons.remove("near_match")
     }
 
     record.reviewReasons = reasons.isEmpty ? nil : Array(reasons).sorted()
