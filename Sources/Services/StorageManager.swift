@@ -134,6 +134,61 @@ func isProductionStorageProtected(destination: URL) -> Bool {
         || destPath == defaultHomeProd || destPath.hasPrefix(defaultHomeProd + "/")
 }
 
+enum PathSecurity {
+    /// Validates that `relativePath` is strictly relative, contains no path traversal (..),
+    /// no leading slash, and when resolved against `baseDirectory`, remains strictly within `baseDirectory`
+    /// without escaping via symlinks.
+    @discardableResult
+    static func validateSafeRelativePath(_ relativePath: String, within baseDirectory: URL) throws -> URL {
+        let trimmed = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw DatabaseError.restoreFailed("Empty path is invalid")
+        }
+        guard !trimmed.hasPrefix("/") else {
+            throw DatabaseError.restoreFailed("Absolute paths are rejected: \(trimmed)")
+        }
+        let components = trimmed.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        if components.contains("..") || components.contains(".") || components.contains("") {
+            throw DatabaseError.restoreFailed("Path traversal or malformed components rejected: \(trimmed)")
+        }
+
+        let combinedURL = baseDirectory.appendingPathComponent(trimmed).standardized
+
+        // Walk backwards to find closest existing ancestor to reliably resolve symlinks
+        // even when trailing destination components do not exist yet.
+        var curr = combinedURL
+        var unverified: [String] = []
+        while !FileManager.default.fileExists(atPath: curr.path), curr.path != "/" {
+            unverified.insert(curr.lastPathComponent, at: 0)
+            curr = curr.deletingLastPathComponent()
+        }
+        var resolvedCombined = curr.resolvingSymlinksInPath().standardized
+        for c in unverified {
+            resolvedCombined = resolvedCombined.appendingPathComponent(c)
+        }
+        resolvedCombined = resolvedCombined.standardized
+
+        let resolvedBase = baseDirectory.resolvingSymlinksInPath().standardized
+        let basePrefix = resolvedBase.path.hasSuffix("/") ? resolvedBase.path : resolvedBase.path + "/"
+        guard resolvedCombined.path.hasPrefix(basePrefix) || resolvedCombined.path == resolvedBase.path else {
+            throw DatabaseError.restoreFailed("Path resolves outside base directory: \(trimmed)")
+        }
+        return combinedURL
+    }
+
+    /// Verifies that a filename contains no directory separators or traversal components.
+    static func validateSafeFilename(_ filename: String) throws -> String {
+        let trimmed = filename.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw DatabaseError.restoreFailed("Filename cannot be empty")
+        }
+        guard !trimmed.contains("/") && !trimmed.contains("\\") && !trimmed.contains("..") else {
+            throw DatabaseError.restoreFailed("Invalid filename containing path separators or traversal: \(trimmed)")
+        }
+        return trimmed
+    }
+}
+
 func addAssociatedPhotos(to record: inout BondRecord, newPhotos: [String]) {
     var existing = Set(record.associatedPhotos ?? [])
     for p in newPhotos where !p.isEmpty {
@@ -192,33 +247,39 @@ func safelyTrashPhotographs(
         }
     }
 
+    var photosToTrash: [(rel: String, url: URL)] = []
+
     for rel in candidatePhotos {
-        // Authoritative database check if database is available; otherwise fallback to in-memory array
+        // Authoritative database check if database is available; otherwise fallback to in-memory array.
+        // MUST NOT fail open: any database error must propagate and prevent deletion.
         if let db = database {
-            if (try? db.isPhotographReferenced(rel, excludingRecordId: record.id)) == true {
+            let isReferenced = try db.isPhotographReferenced(rel, excludingRecordId: record.id)
+            if isReferenced {
                 continue
             }
         } else if isPhotographReferenced(rel, excludingRecordId: record.id, among: existingRecords) {
             continue
         }
 
-        let url = rel.hasPrefix("/") ? URL(fileURLWithPath: rel).standardized : root.appendingPathComponent(rel).standardized
-        // Ensure path remains strictly inside the intended storage root (prevent path traversal)
-        guard url.path.hasPrefix(root.standardized.path) else {
-            ScanLog.shared.write("Attempted photograph path traversal prevented: \(rel)")
+        // Strict path validation: reject absolute paths, .. traversal, and symlink escapes outside root.
+        // Requires directory boundary matching to prevent matching similarly named sibling directories.
+        guard let url = try? PathSecurity.validateSafeRelativePath(rel, within: root) else {
+            ScanLog.shared.write("Attempted unsafe photograph path rejected: \(rel)")
             continue
         }
         if isProductionStorageProtected(destination: url) {
             throw StorageError.productionAccessForbidden("Cannot trash production photograph in test mode: \(url.path)")
         }
 
-        if FileManager.default.fileExists(atPath: url.path) {
-            do {
-                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-                trashed.append(rel)
-            } catch {
-                ScanLog.shared.write("trashItem failed for \(rel): \(error.localizedDescription)")
-            }
+        photosToTrash.append((rel: rel, url: url))
+    }
+
+    for item in photosToTrash where FileManager.default.fileExists(atPath: item.url.path) {
+        do {
+            try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
+            trashed.append(item.rel)
+        } catch {
+            ScanLog.shared.write("trashItem failed for \(item.rel): \(error.localizedDescription)")
         }
     }
     return trashed

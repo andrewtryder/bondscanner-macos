@@ -574,7 +574,9 @@ final class DataSafetyAndRetentionTests: XCTestCase {
     func testRestoreFailsOnMalformedRecordJSON() throws {
         let badDBURL = tempDir.appendingPathComponent("malformed_json.sqlite3")
         let badDB = try DatabaseManager(url: badDBURL)
-        try badDB.execute("INSERT INTO bonds (id, sort_order, captured_at, updated_at, record_json) VALUES ('bad-1', 1, 'now', 'now', 'NOT_VALID_JSON');")
+        let sensitiveJSON = "{ \"id\": \"bad-1\", \"owner\": \"CONFIDENTIAL_NAME\", \"serial\": \"SECRET_SERIAL_999\" INVALID_SYNTAX"
+        let escaped = sensitiveJSON.replacingOccurrences(of: "'", with: "''")
+        try badDB.execute("INSERT INTO bonds (id, sort_order, captured_at, updated_at, record_json) VALUES ('bad-1', 1, 'now', 'now', '\(escaped)');")
 
         let badBackupDir = tempDir.appendingPathComponent("bad_backup_dir", isDirectory: true)
         try FileManager.default.createDirectory(at: badBackupDir, withIntermediateDirectories: true)
@@ -593,11 +595,223 @@ final class DataSafetyAndRetentionTests: XCTestCase {
         let restorePhotosDir = tempDir.appendingPathComponent("photos_fail", isDirectory: true)
 
         XCTAssertThrowsError(try testDb.restoreCollection(from: badBackupDir, destinationDBURL: restoreDBURL, destinationPhotosDir: restorePhotosDir, authorized: true)) { error in
-            guard let dbError = error as? DatabaseError, case .restoreFailed = dbError else {
+            guard let dbError = error as? DatabaseError, case let .restoreFailed(msg) = dbError else {
                 XCTFail("Expected DatabaseError.restoreFailed, got: \(error)")
                 return
             }
+            XCTAssertTrue(msg.contains("index 1"), "Error message should report record index: \(msg)")
+            XCTAssertFalse(msg.contains("CONFIDENTIAL_NAME"), "Error message MUST NOT leak private owner data: \(msg)")
+            XCTAssertFalse(msg.contains("SECRET_SERIAL_999"), "Error message MUST NOT leak serial number: \(msg)")
         }
+    }
+
+    func testBackupPublicationFailurePreservesExistingValidBackup() throws {
+        let backupDestDir = tempDir.appendingPathComponent("publication_test_dest", isDirectory: true)
+        try FileManager.default.createDirectory(at: backupDestDir, withIntermediateDirectories: true)
+
+        // 1. Create a valid original backup generation at backupDestDir
+        let (_, relPhoto1) = createDummyImageFile(named: "gen1_photo.jpg")
+        let rec1 = makeRecord(id: "rec-gen1", serial: "GEN1-11111EE", photo: relPhoto1)
+        let db1URL = tempDir.appendingPathComponent("db_gen1.sqlite3")
+        let db1 = try DatabaseManager(url: db1URL)
+        try db1.upsertRecord(rec1)
+        try db1.backupCollection(to: backupDestDir, photosSourceDir: testPhotosDir)
+
+        // Verify generation 1 backup exists and is valid
+        let publishedManifestURL = backupDestDir.appendingPathComponent("backup_manifest.json")
+        let publishedDBURL = backupDestDir.appendingPathComponent("bonds.sqlite3")
+        let publishedPhoto1URL = backupDestDir.appendingPathComponent(relPhoto1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: publishedManifestURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: publishedDBURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: publishedPhoto1URL.path))
+        let gen1Records = try DatabaseManager.loadRecordsFromSnapshot(at: publishedDBURL)
+        XCTAssertEqual(gen1Records.count, 1)
+        XCTAssertEqual(gen1Records.first?.id, "rec-gen1")
+
+        // 2. Attempt a second backup from a different collection with injected failure during publication
+        let (_, relPhoto2) = createDummyImageFile(named: "gen2_photo.jpg")
+        let rec2 = makeRecord(id: "rec-gen2", serial: "GEN2-22222EE", photo: relPhoto2)
+        let db2URL = tempDir.appendingPathComponent("db_gen2.sqlite3")
+        let db2 = try DatabaseManager(url: db2URL)
+        try db2.upsertRecord(rec2)
+
+        XCTAssertThrowsError(
+            try db2.backupCollection(
+                to: backupDestDir,
+                photosSourceDir: testPhotosDir,
+                _injectedFailureDuringPublication: true
+            )
+        )
+
+        // 3. Verify generation 1 backup was preserved completely and not corrupted or deleted
+        XCTAssertTrue(FileManager.default.fileExists(atPath: publishedManifestURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: publishedDBURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: publishedPhoto1URL.path))
+        // Verify gen2 photo was rolled back / not present
+        let publishedPhoto2URL = backupDestDir.appendingPathComponent(relPhoto2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: publishedPhoto2URL.path))
+
+        // Verify published DB in destination still contains gen1 records
+        let restoredGen1Records = try DatabaseManager.loadRecordsFromSnapshot(at: publishedDBURL)
+        XCTAssertEqual(restoredGen1Records.count, 1)
+        XCTAssertEqual(restoredGen1Records.first?.id, "rec-gen1")
+        XCTAssertEqual(restoredGen1Records.first?.serial, "GEN1-11111EE")
+    }
+
+    func testSafelyTrashPhotographsFailsClosedOnDatabaseError() throws {
+        let (photoURL, relPhoto) = createDummyImageFile(named: "fail_closed_photo.jpg")
+        let rec = makeRecord(id: "rec-fail-closed", photo: relPhoto)
+        try testDb.upsertRecord(rec)
+
+        // Close active database handle to simulate SQLite error/unavailability
+        let brokenDBURL = tempDir.appendingPathComponent("broken.sqlite3")
+        let brokenDB = try DatabaseManager(url: brokenDBURL)
+        brokenDB.close()
+
+        let candidate = makeRecord(id: "rec-del", photo: relPhoto)
+        XCTAssertThrowsError(
+            try safelyTrashPhotographs(
+                for: candidate,
+                existingRecords: [],
+                database: brokenDB,
+                root: StorageConfiguration.shared.outputRoot
+            )
+        )
+
+        // Verify photo was NOT deleted (failed closed)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: photoURL.path), "Photograph must not be deleted when database check fails")
+    }
+
+    func testSafelyTrashPhotographsRejectsSiblingDirectory() throws {
+        let fakeRoot = tempDir.appendingPathComponent("fake_storage_root", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeRoot, withIntermediateDirectories: true)
+
+        let siblingDir = tempDir.appendingPathComponent("fake_storage_root_sibling", isDirectory: true)
+        try FileManager.default.createDirectory(at: siblingDir, withIntermediateDirectories: true)
+        let siblingPhoto = siblingDir.appendingPathComponent("secret.jpg")
+        try Data("SIBLING".utf8).write(to: siblingPhoto)
+
+        let record = makeRecord(id: "rec-sibling", photo: "../fake_storage_root_sibling/secret.jpg")
+        let trashed = try safelyTrashPhotographs(for: record, existingRecords: [], database: testDb, root: fakeRoot)
+        XCTAssertTrue(trashed.isEmpty, "Sibling directory photo must not be trashed")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: siblingPhoto.path))
+    }
+
+    func testRestorePreStagingFailureReopensActiveDatabase() throws {
+        let (origPhotoURL, relOrigPhoto) = createDummyImageFile(named: "orig_prestaging.jpg")
+        let origRec = makeRecord(id: "rec-orig-pre", serial: "ORIG-PRE-111", photo: relOrigPhoto)
+        try testDb.upsertRecord(origRec)
+
+        // Create a valid backup
+        let backupDir = tempDir.appendingPathComponent("valid_backup_for_prestaging", isDirectory: true)
+        try testDb.backupCollection(to: backupDir, photosSourceDir: testPhotosDir)
+
+        // Restore with injected failure right after closing handle during pre-staging
+        XCTAssertThrowsError(
+            try testDb.restoreCollection(
+                from: backupDir,
+                destinationDBURL: testDbURL,
+                destinationPhotosDir: testPhotosDir,
+                authorized: true,
+                _injectedPreRestoreFailure: true
+            )
+        )
+
+        // Verify active database connection was reopened and is still fully functional
+        let loaded = try testDb.loadAllRecords()
+        XCTAssertEqual(loaded.count, 1)
+        XCTAssertEqual(loaded.first?.id, "rec-orig-pre")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: origPhotoURL.path))
+    }
+
+    func testStrictPathValidationRejectsTraversalAndSymlinkEscapes() throws {
+        let baseDir = tempDir.appendingPathComponent("path_sec_base", isDirectory: true)
+        try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
+
+        // Absolute path rejected
+        XCTAssertThrowsError(try PathSecurity.validateSafeRelativePath("/etc/passwd", within: baseDir))
+
+        // Traversal rejected
+        XCTAssertThrowsError(try PathSecurity.validateSafeRelativePath("../outside.txt", within: baseDir))
+        XCTAssertThrowsError(try PathSecurity.validateSafeRelativePath("photos/../../outside.txt", within: baseDir))
+
+        // Symlink escape rejected
+        let outsideDir = tempDir.appendingPathComponent("outside_dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+        let symlinkInBase = baseDir.appendingPathComponent("symlink_escape")
+        try FileManager.default.createSymbolicLink(at: symlinkInBase, withDestinationURL: outsideDir)
+
+        XCTAssertThrowsError(try PathSecurity.validateSafeRelativePath("symlink_escape/secret.txt", within: baseDir))
+
+        // Invalid filenames rejected
+        XCTAssertThrowsError(try PathSecurity.validateSafeFilename("../evil.sqlite3"))
+        XCTAssertThrowsError(try PathSecurity.validateSafeFilename("sub/evil.sqlite3"))
+        XCTAssertThrowsError(try PathSecurity.validateSafeFilename("/evil.sqlite3"))
+        XCTAssertEqual(try PathSecurity.validateSafeFilename("bonds.sqlite3"), "bonds.sqlite3")
+    }
+
+    func testBackupRejectsPathTraversalInRecordPhotos() throws {
+        let traversalRec = makeRecord(id: "rec-trav", serial: "TRAV12345EE", photo: "../../secret.jpg")
+        try testDb.upsertRecord(traversalRec)
+
+        let backupDir = tempDir.appendingPathComponent("trav_backup_dest", isDirectory: true)
+        XCTAssertThrowsError(try testDb.backupCollection(to: backupDir, photosSourceDir: testPhotosDir))
+    }
+
+    func testRestoreRejectsManifestWithTraversalOrEscape() throws {
+        let validBackupDir = tempDir.appendingPathComponent("valid_backup_sec", isDirectory: true)
+        let (_, relPhoto) = createDummyImageFile(named: "sec_test.jpg")
+        let rec = makeRecord(id: "rec-sec", serial: "SEC123456EE", photo: relPhoto)
+        let secDBURL = tempDir.appendingPathComponent("sec_db.sqlite3")
+        let secDB = try DatabaseManager(url: secDBURL)
+        try secDB.upsertRecord(rec)
+        try secDB.backupCollection(to: validBackupDir, photosSourceDir: testPhotosDir)
+
+        // Tamper manifest databaseFileName with path traversal
+        let manifestURL = validBackupDir.appendingPathComponent("backup_manifest.json")
+        let manifestData = try Data(contentsOf: manifestURL)
+        var manifest = try JSONDecoder().decode(CollectionBackupManifest.self, from: manifestData)
+        manifest = CollectionBackupManifest(
+            timestamp: manifest.timestamp,
+            schemaVersion: manifest.schemaVersion,
+            recordCount: manifest.recordCount,
+            databaseFileName: "../escaped.sqlite3",
+            photoFiles: manifest.photoFiles
+        )
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+
+        let restoreDBURL = tempDir.appendingPathComponent("sec_restore.sqlite3")
+        let restorePhotosDir = tempDir.appendingPathComponent("sec_photos", isDirectory: true)
+
+        XCTAssertThrowsError(
+            try testDb.restoreCollection(
+                from: validBackupDir,
+                destinationDBURL: restoreDBURL,
+                destinationPhotosDir: restorePhotosDir,
+                authorized: true
+            )
+        )
+    }
+
+    func testBackupDerivesInventoryDirectlyFromSnapshot() throws {
+        let (photoURL, relPhoto) = createDummyImageFile(named: "snapshot_derive.jpg")
+        let rec = makeRecord(id: "rec-snap", serial: "SNAP12345EE", photo: relPhoto)
+        try testDb.upsertRecord(rec)
+
+        let backupDir = tempDir.appendingPathComponent("snapshot_derive_backup", isDirectory: true)
+        try testDb.backupCollection(to: backupDir, photosSourceDir: testPhotosDir)
+
+        let manifestURL = backupDir.appendingPathComponent("backup_manifest.json")
+        let manifestData = try Data(contentsOf: manifestURL)
+        let manifest = try JSONDecoder().decode(CollectionBackupManifest.self, from: manifestData)
+
+        let backupDBURL = backupDir.appendingPathComponent("bonds.sqlite3")
+        let snapshotRecords = try DatabaseManager.loadRecordsFromSnapshot(at: backupDBURL)
+
+        XCTAssertEqual(manifest.recordCount, snapshotRecords.count)
+        XCTAssertEqual(manifest.photoFiles, [relPhoto])
+        XCTAssertEqual(snapshotRecords.first?.id, "rec-snap")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: photoURL.path))
     }
 
     // MARK: - 4. Issue-Date OCR Multi-line and Dating Stamp Logic

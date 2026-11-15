@@ -133,13 +133,17 @@ final class DatabaseManager {
         try configurePragmasAndSchema()
     }
 
-    deinit {
+    func close() {
         lock.lock()
-        if let db = db {
-            sqlite3_close_v2(db)
+        defer { lock.unlock() }
+        if let active = db {
+            sqlite3_close_v2(active)
             self.db = nil
         }
-        lock.unlock()
+    }
+
+    deinit {
+        close()
     }
 
     /// Validates SQLite database integrity at the specified URL using `PRAGMA integrity_check`.
@@ -444,25 +448,35 @@ final class DatabaseManager {
             try bindText(stmt, index: 5, value: excl)
         }
 
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let jsonCStr = sqlite3_column_text(stmt, 1) else { continue }
-            let jsonString = String(cString: jsonCStr)
-            guard let data = jsonString.data(using: .utf8),
-                  let record = try? decoder.decode(BondRecord.self, from: data)
-            else {
-                if jsonString.contains(normalized) {
+        while true {
+            let step = sqlite3_step(stmt)
+            if step == SQLITE_ROW {
+                guard let jsonCStr = sqlite3_column_text(stmt, 1) else {
+                    // Fail closed if record JSON is unexpectedly null
                     return true
                 }
-                continue
-            }
-            if record.photo == normalized || record.sourcePhoto == normalized {
-                return true
-            }
-            if let assoc = record.associatedPhotos, assoc.contains(normalized) {
-                return true
-            }
-            if let fieldPhotos = record.fieldPhoto, fieldPhotos.values.contains(normalized) {
-                return true
+                let jsonString = String(cString: jsonCStr)
+                guard let data = jsonString.data(using: .utf8),
+                      let record = try? decoder.decode(BondRecord.self, from: data)
+                else {
+                    if jsonString.contains(normalized) {
+                        return true
+                    }
+                    throw DatabaseError.invalidRecordJSON
+                }
+                if record.photo == normalized || record.sourcePhoto == normalized {
+                    return true
+                }
+                if let assoc = record.associatedPhotos, assoc.contains(normalized) {
+                    return true
+                }
+                if let fieldPhotos = record.fieldPhoto, fieldPhotos.values.contains(normalized) {
+                    return true
+                }
+            } else if step == SQLITE_DONE {
+                break
+            } else {
+                throw sqliteError(code: step, context: "isPhotographReferenced step")
             }
         }
         return false
@@ -903,10 +917,54 @@ struct CollectionBackupManifest: Codable, Equatable {
 }
 
 extension DatabaseManager {
+    /// Reads and decodes all BondRecords directly from a SQLite snapshot database.
+    /// Ensures that backup manifests and photograph references correspond exactly to the database snapshot.
+    static func loadRecordsFromSnapshot(at snapshotURL: URL) throws -> [BondRecord] {
+        var inspectHandle: OpaquePointer?
+        let inspectRc = sqlite3_open_v2(snapshotURL.path, &inspectHandle, SQLITE_OPEN_READONLY, nil)
+        guard inspectRc == SQLITE_OK, let h = inspectHandle else {
+            throw DatabaseError.openFailed("Cannot inspect backup snapshot database: code \(inspectRc)")
+        }
+        defer { sqlite3_close_v2(h) }
+
+        var inspectStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(h, "SELECT record_json FROM bonds;", -1, &inspectStmt, nil) == SQLITE_OK, let s = inspectStmt else {
+            throw DatabaseError.statementFailed("Failed to read records from backup snapshot")
+        }
+        defer { sqlite3_finalize(s) }
+
+        var records: [BondRecord] = []
+        let jsonDecoder = JSONDecoder()
+        var recordIndex = 0
+        while true {
+            let step = sqlite3_step(s)
+            if step == SQLITE_ROW {
+                recordIndex += 1
+                guard let cStr = sqlite3_column_text(s, 0) else {
+                    throw DatabaseError.statementFailed("Malformed null record JSON at index \(recordIndex) in backup snapshot")
+                }
+                let json = String(cString: cStr)
+                guard let data = json.data(using: .utf8), let rec = try? jsonDecoder.decode(BondRecord.self, from: data) else {
+                    throw DatabaseError.statementFailed("Malformed record JSON at index \(recordIndex) in backup snapshot (decoding failed)")
+                }
+                records.append(rec)
+            } else if step == SQLITE_DONE {
+                break
+            } else {
+                throw DatabaseError.statementFailed("Error reading snapshot database records: code \(step)")
+            }
+        }
+        return records
+    }
+
     /// Creates an atomic, complete collection backup covering both records and photograph files.
     /// Never modifies the source collection. Validates SQLite backup integrity.
-    /// Safe against destructive cleanup: builds in staging and never deletes caller-owned destination directory.
-    func backupCollection(to destinationDir: URL, photosSourceDir: URL = photosRoot) throws {
+    /// Safe against destructive cleanup: builds in staging and preserves existing generations until publication succeeds.
+    func backupCollection(
+        to destinationDir: URL,
+        photosSourceDir: URL = photosRoot,
+        _injectedFailureDuringPublication: Bool = false
+    ) throws {
         lock.lock()
         defer { lock.unlock() }
 
@@ -934,9 +992,15 @@ extension DatabaseManager {
         let manifestURL = stagingDir.appendingPathComponent("backup_manifest.json")
         let photosDestDir = stagingDir.appendingPathComponent("photos", isDirectory: true)
 
+        // 1. Create SQLite snapshot
         try backupDatabase(to: dbBackupURL)
 
-        let allRecords = try loadAllRecords()
+        // 2. Validate snapshot integrity
+        _ = try DatabaseManager.validateDatabaseIntegrity(at: dbBackupURL)
+
+        // 3. Derive records and photo inventory directly from the snapshot database
+        let allRecords = try DatabaseManager.loadRecordsFromSnapshot(at: dbBackupURL)
+
         var referencedPhotos = Set<String>()
         for r in allRecords {
             if !r.photo.isEmpty {
@@ -957,15 +1021,17 @@ extension DatabaseManager {
             }
         }
 
+        let sourceBaseDir = photosSourceDir.deletingLastPathComponent()
         var copiedPhotos: [String] = []
         if !referencedPhotos.isEmpty {
             try FileManager.default.createDirectory(at: photosDestDir, withIntermediateDirectories: true)
             for rel in referencedPhotos {
-                let sourceURL = rel.hasPrefix("/") ? URL(fileURLWithPath: rel).standardized : photosSourceDir.deletingLastPathComponent().appendingPathComponent(rel).standardized
+                // Strict path validation: reject absolute paths, .. traversal, and symlink escapes
+                let sourceURL = try PathSecurity.validateSafeRelativePath(rel, within: sourceBaseDir)
                 guard FileManager.default.fileExists(atPath: sourceURL.path) else {
                     throw DatabaseError.statementFailed("Missing referenced source photograph: \(rel)")
                 }
-                let destURL = stagingDir.appendingPathComponent(rel)
+                let destURL = try PathSecurity.validateSafeRelativePath(rel, within: stagingDir)
                 try FileManager.default.createDirectory(at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                 if !FileManager.default.fileExists(atPath: destURL.path) {
                     try FileManager.default.copyItem(at: sourceURL, to: destURL)
@@ -986,21 +1052,91 @@ extension DatabaseManager {
         let manifestData = try encoder.encode(manifest)
         try manifestData.write(to: manifestURL, options: .atomic)
 
+        // Final integrity check on snapshot before publication
         _ = try DatabaseManager.validateDatabaseIntegrity(at: dbBackupURL)
 
-        // All steps succeeded and validated. Publish staging contents to destinationDir
-        // without ever deleting caller-owned directories or unrelated pre-existing files.
-        try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true)
-        let stagingItems = try FileManager.default.contentsOfDirectory(at: stagingDir, includingPropertiesForKeys: nil)
-        for item in stagingItems {
-            let destItem = destinationDir.appendingPathComponent(item.lastPathComponent)
-            if FileManager.default.fileExists(atPath: destItem.path) {
-                try FileManager.default.removeItem(at: destItem)
+        // 4. Safe Publication Phase:
+        // Publish staging contents as a single validated generation.
+        // Preserve any existing good generation in destinationDir until replacement succeeds.
+        let prevGenerationSafetyDir = FileManager.default.temporaryDirectory.appendingPathComponent("backup_prev_gen_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: prevGenerationSafetyDir, withIntermediateDirectories: true)
+        var preservePrevSafetyDir = false
+        defer {
+            if !preservePrevSafetyDir {
+                try? FileManager.default.removeItem(at: prevGenerationSafetyDir)
             }
-            try FileManager.default.copyItem(at: item, to: destItem)
         }
 
-        ScanLog.shared.write("collection backup completed: records=\(allRecords.count) photos=\(copiedPhotos.count)")
+        // Preserve all existing items in destinationDir if it exists
+        if FileManager.default.fileExists(atPath: destinationDir.path) {
+            let existingItems = (try? FileManager.default.contentsOfDirectory(at: destinationDir, includingPropertiesForKeys: nil)) ?? []
+            for item in existingItems {
+                let target = prevGenerationSafetyDir.appendingPathComponent(item.lastPathComponent)
+                try FileManager.default.copyItem(at: item, to: target)
+            }
+        }
+
+        do {
+            try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+            let stagingItems = try FileManager.default.contentsOfDirectory(at: stagingDir, includingPropertiesForKeys: nil)
+            for item in stagingItems {
+                let destItem = destinationDir.appendingPathComponent(item.lastPathComponent)
+                if FileManager.default.fileExists(atPath: destItem.path) {
+                    try FileManager.default.removeItem(at: destItem)
+                }
+                try FileManager.default.copyItem(at: item, to: destItem)
+                if _injectedFailureDuringPublication {
+                    throw DatabaseError.statementFailed("Injected publication failure for testing")
+                }
+            }
+
+            // Verify integrity of the published database at its destination
+            let publishedDB = destinationDir.appendingPathComponent("bonds.sqlite3")
+            _ = try DatabaseManager.validateDatabaseIntegrity(at: publishedDB)
+
+            ScanLog.shared.write("collection backup completed: records=\(allRecords.count) photos=\(copiedPhotos.count)")
+        } catch {
+            // Publication failed: Roll back destinationDir to the previous good generation!
+            var rollbackFailed = false
+            var rollbackErrors: [Error] = []
+
+            // Remove newly/partially published items from staging
+            let stagingItems = (try? FileManager.default.contentsOfDirectory(at: stagingDir, includingPropertiesForKeys: nil)) ?? []
+            for item in stagingItems {
+                let destItem = destinationDir.appendingPathComponent(item.lastPathComponent)
+                if FileManager.default.fileExists(atPath: destItem.path) {
+                    do {
+                        try FileManager.default.removeItem(at: destItem)
+                    } catch {
+                        rollbackFailed = true
+                        rollbackErrors.append(error)
+                    }
+                }
+            }
+
+            // Restore previous generation items
+            let savedPrevItems = (try? FileManager.default.contentsOfDirectory(at: prevGenerationSafetyDir, includingPropertiesForKeys: nil)) ?? []
+            for item in savedPrevItems {
+                let destItem = destinationDir.appendingPathComponent(item.lastPathComponent)
+                do {
+                    if FileManager.default.fileExists(atPath: destItem.path) {
+                        try FileManager.default.removeItem(at: destItem)
+                    }
+                    try FileManager.default.copyItem(at: item, to: destItem)
+                } catch {
+                    rollbackFailed = true
+                    rollbackErrors.append(error)
+                }
+            }
+
+            if rollbackFailed {
+                preservePrevSafetyDir = true
+                ScanLog.shared.write("CRITICAL: Publication rollback failed. Preserved previous backup at: \(prevGenerationSafetyDir.path)")
+                throw DatabaseError.statementFailed("Publication failed and rollback encountered errors. Preserved previous backup at \(prevGenerationSafetyDir.path). Errors: \(rollbackErrors)")
+            }
+
+            throw error
+        }
     }
 
     /// Restores a complete collection backup after verifying database integrity,
@@ -1012,7 +1148,8 @@ extension DatabaseManager {
         destinationDBURL: URL = databaseURL,
         destinationPhotosDir: URL = photosRoot,
         authorized: Bool,
-        _injectedFailureAfterDB: Bool = false
+        _injectedFailureAfterDB: Bool = false,
+        _injectedPreRestoreFailure: Bool = false
     ) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -1044,7 +1181,12 @@ extension DatabaseManager {
             throw DatabaseError.incompatibleSchema(current: DatabaseManager.schemaVersion, backup: manifest.schemaVersion)
         }
 
-        let backupDBURL = backupDir.appendingPathComponent(manifest.databaseFileName)
+        // Strict filename validation on manifest.databaseFileName
+        let dbFileName = try PathSecurity.validateSafeFilename(manifest.databaseFileName)
+        guard dbFileName.hasSuffix(".sqlite3") || dbFileName.hasSuffix(".db") else {
+            throw DatabaseError.restoreFailed("Invalid manifest database filename extension: '\(manifest.databaseFileName)'")
+        }
+        let backupDBURL = try PathSecurity.validateSafeRelativePath(dbFileName, within: backupDir)
         guard FileManager.default.fileExists(atPath: backupDBURL.path) else {
             throw DatabaseError.restoreFailed("Missing database file '\(manifest.databaseFileName)' in backup")
         }
@@ -1066,15 +1208,18 @@ extension DatabaseManager {
 
         var records: [BondRecord] = []
         let jsonDecoder = JSONDecoder()
+        var recordIndex = 0
         while true {
             let step = sqlite3_step(s)
             if step == SQLITE_ROW {
+                recordIndex += 1
                 guard let cStr = sqlite3_column_text(s, 0) else {
-                    throw DatabaseError.restoreFailed("Malformed null record JSON in backup database")
+                    throw DatabaseError.restoreFailed("Malformed null record JSON at index \(recordIndex) in backup database")
                 }
                 let json = String(cString: cStr)
                 guard let data = json.data(using: .utf8), let rec = try? jsonDecoder.decode(BondRecord.self, from: data) else {
-                    throw DatabaseError.restoreFailed("Malformed record JSON in backup database: \(json)")
+                    // Redacted error message: never include raw json string or private identifiers
+                    throw DatabaseError.restoreFailed("Malformed record JSON at index \(recordIndex) in backup database (decoding failed)")
                 }
                 records.append(rec)
             } else if step == SQLITE_DONE {
@@ -1108,18 +1253,23 @@ extension DatabaseManager {
             }
         }
 
+        // Strict path validation for every photograph reference in backup
         for rel in requiredPhotos {
-            let photoInBackup = backupDir.appendingPathComponent(rel)
+            let photoInBackup = try PathSecurity.validateSafeRelativePath(rel, within: backupDir)
             guard FileManager.default.fileExists(atPath: photoInBackup.path) else {
                 throw DatabaseError.restoreFailed("Incomplete collection backup: missing photograph file '\(rel)'")
             }
+            _ = try PathSecurity.validateSafeRelativePath(rel, within: destinationPhotosDir.deletingLastPathComponent())
         }
 
         // Unified pre-restore safety copy for BOTH SQLite database and photograph files
         let stagingSafetyDir = FileManager.default.temporaryDirectory.appendingPathComponent("pre_restore_safety_\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: stagingSafetyDir, withIntermediateDirectories: true)
+        var preserveSafetyDir = false
         defer {
-            try? FileManager.default.removeItem(at: stagingSafetyDir)
+            if !preserveSafetyDir {
+                try? FileManager.default.removeItem(at: stagingSafetyDir)
+            }
         }
 
         let dbSafetyDir = stagingSafetyDir.appendingPathComponent("db_safety", isDirectory: true)
@@ -1129,36 +1279,46 @@ extension DatabaseManager {
         let targetDBURL = destinationDBURL
         let targetDBWalURL = URL(fileURLWithPath: targetDBURL.path + "-wal")
         let targetDBShmURL = URL(fileURLWithPath: targetDBURL.path + "-shm")
-
         let isTargetingActiveDB = (targetDBURL == self.currentURL)
 
-        if isTargetingActiveDB {
-            try? execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            if let activeHandle = db {
-                sqlite3_close_v2(activeHandle)
-                self.db = nil
-            }
-        }
-
-        var hadOriginalDB = false
-        if FileManager.default.fileExists(atPath: targetDBURL.path) {
-            try FileManager.default.copyItem(at: targetDBURL, to: dbSafetyDir.appendingPathComponent("bonds.sqlite3"))
-            hadOriginalDB = true
-        }
-        if FileManager.default.fileExists(atPath: targetDBWalURL.path) {
-            try? FileManager.default.copyItem(at: targetDBWalURL, to: dbSafetyDir.appendingPathComponent("bonds.sqlite3-wal"))
-        }
-        if FileManager.default.fileExists(atPath: targetDBShmURL.path) {
-            try? FileManager.default.copyItem(at: targetDBShmURL, to: dbSafetyDir.appendingPathComponent("bonds.sqlite3-shm"))
-        }
-
+        // Complete photograph safety copy BEFORE touching active database connection
         var hadOriginalPhotos = false
         if FileManager.default.fileExists(atPath: destinationPhotosDir.path) {
             try FileManager.default.copyItem(at: destinationPhotosDir, to: photosSafetyDir)
             hadOriginalPhotos = true
         }
 
+        var hadOriginalDB = false
+        var hadOriginalWal = false
+        var hadOriginalShm = false
+
+        // From the moment the active connection is closed or modified, everything is wrapped in do/catch with recovery
         do {
+            if isTargetingActiveDB {
+                try? execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                if let activeHandle = db {
+                    sqlite3_close_v2(activeHandle)
+                    self.db = nil
+                }
+            }
+
+            if FileManager.default.fileExists(atPath: targetDBURL.path) {
+                try FileManager.default.copyItem(at: targetDBURL, to: dbSafetyDir.appendingPathComponent("bonds.sqlite3"))
+                hadOriginalDB = true
+            }
+            if FileManager.default.fileExists(atPath: targetDBWalURL.path) {
+                try? FileManager.default.copyItem(at: targetDBWalURL, to: dbSafetyDir.appendingPathComponent("bonds.sqlite3-wal"))
+                hadOriginalWal = true
+            }
+            if FileManager.default.fileExists(atPath: targetDBShmURL.path) {
+                try? FileManager.default.copyItem(at: targetDBShmURL, to: dbSafetyDir.appendingPathComponent("bonds.sqlite3-shm"))
+                hadOriginalShm = true
+            }
+
+            if _injectedPreRestoreFailure {
+                throw DatabaseError.restoreFailed("Injected pre-restore failure after closing connection for testing")
+            }
+
             // Step 1: Replace Database
             let destDir = targetDBURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
@@ -1197,8 +1357,8 @@ extension DatabaseManager {
             // Step 2: Replace / copy photographs
             try FileManager.default.createDirectory(at: destinationPhotosDir, withIntermediateDirectories: true)
             for rel in requiredPhotos {
-                let src = backupDir.appendingPathComponent(rel)
-                let dst = destinationPhotosDir.deletingLastPathComponent().appendingPathComponent(rel)
+                let src = try PathSecurity.validateSafeRelativePath(rel, within: backupDir)
+                let dst = try PathSecurity.validateSafeRelativePath(rel, within: destinationPhotosDir.deletingLastPathComponent())
                 try FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
                 if FileManager.default.fileExists(atPath: dst.path) {
                     try FileManager.default.removeItem(at: dst)
@@ -1208,13 +1368,22 @@ extension DatabaseManager {
 
             ScanLog.shared.write("collection restore completed successfully: records=\(records.count) photos=\(requiredPhotos.count)")
         } catch {
-            // Full atomic rollback for BOTH database and photographs
+            // Full atomic rollback for BOTH database and photographs with error propagation and safety preservation
+            var rollbackFailed = false
+            var rollbackErrors: [Error] = []
+
             // 1. Rollback photographs
-            if FileManager.default.fileExists(atPath: destinationPhotosDir.path) {
-                try? FileManager.default.removeItem(at: destinationPhotosDir)
-            }
-            if hadOriginalPhotos {
-                try? FileManager.default.copyItem(at: photosSafetyDir, to: destinationPhotosDir)
+            do {
+                if FileManager.default.fileExists(atPath: destinationPhotosDir.path) {
+                    try FileManager.default.removeItem(at: destinationPhotosDir)
+                }
+                if hadOriginalPhotos {
+                    try FileManager.default.copyItem(at: photosSafetyDir, to: destinationPhotosDir)
+                }
+            } catch {
+                rollbackFailed = true
+                rollbackErrors.append(error)
+                ScanLog.shared.write("CRITICAL: Failed to rollback photographs: \(error.localizedDescription)")
             }
 
             // 2. Rollback database
@@ -1222,33 +1391,61 @@ extension DatabaseManager {
                 sqlite3_close_v2(activeHandle)
                 self.db = nil
             }
-            try? FileManager.default.removeItem(at: targetDBURL)
-            try? FileManager.default.removeItem(at: targetDBWalURL)
-            try? FileManager.default.removeItem(at: targetDBShmURL)
+            do {
+                if FileManager.default.fileExists(atPath: targetDBURL.path) {
+                    try FileManager.default.removeItem(at: targetDBURL)
+                }
+                if FileManager.default.fileExists(atPath: targetDBWalURL.path) {
+                    try? FileManager.default.removeItem(at: targetDBWalURL)
+                }
+                if FileManager.default.fileExists(atPath: targetDBShmURL.path) {
+                    try? FileManager.default.removeItem(at: targetDBShmURL)
+                }
 
-            if hadOriginalDB {
-                let savedDB = dbSafetyDir.appendingPathComponent("bonds.sqlite3")
-                let savedWal = dbSafetyDir.appendingPathComponent("bonds.sqlite3-wal")
-                let savedShm = dbSafetyDir.appendingPathComponent("bonds.sqlite3-shm")
-                if FileManager.default.fileExists(atPath: savedDB.path) {
-                    try? FileManager.default.copyItem(at: savedDB, to: targetDBURL)
+                if hadOriginalDB {
+                    let savedDB = dbSafetyDir.appendingPathComponent("bonds.sqlite3")
+                    let savedWal = dbSafetyDir.appendingPathComponent("bonds.sqlite3-wal")
+                    let savedShm = dbSafetyDir.appendingPathComponent("bonds.sqlite3-shm")
+                    if FileManager.default.fileExists(atPath: savedDB.path) {
+                        try FileManager.default.copyItem(at: savedDB, to: targetDBURL)
+                    }
+                    if hadOriginalWal, FileManager.default.fileExists(atPath: savedWal.path) {
+                        try FileManager.default.copyItem(at: savedWal, to: targetDBWalURL)
+                    }
+                    if hadOriginalShm, FileManager.default.fileExists(atPath: savedShm.path) {
+                        try FileManager.default.copyItem(at: savedShm, to: targetDBShmURL)
+                    }
                 }
-                if FileManager.default.fileExists(atPath: savedWal.path) {
-                    try? FileManager.default.copyItem(at: savedWal, to: targetDBWalURL)
-                }
-                if FileManager.default.fileExists(atPath: savedShm.path) {
-                    try? FileManager.default.copyItem(at: savedShm, to: targetDBShmURL)
-                }
+            } catch {
+                rollbackFailed = true
+                rollbackErrors.append(error)
+                ScanLog.shared.write("CRITICAL: Failed to rollback database files: \(error.localizedDescription)")
             }
 
-            if isTargetingActiveDB, hadOriginalDB {
+            // 3. Reopen active database handle
+            if isTargetingActiveDB, FileManager.default.fileExists(atPath: targetDBURL.path) {
                 var handle: OpaquePointer?
                 let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
                 let openRc = sqlite3_open_v2(targetDBURL.path, &handle, flags, nil)
                 if openRc == SQLITE_OK, let opened = handle {
                     self.db = opened
-                    try? configurePragmasAndSchema()
+                    _ = try? configurePragmasAndSchema()
+                } else {
+                    rollbackFailed = true
+                    let msg = handle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "code \(openRc)"
+                    if let handle = handle {
+                        sqlite3_close_v2(handle)
+                    }
+                    let reopenErr = DatabaseError.openFailed("Failed reopening active database after rollback: \(msg)")
+                    rollbackErrors.append(reopenErr)
+                    ScanLog.shared.write("CRITICAL: \(reopenErr.localizedDescription)")
                 }
+            }
+
+            if rollbackFailed {
+                preserveSafetyDir = true
+                ScanLog.shared.write("CRITICAL: Collection restore rollback failed. Preserved safety backup at: \(stagingSafetyDir.path)")
+                throw DatabaseError.restoreFailed("CRITICAL: Restore rollback failed. Safety copy preserved at \(stagingSafetyDir.path). Recovery errors: \(rollbackErrors)")
             }
 
             throw error
