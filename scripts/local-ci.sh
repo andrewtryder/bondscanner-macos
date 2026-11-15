@@ -82,11 +82,35 @@ echo "--> [3/4] Building staging application..."
 # 4. Tests
 if [ "$SKIP_TESTS" = false ]; then
     echo "--> [4/4] Running test suite..."
+    RESULT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bondscanner-xcresult.XXXXXX")"
+    RESULT_BUNDLE="$RESULT_DIR/tests.xcresult"
+    cleanup_results() { rm -rf "$RESULT_DIR"; }
+    trap cleanup_results EXIT
     xcodebuild test \
         -project "$ROOT/BondScanner.xcodeproj" \
         -scheme BondScanner \
         -destination "platform=macOS" \
+        -resultBundlePath "$RESULT_BUNDLE" \
         -quiet
+    SUMMARY="$(xcrun xcresulttool get test-results summary --path "$RESULT_BUNDLE")"
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "❌ jq is required to verify structured XCTest results." >&2
+        exit 1
+    fi
+    TOTAL="$(printf '%s' "$SUMMARY" | jq -r '.totalTestCount // 0')"
+    FAILED="$(printf '%s' "$SUMMARY" | jq -r '.failedTests // 0')"
+    PASSED="$(printf '%s' "$SUMMARY" | jq -r '.passedTests // 0')"
+    if [ "$TOTAL" -le 0 ] || [ "$PASSED" -le 0 ] || [ "$FAILED" -ne 0 ]; then
+        echo "❌ XCTest result invalid: total=$TOTAL passed=$PASSED failed=$FAILED" >&2
+        exit 1
+    fi
+    TESTS="$(xcrun xcresulttool get test-results tests --path "$RESULT_BUNDLE")"
+    for suite in ReviewWorkflowTests BondValidationTests BondScannerTests; do
+        if ! printf '%s' "$TESTS" | jq -e --arg suite "$suite" '.. | objects | select(.name? == $suite)' >/dev/null; then
+            echo "❌ Expected XCTest suite missing: $suite" >&2
+            exit 1
+        fi
+    done
     echo "✅ Unit tests passed."
 else
     echo "--> [4/4] Skipping tests (--skip-tests specified)."

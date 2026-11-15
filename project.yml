@@ -87,3 +87,35 @@ schemes:
         BONDSCANNER_TEST_MODE: "1"
       targets:
         - BondScannerTests
+
+  BondScannerHardwareEvaluation:
+    build:
+      targets:
+        BondScanner: all
+        BondScannerTests: [test]
+    test:
+      config: Debug
+      # This is deliberately a separate, explicit scheme. It is the only
+      # generated configuration that can invoke private local-model inference.
+      environmentVariables:
+        BONDSCANNER_TEST_MODE: "1"
+        BONDSCANNER_RUN_LOCAL_AI_EVAL: "1"
+        BONDSCANNER_AI_EVAL_LIMIT: "5"
+        BONDSCANNER_AI_EVAL_MODE: "review"
+      targets:
+        - BondScannerTests
+
+  BondScannerManifestDraft:
+    build:
+      targets:
+        BondScanner: all
+        BondScannerTests: [test]
+    test:
+      config: Debug
+      # Creates an ignored, explicitly unverified draft only. It never changes
+      # manifest.json, which remains reserved for human-verified ground truth.
+      environmentVariables:
+        BONDSCANNER_TEST_MODE: "1"
+        BONDSCANNER_GENERATE_AI_DRAFT: "1"
+      targets:
+        - BondScannerTests
