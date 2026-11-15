@@ -14,6 +14,9 @@ import Vision
 #endif
 
 final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, AVCapturePhotoCaptureDelegate {
+    /// Explicit hosted-test guard. This is evaluated before any production path,
+    /// including database initialization, logging, exports, and camera setup.
+    private let isTestMode = ProcessInfo.processInfo.environment["BONDSCANNER_TEST_MODE"] == "1"
     private var window: NSWindow!
     private var preview: PreviewView!
     private var statusLabel: NSTextField!
@@ -140,7 +143,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     private var activeHuntTimestamp: TimeInterval = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if NSClassFromString("XCTestCase") != nil {
+        if isTestMode || NSClassFromString("XCTestCase") != nil {
             return
         }
         do {
