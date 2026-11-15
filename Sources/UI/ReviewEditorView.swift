@@ -969,13 +969,13 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
         if !isCurrent {
             status = "AI Analysis History — Outdated (not actionable)"
         } else {
-        switch analysis.status {
-        case .ready: status = "AI Analysis — Suggestions are unverified"
-        case .abstained: status = "AI Analysis — Evidence insufficient"
-        case .unavailable: status = "AI Analysis Unavailable"
-        case .failed: status = "AI Analysis Could Not Complete"
-        case .cancelled: status = "AI Analysis Cancelled"
-        }
+            switch analysis.status {
+            case .ready: status = "AI Analysis — Suggestions are unverified"
+            case .abstained: status = "AI Analysis — Evidence insufficient"
+            case .unavailable: status = "AI Analysis Unavailable"
+            case .failed: status = "AI Analysis Could Not Complete"
+            case .cancelled: status = "AI Analysis Cancelled"
+            }
         }
         let header = NSTextField(labelWithString: status)
         header.font = .systemFont(ofSize: 11.5, weight: .bold)

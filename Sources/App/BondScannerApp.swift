@@ -291,9 +291,17 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         reviewWindowController?.showReviewWindow(selectingRecordId: nil, filter: .allReview)
     }
 
-    @objc private func pauseAIReviewQueue() { reviewWindowController?.coordinator.pauseAIReview() }
-    @objc private func resumeAIReviewQueue() { reviewWindowController?.coordinator.resumeAIReview() }
-    @objc private func cancelAIReviewQueue() { reviewWindowController?.coordinator.cancelAIReview() }
+    @objc private func pauseAIReviewQueue() {
+        reviewWindowController?.coordinator.pauseAIReview()
+    }
+
+    @objc private func resumeAIReviewQueue() {
+        reviewWindowController?.coordinator.resumeAIReview()
+    }
+
+    @objc private func cancelAIReviewQueue() {
+        reviewWindowController?.coordinator.cancelAIReview()
+    }
 
     @objc private func refocusCamera() {
         guard let camera = captureDevice else { status("No webcam available to refocus."); return }
@@ -1820,7 +1828,6 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             isProcessing = false
         }
     }
-
 
     private func updateCount() {
         let processing = records.filter { $0.status == "PROCESSING" }.count

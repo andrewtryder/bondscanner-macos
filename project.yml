@@ -117,5 +117,6 @@ schemes:
       environmentVariables:
         BONDSCANNER_TEST_MODE: "1"
         BONDSCANNER_GENERATE_AI_DRAFT: "1"
+        BONDSCANNER_AI_DRAFT_LIMIT: "5"
       targets:
         - BondScannerTests

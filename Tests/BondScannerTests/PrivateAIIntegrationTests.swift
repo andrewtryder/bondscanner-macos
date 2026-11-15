@@ -1,5 +1,5 @@
-import XCTest
 @testable import BondScanner
+import XCTest
 
 private enum AIEvalMode: String { case review, all }
 private enum AIEvalRun: String, CaseIterable { case textOnly, multimodal }
@@ -16,10 +16,30 @@ private struct AIEvalCounters: Codable {
         guard !expected.isEmpty else { return }
         visionEvaluated += 1
         let correct = AIEvaluation.normalized(actual, field: field) == AIEvaluation.normalized(expected, field: field)
-        if correct { visionCorrect += 1 } else { visionErrors += 1 }
-        if field == "serial" { serialEvaluated += 1; if correct { serialExact += 1 } }
-        if field == "denomination" { denominationEvaluated += 1; if correct { denominationExact += 1 } }
+        if correct {
+            visionCorrect += 1
+        } else {
+            visionErrors += 1
+        }
+        if field == "serial" {
+            serialEvaluated += 1; if correct {
+                serialExact += 1
+            }
+        }
+        if field == "denomination" {
+            denominationEvaluated += 1; if correct {
+                denominationExact += 1
+            }
+        }
     }
+}
+
+private struct AIEvalCheckpoint: Codable {
+    var nextFixtureIndex: Int
+    var complete: Bool
+    var vision: AIEvalCounters
+    var text: AIEvalCounters
+    var image: AIEvalCounters
 }
 
 private enum AIEvaluation {
@@ -33,15 +53,20 @@ private enum AIEvaluation {
         default: return value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         }
     }
+
     static func value(_ record: BondRecord, field: String) -> String {
         switch field { case "series": return record.series; case "serial": return record.serial; case "denomination": return record.denomination; case "issueMonth": return record.issueMonth; case "issueYear": return record.issueYear; default: return "" }
     }
+
     static func expected(_ fixture: FixtureManifestItem, field: String) -> String {
         switch field { case "series": return fixture.series ?? ""; case "serial": return fixture.serial ?? ""; case "denomination": return fixture.denomination ?? ""; case "issueMonth": return fixture.issueMonth ?? ""; case "issueYear": return fixture.issueYear ?? ""; default: return "" }
     }
+
     static func uniqueSuggestions(_ suggestions: [BondAISuggestion]) -> [String: BondAISuggestion] {
         var values: [String: BondAISuggestion] = [:]
-        for suggestion in suggestions where values[suggestion.field]?.abstained != false { values[suggestion.field] = suggestion }
+        for suggestion in suggestions where values[suggestion.field]?.abstained != false {
+            values[suggestion.field] = suggestion
+        }
         return values
     }
 }
@@ -49,8 +74,13 @@ private enum AIEvaluation {
 /// Explicitly opt-in and read-only. Reports contain aggregate counters/timings only.
 final class PrivateAIIntegrationTests: XCTestCase {
     private var priorLogging = true
-    override func setUp() { super.setUp(); priorLogging = ScanLog.shared.isEnabled; ScanLog.shared.isEnabled = false }
-    override func tearDown() { ScanLog.shared.isEnabled = priorLogging; super.tearDown() }
+    override func setUp() {
+        super.setUp(); priorLogging = ScanLog.shared.isEnabled; ScanLog.shared.isEnabled = false
+    }
+
+    override func tearDown() {
+        ScanLog.shared.isEnabled = priorLogging; super.tearDown()
+    }
 
     func testEvaluatorCanonicalNormalization() {
         XCTAssertEqual(AIEvaluation.normalized("$1,000", field: "denomination"), "1000")
@@ -88,9 +118,10 @@ final class PrivateAIIntegrationTests: XCTestCase {
             throw XCTSkip("Local model unavailable: \(ReviewCoordinator.localModelAvailability.rawValue)")
         }
         guard let root = PrivateFixturesEnvironment.projectRootURL() else { throw XCTSkip("Project root unavailable.") }
-        let images = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("local-fixtures/real/images"), includingPropertiesForKeys: nil)
+        let limit = max(1, Int(ProcessInfo.processInfo.environment["BONDSCANNER_AI_DRAFT_LIMIT"] ?? "5") ?? 5)
+        let images = try Array(FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("local-fixtures/real/images"), includingPropertiesForKeys: nil)
             .filter { ["jpg", "jpeg", "png", "heic"].contains($0.pathExtension.lowercased()) }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }.prefix(limit))
         guard !images.isEmpty else { throw XCTSkip("No private real photographs available.") }
         struct Draft: Codable {
             let id: String; let filename: String; let series: String?; let denomination: String?; let serial: String?; let issueMonth: String?; let issueYear: String?; let notes: String
@@ -110,7 +141,9 @@ final class PrivateAIIntegrationTests: XCTestCase {
             let analysis = await analyzer.analyze(record: record, imageURL: url)
             let suggestions = AIEvaluation.uniqueSuggestions(analysis.suggestions)
             func value(_ field: String, _ vision: String) -> String? {
-                if let proposed = suggestions[field]?.proposedValue, !proposed.isEmpty { return proposed }
+                if let proposed = suggestions[field]?.proposedValue, !proposed.isEmpty {
+                    return proposed
+                }
                 return vision.isEmpty ? nil : vision
             }
             drafts.append(Draft(id: "draft-\(index + 1)", filename: url.lastPathComponent, series: value("series", record.series), denomination: value("denomination", record.denomination), serial: value("serial", record.serial), issueMonth: value("issueMonth", record.issueMonth), issueYear: value("issueYear", record.issueYear), notes: "UNVERIFIED AI/Vision draft — manually inspect original photograph before copying any value into manifest.json"))
@@ -130,8 +163,17 @@ final class PrivateAIIntegrationTests: XCTestCase {
         let fixtures = try JSONDecoder().decode([FixtureManifestItem].self, from: Data(contentsOf: manifestURL)).sorted { $0.id < $1.id }
         guard !fixtures.isEmpty else { throw XCTSkip("Private real manifest empty.") }
         var vision = AIEvalCounters(), text = AIEvalCounters(), image = AIEvalCounters()
+        let checkpointURL = try XCTUnwrap(PrivateFixturesEnvironment.reportsDirectoryURL(for: .real)).appendingPathComponent("ai-evaluation-checkpoint.json")
+        var startIndex = 0
+        if env["BONDSCANNER_AI_EVAL_RESUME"] == "1",
+           let data = try? Data(contentsOf: checkpointURL),
+           let checkpoint = try? JSONDecoder().decode(AIEvalCheckpoint.self, from: data)
+        {
+            vision = checkpoint.vision; text = checkpoint.text; image = checkpoint.image
+            startIndex = checkpoint.complete ? limit : checkpoint.nextFixtureIndex
+        }
 
-        for fixture in fixtures.prefix(limit) {
+        for (fixtureIndex, fixture) in fixtures.prefix(limit).enumerated() where fixtureIndex >= startIndex {
             vision.fixtures += 1
             guard let url = PrivateFixturesEnvironment.imageURL(for: fixture.filename, dataset: .real) else { vision.missingPhotos += 1; continue }
             guard let imageFile = cgImageFromFile(url) else { vision.undecodablePhotos += 1; continue }
@@ -139,45 +181,72 @@ final class PrivateAIIntegrationTests: XCTestCase {
             var record = scanImage(imageFile).record
             vision.latencies.append(CFAbsoluteTimeGetCurrent() - visionStart)
             record.id = UUID().uuidString; record.revision = 1
-            for field in AIEvaluation.fields { vision.addVision(AIEvaluation.value(record, field: field), expected: AIEvaluation.expected(fixture, field: field), field: field) }
+            for field in AIEvaluation.fields {
+                vision.addVision(AIEvaluation.value(record, field: field), expected: AIEvaluation.expected(fixture, field: field), field: field)
+            }
             let expectedMonth = AIEvaluation.expected(fixture, field: "issueMonth"), expectedYear = AIEvaluation.expected(fixture, field: "issueYear")
             if !expectedMonth.isEmpty, !expectedYear.isEmpty {
                 vision.dateEvaluated += 1
-                if AIEvaluation.normalized(record.issueMonth, field: "issueMonth") == AIEvaluation.normalized(expectedMonth, field: "issueMonth") && record.issueYear == expectedYear { vision.dateExact += 1 }
+                if AIEvaluation.normalized(record.issueMonth, field: "issueMonth") == AIEvaluation.normalized(expectedMonth, field: "issueMonth"), record.issueYear == expectedYear {
+                    vision.dateExact += 1
+                }
             }
             let eligible = ReviewCoordinator.isAutomaticallyReviewEligible(record)
-            if eligible { vision.reviewFixtures += 1 }
+            if eligible {
+                vision.reviewFixtures += 1
+            }
             guard mode == .all || eligible else { continue }
             text.fixtures += 1; image.fixtures += 1
             if availability == .available {
                 await score(analyzer: LocalBondAIAnalyzer(mode: .textOnly), record: record, imageURL: url, fixture: fixture, counters: &text)
                 await score(analyzer: LocalBondAIAnalyzer(mode: .multimodal), record: record, imageURL: url, fixture: fixture, counters: &image)
-            } else { text.unavailable += 1; image.unavailable += 1 }
+            } else {
+                text.unavailable += 1; image.unavailable += 1
+            }
             // Safe aggregate-only checkpoint: interrupted hardware runs retain
             // completed measurements without identifiers, OCR, or proposals.
             try writeReport(vision: vision, text: text, image: image, mode: mode, limit: limit, availability: availability, isComplete: false)
+            let checkpoint = AIEvalCheckpoint(nextFixtureIndex: fixtureIndex + 1, complete: false, vision: vision, text: text, image: image)
+            try JSONEncoder().encode(checkpoint).write(to: checkpointURL, options: .atomic)
         }
         try writeReport(vision: vision, text: text, image: image, mode: mode, limit: limit, availability: availability, isComplete: true)
+        try JSONEncoder().encode(AIEvalCheckpoint(nextFixtureIndex: limit, complete: true, vision: vision, text: text, image: image)).write(to: checkpointURL, options: .atomic)
     }
 
     private func score(analyzer: LocalBondAIAnalyzer, record: BondRecord, imageURL: URL, fixture: FixtureManifestItem, counters: inout AIEvalCounters) async {
         let start = CFAbsoluteTimeGetCurrent(); let analysis = await analyzer.analyze(record: record, imageURL: imageURL)
         counters.latencies.append(CFAbsoluteTimeGetCurrent() - start)
-        if analysis.status == .unavailable { counters.unavailable += 1; return }
+        if analysis.status == .unavailable {
+            counters.unavailable += 1; return
+        }
         guard analysis.status == .ready || analysis.status == .abstained else { counters.failures += 1; return }
         let suggestions = AIEvaluation.uniqueSuggestions(analysis.suggestions)
         for field in AIEvaluation.fields {
             let expected = AIEvaluation.expected(fixture, field: field); guard expected != "/" && !expected.isEmpty else { continue }
             let visionValue = AIEvaluation.value(record, field: field)
             let visionCorrect = AIEvaluation.normalized(visionValue, field: field) == AIEvaluation.normalized(expected, field: field)
-            if !visionCorrect { counters.visionErrors += 1 }
+            if !visionCorrect {
+                counters.visionErrors += 1
+            }
             guard let suggestion = suggestions[field], !suggestion.abstained, let proposed = suggestion.proposedValue else { counters.abstentions += 1; continue }
             counters.proposals += 1
             let correct = AIEvaluation.normalized(proposed, field: field) == AIEvaluation.normalized(expected, field: field)
-            if correct { counters.correctProposals += 1 }
-            if !visionCorrect && correct { counters.recoveredErrors += 1 }
-            if visionCorrect && !correct { counters.regressions += 1 }
-            if field == "serial" { if suggestion.evidence.hasPrefix("visual-unverified:") { counters.visualUnverifiedSerials += 1 } else { counters.corroboratedSerials += 1 } }
+            if correct {
+                counters.correctProposals += 1
+            }
+            if !visionCorrect, correct {
+                counters.recoveredErrors += 1
+            }
+            if visionCorrect, !correct {
+                counters.regressions += 1
+            }
+            if field == "serial" {
+                if suggestion.evidence.hasPrefix("visual-unverified:") {
+                    counters.visualUnverifiedSerials += 1
+                } else {
+                    counters.corroboratedSerials += 1
+                }
+            }
         }
     }
 

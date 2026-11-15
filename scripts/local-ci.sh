@@ -106,8 +106,15 @@ if [ "$SKIP_TESTS" = false ]; then
     fi
     TESTS="$(xcrun xcresulttool get test-results tests --path "$RESULT_BUNDLE")"
     for suite in ReviewWorkflowTests BondValidationTests BondScannerTests; do
-        if ! printf '%s' "$TESTS" | jq -e --arg suite "$suite" '.. | objects | select(.name? == $suite)' >/dev/null; then
+        SUITE="$(printf '%s' "$TESTS" | jq -c --arg suite "$suite" '.. | objects | select(.name? == $suite and .nodeType? == "Test Suite")' | head -n 1)"
+        if [ -z "$SUITE" ]; then
             echo "❌ Expected XCTest suite missing: $suite" >&2
+            exit 1
+        fi
+        SUITE_PASSED="$(printf '%s' "$SUITE" | jq '[.. | objects | select(.nodeType? == "Test Case" and .result? == "Passed")] | length')"
+        SUITE_FAILED="$(printf '%s' "$SUITE" | jq '[.. | objects | select(.nodeType? == "Test Case" and (.result? == "Failed" or .result? == "Expected Failure"))] | length')"
+        if [ "$SUITE_PASSED" -le 0 ] || [ "$SUITE_FAILED" -ne 0 ]; then
+            echo "❌ XCTest suite invalid: $suite passed=$SUITE_PASSED failed=$SUITE_FAILED" >&2
             exit 1
         fi
     done

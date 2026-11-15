@@ -24,7 +24,10 @@ struct BondAIAnalysis: Codable, Equatable {
 
 struct BondAISuggestion: Codable, Equatable, Identifiable {
     enum Assessment: String, Codable, CaseIterable { case strongEvidence, conflictingEvidence, insufficientEvidence }
-    var id: String { field }
+    var id: String {
+        field
+    }
+
     var field: String
     var existingValue: String
     var proposedValue: String?
