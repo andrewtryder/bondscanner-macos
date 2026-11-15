@@ -814,6 +814,223 @@ final class DataSafetyAndRetentionTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: photoURL.path))
     }
 
+    func testRestoreSafetyStagingFailureDoesNotDeleteOriginalDatabase() throws {
+        let (origPhotoURL, relOrigPhoto) = createDummyImageFile(named: "orig_staging_fail.jpg")
+        let origRec = makeRecord(id: "rec-staging-fail", serial: "STAGING-FAIL-001", photo: relOrigPhoto)
+        try testDb.upsertRecord(origRec)
+
+        // Create a valid backup to restore from
+        let validBackupDir = tempDir.appendingPathComponent("valid_backup_for_safety_fail", isDirectory: true)
+        try testDb.backupCollection(to: validBackupDir, photosSourceDir: testPhotosDir)
+
+        // Inject failure during safety staging copy
+        XCTAssertThrowsError(
+            try testDb.restoreCollection(
+                from: validBackupDir,
+                destinationDBURL: testDbURL,
+                destinationPhotosDir: testPhotosDir,
+                authorized: true,
+                _injectedSafetyStagingFailure: true
+            )
+        )
+
+        // CRITICAL INVARIANT: Original database file MUST NOT be deleted
+        XCTAssertTrue(FileManager.default.fileExists(atPath: testDbURL.path), "Original database file must exist after safety staging failure")
+
+        // Active connection must remain open and queryable
+        let loaded = try testDb.loadAllRecords()
+        XCTAssertEqual(loaded.count, 1)
+        XCTAssertEqual(loaded.first?.id, "rec-staging-fail")
+        XCTAssertEqual(loaded.first?.serial, "STAGING-FAIL-001")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: origPhotoURL.path))
+    }
+
+    func testBackupPublicationRejectsDestinationsWithinActiveCollectionTree() throws {
+        let testOutputRoot = StorageConfiguration.shared.outputRoot
+
+        // 1. Direct collection root
+        XCTAssertThrowsError(try testDb.backupCollection(to: testOutputRoot, photosSourceDir: testPhotosDir))
+
+        // 2. Photos directory
+        XCTAssertThrowsError(try testDb.backupCollection(to: testPhotosDir, photosSourceDir: testPhotosDir))
+
+        // 3. Nested subfolder inside active collection
+        let nestedInsideRoot = testOutputRoot.appendingPathComponent("nested_backups/backup_1", isDirectory: true)
+        XCTAssertThrowsError(try testDb.backupCollection(to: nestedInsideRoot, photosSourceDir: testPhotosDir))
+
+        // 4. Nested subfolder inside photos
+        let nestedInsidePhotos = testPhotosDir.appendingPathComponent("sub_photos", isDirectory: true)
+        XCTAssertThrowsError(try testDb.backupCollection(to: nestedInsidePhotos, photosSourceDir: testPhotosDir))
+
+        // 5. Database directory
+        let dbDir = testDbURL.deletingLastPathComponent()
+        XCTAssertThrowsError(try testDb.backupCollection(to: dbDir, photosSourceDir: testPhotosDir))
+
+        // 6. Symlink inside temp pointing into live photos directory
+        let symlinkDest = tempDir.appendingPathComponent("symlink_to_photos", isDirectory: true)
+        try? FileManager.default.createSymbolicLink(atPath: symlinkDest.path, withDestinationPath: testPhotosDir.path)
+        XCTAssertThrowsError(try testDb.backupCollection(to: symlinkDest, photosSourceDir: testPhotosDir))
+    }
+
+    func testRestoreRejectsPhotographPathOutsidePhotosSubtree() throws {
+        let validBackupDir = tempDir.appendingPathComponent("valid_backup_subtree_test", isDirectory: true)
+        let (_, relPhoto) = createDummyImageFile(named: "subtree_ok.jpg")
+        let rec = makeRecord(id: "rec-subtree", serial: "SUBTREE-111", photo: relPhoto)
+        try testDb.upsertRecord(rec)
+        try testDb.backupCollection(to: validBackupDir, photosSourceDir: testPhotosDir)
+
+        // Mutate the backup database record so that photo references a file outside 'photos/' subtree
+        let manifestURL = validBackupDir.appendingPathComponent("backup_manifest.json")
+        let manifestData = try Data(contentsOf: manifestURL)
+        let manifest = try JSONDecoder().decode(CollectionBackupManifest.self, from: manifestData)
+
+        let backupDBURL = validBackupDir.appendingPathComponent(manifest.databaseFileName)
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(backupDBURL.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        let maliciousRecord = makeRecord(id: "rec-malicious", serial: "EVIL-666", photo: "escaped_root.txt")
+        let encoder = JSONEncoder()
+        let maliciousData = try encoder.encode(maliciousRecord)
+        let maliciousJSON = try XCTUnwrap(String(data: maliciousData, encoding: .utf8))
+
+        var stmt: OpaquePointer?
+        let updateSQL = "UPDATE bonds SET record_json = ? WHERE id = 'rec-subtree';"
+        XCTAssertEqual(sqlite3_prepare_v2(handle, updateSQL, -1, &stmt, nil), SQLITE_OK)
+        sqlite3_bind_text(stmt, 1, (maliciousJSON as NSString).utf8String, -1, nil)
+        XCTAssertEqual(sqlite3_step(stmt), SQLITE_DONE)
+        sqlite3_finalize(stmt)
+        sqlite3_close_v2(handle)
+
+        let restoreDestDir = tempDir.appendingPathComponent("subtree_restore_dest", isDirectory: true)
+        let restoreDBURL = restoreDestDir.appendingPathComponent("bonds.sqlite3")
+        let restorePhotosDir = restoreDestDir.appendingPathComponent("photos", isDirectory: true)
+
+        // Restoration MUST fail and reject photograph destinations outside photos subtree
+        XCTAssertThrowsError(
+            try testDb.restoreCollection(
+                from: validBackupDir,
+                destinationDBURL: restoreDBURL,
+                destinationPhotosDir: restorePhotosDir,
+                authorized: true
+            )
+        )
+
+        // Verify no file was written to restoreDestDir outside photos directory
+        XCTAssertFalse(FileManager.default.fileExists(atPath: restoreDestDir.appendingPathComponent("escaped_root.txt").path))
+    }
+
+    func testBackupCrashSafeGenerationsSwitch() throws {
+        let backupDestDir = tempDir.appendingPathComponent("atomic_gen_test_dest", isDirectory: true)
+
+        let (_, relPhoto1) = createDummyImageFile(named: "gen1.jpg")
+        let rec1 = makeRecord(id: "rec-gen1", serial: "GEN1-A", photo: relPhoto1)
+        try testDb.upsertRecord(rec1)
+        try testDb.backupCollection(to: backupDestDir, photosSourceDir: testPhotosDir)
+
+        let generationsDir = backupDestDir.appendingPathComponent("generations")
+        let currentLink = backupDestDir.appendingPathComponent("current")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: generationsDir.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: currentLink.path))
+
+        let gen1Entries = (try? FileManager.default.contentsOfDirectory(atPath: generationsDir.path)) ?? []
+        XCTAssertEqual(gen1Entries.count, 1)
+        let gen1Name = gen1Entries[0]
+
+        // Read destination symlink target of current
+        var buf = [CChar](repeating: 0, count: 1024)
+        let len = readlink(currentLink.path, &buf, buf.count)
+        XCTAssertGreaterThan(len, 0)
+        let target = String(cString: buf)
+        XCTAssertEqual(target, "generations/\(gen1Name)")
+
+        // Add second record and backup again
+        let (_, relPhoto2) = createDummyImageFile(named: "gen2.jpg")
+        let rec2 = makeRecord(id: "rec-gen2", serial: "GEN2-B", photo: relPhoto2)
+        try testDb.upsertRecord(rec2)
+        try testDb.backupCollection(to: backupDestDir, photosSourceDir: testPhotosDir)
+
+        let gen2Entries = (try? FileManager.default.contentsOfDirectory(atPath: generationsDir.path)) ?? []
+        XCTAssertEqual(gen2Entries.count, 2, "Both immutable generations must be preserved")
+
+        let len2 = readlink(currentLink.path, &buf, buf.count)
+        XCTAssertGreaterThan(len2, 0)
+        let target2 = String(cString: buf)
+        XCTAssertNotEqual(target, target2, "Current symlink must atomically switch to new generation")
+        XCTAssertTrue(target2.hasPrefix("generations/gen_"))
+
+        // Top level bonds.sqlite3 resolves to gen 2 (2 records)
+        let snapshotRecords = try DatabaseManager.loadRecordsFromSnapshot(at: backupDestDir.appendingPathComponent("bonds.sqlite3"))
+        XCTAssertEqual(snapshotRecords.count, 2)
+    }
+
+    func testCompleteSyntheticCollectionRestoration() throws {
+        // Create an entirely synthetic collection
+        let synthCollectionDir = tempDir.appendingPathComponent("synthetic_collection", isDirectory: true)
+        let synthOutputRoot = synthCollectionDir.appendingPathComponent("output", isDirectory: true)
+        let synthPhotosDir = synthOutputRoot.appendingPathComponent("photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: synthPhotosDir, withIntermediateDirectories: true)
+        let synthDBURL = synthCollectionDir.appendingPathComponent("bonds.sqlite3")
+
+        let synthDB = try DatabaseManager(url: synthDBURL)
+
+        var createdPhotos: [String] = []
+        for i in 1 ... 5 {
+            let photoName = "synth_bond_\(i).jpg"
+            let photoURL = synthPhotosDir.appendingPathComponent(photoName)
+            let testPayload = "SYNTHETIC_IMAGE_BYTES_FOR_BOND_\(i)_\(UUID().uuidString)"
+            try Data(testPayload.utf8).write(to: photoURL)
+            createdPhotos.append("photos/\(photoName)")
+
+            let rec = makeRecord(
+                id: "synth-rec-\(i)",
+                serial: "SYNTH\(i)000000EE",
+                series: i % 2 == 0 ? "I" : "EE",
+                denom: "\(i * 50)",
+                photo: "photos/\(photoName)",
+                notes: "Synthetic collection bond #\(i)"
+            )
+            try synthDB.upsertRecord(rec)
+        }
+
+        let synthBackupDir = tempDir.appendingPathComponent("synthetic_backup", isDirectory: true)
+        try synthDB.backupCollection(to: synthBackupDir, photosSourceDir: synthPhotosDir)
+
+        // Verify backup manifest and structure
+        let manifestURL = synthBackupDir.appendingPathComponent("backup_manifest.json")
+        let manifestData = try Data(contentsOf: manifestURL)
+        let manifest = try JSONDecoder().decode(CollectionBackupManifest.self, from: manifestData)
+        XCTAssertEqual(manifest.recordCount, 5)
+        XCTAssertEqual(manifest.photoFiles.count, 5)
+
+        // Restore into an entirely synthetic fresh destination
+        let freshRestoreDir = tempDir.appendingPathComponent("fresh_synthetic_restore", isDirectory: true)
+        let freshDBURL = freshRestoreDir.appendingPathComponent("bonds.sqlite3")
+        let freshPhotosDir = freshRestoreDir.appendingPathComponent("photos", isDirectory: true)
+
+        let restoreManager = try DatabaseManager(url: freshDBURL)
+        try restoreManager.restoreCollection(
+            from: synthBackupDir,
+            destinationDBURL: freshDBURL,
+            destinationPhotosDir: freshPhotosDir,
+            authorized: true
+        )
+
+        let restoredRecords = try restoreManager.loadAllRecords()
+        XCTAssertEqual(restoredRecords.count, 5)
+
+        // Verify all 5 photographs exist with identical content
+        for i in 1 ... 5 {
+            let photoURL = freshPhotosDir.appendingPathComponent("synth_bond_\(i).jpg")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: photoURL.path))
+            let content = try String(contentsOf: photoURL, encoding: .utf8)
+            XCTAssertTrue(content.hasPrefix("SYNTHETIC_IMAGE_BYTES_FOR_BOND_\(i)_"))
+        }
+
+        // Verify restored database is functional for mutations
+        let newRec = makeRecord(id: "synth-post-restore", serial: "POST12345EE")
+        try restoreManager.upsertRecord(newRec)
+        XCTAssertEqual(try restoreManager.loadAllRecords().count, 6)
+    }
+
     // MARK: - 4. Issue-Date OCR Multi-line and Dating Stamp Logic
 
     func testExtractIssueDateReadingWithAdjacentTwoDigitMonthAndYear() {
