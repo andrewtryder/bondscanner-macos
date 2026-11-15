@@ -973,12 +973,15 @@ final class DataSafetyAndRetentionTests: XCTestCase {
         let synthDB = try DatabaseManager(url: synthDBURL)
 
         var createdPhotos: [String] = []
+        var originalPhotoData: [String: Data] = [:]
         for i in 1 ... 5 {
             let photoName = "synth_bond_\(i).jpg"
             let photoURL = synthPhotosDir.appendingPathComponent(photoName)
             let testPayload = "SYNTHETIC_IMAGE_BYTES_FOR_BOND_\(i)_\(UUID().uuidString)"
-            try Data(testPayload.utf8).write(to: photoURL)
+            let payloadData = Data(testPayload.utf8)
+            try payloadData.write(to: photoURL)
             createdPhotos.append("photos/\(photoName)")
+            originalPhotoData[photoName] = payloadData
 
             let rec = makeRecord(
                 id: "synth-rec-\(i)",
@@ -1017,18 +1020,55 @@ final class DataSafetyAndRetentionTests: XCTestCase {
         let restoredRecords = try restoreManager.loadAllRecords()
         XCTAssertEqual(restoredRecords.count, 5)
 
-        // Verify all 5 photographs exist with identical content
+        // Verify all 5 photographs exist with complete byte-for-byte equality
         for i in 1 ... 5 {
-            let photoURL = freshPhotosDir.appendingPathComponent("synth_bond_\(i).jpg")
+            let photoName = "synth_bond_\(i).jpg"
+            let photoURL = freshPhotosDir.appendingPathComponent(photoName)
             XCTAssertTrue(FileManager.default.fileExists(atPath: photoURL.path))
-            let content = try String(contentsOf: photoURL, encoding: .utf8)
-            XCTAssertTrue(content.hasPrefix("SYNTHETIC_IMAGE_BYTES_FOR_BOND_\(i)_"))
+            let restoredData = try Data(contentsOf: photoURL)
+            XCTAssertEqual(restoredData, originalPhotoData[photoName], "Restored photo \(photoName) must match original byte-for-byte")
         }
 
         // Verify restored database is functional for mutations
         let newRec = makeRecord(id: "synth-post-restore", serial: "POST12345EE")
         try restoreManager.upsertRecord(newRec)
         XCTAssertEqual(try restoreManager.loadAllRecords().count, 6)
+    }
+
+    func testBackupPostCommitFailurePreservesActiveCommittedGeneration() throws {
+        let backupDestDir = tempDir.appendingPathComponent("post_commit_fail_dest", isDirectory: true)
+
+        let (_, relPhoto) = createDummyImageFile(named: "post_commit_photo.jpg")
+        let rec = makeRecord(id: "rec-post-commit", serial: "POST-COMMIT-999", photo: relPhoto)
+        try testDb.upsertRecord(rec)
+
+        // Backup with injected failure AFTER pointer commit
+        XCTAssertThrowsError(
+            try testDb.backupCollection(
+                to: backupDestDir,
+                photosSourceDir: testPhotosDir,
+                _injectedFailureAfterGenerationCommit: true
+            )
+        )
+
+        // CRITICAL INVARIANT: The committed generation MUST NOT be deleted by catch block
+        let currentLink = backupDestDir.appendingPathComponent("current")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: currentLink.path), "Current pointer must exist and not be dangling")
+
+        var buf = [CChar](repeating: 0, count: 1024)
+        let len = readlink(currentLink.path, &buf, buf.count)
+        XCTAssertGreaterThan(len, 0)
+        let target = String(cString: buf)
+        XCTAssertTrue(target.hasPrefix("generations/gen_"))
+
+        let committedGenDir = backupDestDir.appendingPathComponent(target)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: committedGenDir.path), "Committed generation directory must be preserved on post-commit failure")
+
+        // Destination database must be intact and queryable through current pointer
+        let snapshotRecords = try DatabaseManager.loadRecordsFromSnapshot(at: backupDestDir.appendingPathComponent("bonds.sqlite3"))
+        XCTAssertEqual(snapshotRecords.count, 1)
+        XCTAssertEqual(snapshotRecords.first?.id, "rec-post-commit")
+        XCTAssertEqual(snapshotRecords.first?.serial, "POST-COMMIT-999")
     }
 
     // MARK: - 4. Issue-Date OCR Multi-line and Dating Stamp Logic

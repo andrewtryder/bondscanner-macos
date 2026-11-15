@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import SQLite3
 
@@ -959,11 +960,16 @@ extension DatabaseManager {
 
     /// Creates an atomic, complete collection backup covering both records and photograph files.
     /// Never modifies the source collection. Validates SQLite backup integrity.
-    /// Safe against destructive cleanup: builds in staging and preserves existing generations until publication succeeds.
+    /// Publishes complete, immutable backup generations and atomically switches which generation is considered current.
+    /// Safe against destructive cleanup: builds in staging and preserves existing generations.
+    /// Uses atomic pointer publication: pre-syncs generation data, establishes top-level compatibility links,
+    /// and atomically commits the 'current' pointer switch. The commit point is the successful rename() of 'current'.
+    /// No failure after the commit point will delete the newly active generation.
     func backupCollection(
         to destinationDir: URL,
         photosSourceDir: URL = photosRoot,
-        _injectedFailureDuringPublication: Bool = false
+        _injectedFailureDuringPublication: Bool = false,
+        _injectedFailureAfterGenerationCommit: Bool = false
     ) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -1082,24 +1088,35 @@ extension DatabaseManager {
         // If destinationDir contains legacy flat files (not symlinks), migrate them into an initial generation
         var statBuf = stat()
         if lstat(currentSymlink.path, &statBuf) != 0 {
-            let existingEntries = (try? FileManager.default.contentsOfDirectory(at: destinationDir, includingPropertiesForKeys: nil)) ?? []
+            let existingEntries = try FileManager.default.contentsOfDirectory(at: destinationDir, includingPropertiesForKeys: nil)
             let nonGenEntries = existingEntries.filter { $0.lastPathComponent != "generations" && !$0.lastPathComponent.hasPrefix(".") }
             if !nonGenEntries.isEmpty {
                 let initialGenDir = generationsDir.appendingPathComponent("gen_initial", isDirectory: true)
-                try? FileManager.default.createDirectory(at: initialGenDir, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: initialGenDir, withIntermediateDirectories: true)
                 for entry in nonGenEntries {
                     let dest = initialGenDir.appendingPathComponent(entry.lastPathComponent)
-                    try? FileManager.default.copyItem(at: entry, to: dest)
+                    try FileManager.default.copyItem(at: entry, to: dest)
+                }
+                let legacyDB = initialGenDir.appendingPathComponent("bonds.sqlite3")
+                if FileManager.default.fileExists(atPath: legacyDB.path) {
+                    _ = try DatabaseManager.validateDatabaseIntegrity(at: legacyDB)
                 }
                 let tmpInitLink = destinationDir.appendingPathComponent(".current_init_\(UUID().uuidString)")
-                try? FileManager.default.createSymbolicLink(atPath: tmpInitLink.path, withDestinationPath: "generations/gen_initial")
-                _ = rename(tmpInitLink.path, currentSymlink.path)
+                try FileManager.default.createSymbolicLink(atPath: tmpInitLink.path, withDestinationPath: "generations/gen_initial")
+                let initRenameRc = rename(tmpInitLink.path, currentSymlink.path)
+                if initRenameRc != 0 {
+                    let err = errno
+                    try? FileManager.default.removeItem(at: tmpInitLink)
+                    try? FileManager.default.removeItem(at: initialGenDir)
+                    throw DatabaseError.statementFailed("Failed to initialize legacy generation pointer: errno \(err)")
+                }
             }
         }
 
         let timestampStr = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
         let genID = "gen_\(timestampStr)_\(UUID().uuidString.prefix(8))"
         let genDir = generationsDir.appendingPathComponent(genID, isDirectory: true)
+        var didCommitGeneration = false
 
         do {
             try FileManager.default.copyItem(at: stagingDir, to: genDir)
@@ -1108,11 +1125,57 @@ extension DatabaseManager {
             let publishedDB = genDir.appendingPathComponent("bonds.sqlite3")
             _ = try DatabaseManager.validateDatabaseIntegrity(at: publishedDB)
 
+            // Flush database and generation directory metadata for power-loss durability before pointer switch
+            let dbFd = open(publishedDB.path, O_RDONLY)
+            if dbFd >= 0 {
+                #if os(macOS)
+                    _ = fcntl(dbFd, F_FULLFSYNC)
+                #else
+                    fsync(dbFd)
+                #endif
+                Darwin.close(dbFd)
+            }
+            let genFd = open(genDir.path, O_RDONLY)
+            if genFd >= 0 {
+                #if os(macOS)
+                    _ = fcntl(genFd, F_FULLFSYNC)
+                #else
+                    fsync(genFd)
+                #endif
+                Darwin.close(genFd)
+            }
+
             if _injectedFailureDuringPublication {
                 throw DatabaseError.statementFailed("Injected publication failure for testing")
             }
 
-            // Atomically switch 'current' pointer to this new immutable generation
+            // Pre-prepare top-level compatibility symlinks before committing pointer switch
+            let stagingItems = try FileManager.default.contentsOfDirectory(at: stagingDir, includingPropertiesForKeys: nil)
+            for item in stagingItems {
+                let itemName = item.lastPathComponent
+                let topItem = destinationDir.appendingPathComponent(itemName)
+                var needsLink = true
+                if lstat(topItem.path, &statBuf) == 0 {
+                    let isSymlink = (statBuf.st_mode & S_IFMT) == S_IFLNK
+                    if isSymlink {
+                        needsLink = false
+                    } else {
+                        try FileManager.default.removeItem(at: topItem)
+                    }
+                }
+                if needsLink {
+                    let tmpTop = destinationDir.appendingPathComponent(".top_tmp_\(itemName)_\(UUID().uuidString)")
+                    try FileManager.default.createSymbolicLink(atPath: tmpTop.path, withDestinationPath: "current/\(itemName)")
+                    let topRenameRc = rename(tmpTop.path, topItem.path)
+                    if topRenameRc != 0 {
+                        let err = errno
+                        try? FileManager.default.removeItem(at: tmpTop)
+                        throw DatabaseError.statementFailed("Failed to establish top-level compatibility link for \(itemName): errno \(err)")
+                    }
+                }
+            }
+
+            // Atomically switch 'current' pointer to this new immutable generation (COMMIT POINT)
             let tempCurrentSymlink = destinationDir.appendingPathComponent(".current_tmp_\(UUID().uuidString)")
             try FileManager.default.createSymbolicLink(atPath: tempCurrentSymlink.path, withDestinationPath: "generations/\(genID)")
 
@@ -1130,31 +1193,30 @@ extension DatabaseManager {
                 throw DatabaseError.statementFailed("Atomic generation switch failed: errno \(err)")
             }
 
-            // Maintain top-level symlinks into 'current' for direct / transparent access
-            let stagingItems = try FileManager.default.contentsOfDirectory(at: stagingDir, includingPropertiesForKeys: nil)
-            for item in stagingItems {
-                let itemName = item.lastPathComponent
-                let topItem = destinationDir.appendingPathComponent(itemName)
-                var needsLink = true
-                if lstat(topItem.path, &statBuf) == 0 {
-                    let isSymlink = (statBuf.st_mode & S_IFMT) == S_IFLNK
-                    if isSymlink {
-                        needsLink = false
-                    } else {
-                        try? FileManager.default.removeItem(at: topItem)
-                    }
-                }
-                if needsLink {
-                    let tmpTop = destinationDir.appendingPathComponent(".top_tmp_\(itemName)_\(UUID().uuidString)")
-                    try FileManager.default.createSymbolicLink(atPath: tmpTop.path, withDestinationPath: "current/\(itemName)")
-                    _ = rename(tmpTop.path, topItem.path)
-                }
+            // COMMIT POINT: Generation switch succeeded!
+            // From this point onward, genDir is the committed active generation and must NEVER be deleted.
+            didCommitGeneration = true
+
+            // Flush destination directory metadata after pointer switch
+            let destFd = open(destinationDir.path, O_RDONLY)
+            if destFd >= 0 {
+                #if os(macOS)
+                    _ = fcntl(destFd, F_FULLFSYNC)
+                #else
+                    fsync(destFd)
+                #endif
+                Darwin.close(destFd)
+            }
+
+            if _injectedFailureAfterGenerationCommit {
+                throw DatabaseError.statementFailed("Injected failure after generation commit for testing")
             }
 
             ScanLog.shared.write("collection backup completed: generation=\(genID) records=\(allRecords.count) photos=\(copiedPhotos.count)")
         } catch {
-            // Only clean up the failed new generation. The current pointer and all previous generations remain untouched.
-            if FileManager.default.fileExists(atPath: genDir.path) {
+            // Only clean up the new generation if failure occurred BEFORE the generation was committed.
+            // Once committed, the active generation is preserved and never deleted.
+            if !didCommitGeneration, FileManager.default.fileExists(atPath: genDir.path) {
                 try? FileManager.default.removeItem(at: genDir)
             }
             throw error
