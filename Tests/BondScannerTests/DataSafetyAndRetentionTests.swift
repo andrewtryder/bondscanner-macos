@@ -103,10 +103,16 @@ final class DataSafetyAndRetentionTests: XCTestCase {
 
     func testProductionStorageIsProtectedInTestMode() {
         XCTAssertTrue(isProductionStorageProtected())
+        let fakeProdRoot = tempDir.appendingPathComponent("fake_prod", isDirectory: true)
+        StorageConfiguration.shared.setCustomProductionRoot(fakeProdRoot)
+        XCTAssertTrue(isProductionStorageProtected(destination: fakeProdRoot))
+        XCTAssertTrue(isProductionStorageProtected(destination: fakeProdRoot.appendingPathComponent("bonds.sqlite3")))
     }
 
     func testDirectProductionDatabaseInitForbiddenInTestMode() {
-        let prodDB = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans/bonds.sqlite3")
+        let fakeProdRoot = tempDir.appendingPathComponent("fake_prod_db", isDirectory: true)
+        StorageConfiguration.shared.setCustomProductionRoot(fakeProdRoot)
+        let prodDB = fakeProdRoot.appendingPathComponent("bonds.sqlite3")
         XCTAssertThrowsError(try DatabaseManager(url: prodDB)) { error in
             guard let dbError = error as? DatabaseError, case .permissionDenied = dbError else {
                 XCTFail("Expected DatabaseError.permissionDenied, got: \(error)")
@@ -117,8 +123,10 @@ final class DataSafetyAndRetentionTests: XCTestCase {
 
     func testExportToProductionForbiddenInTestMode() {
         let sample = makeRecord(serial: "C123456789EE")
-        let prodCSV = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans/bonds.csv")
-        let prodJSON = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans/records.json")
+        let fakeProdRoot = tempDir.appendingPathComponent("fake_prod_export", isDirectory: true)
+        StorageConfiguration.shared.setCustomProductionRoot(fakeProdRoot)
+        let prodCSV = fakeProdRoot.appendingPathComponent("bonds.csv")
+        let prodJSON = fakeProdRoot.appendingPathComponent("records.json")
 
         XCTAssertThrowsError(try exportCSV([sample], to: prodCSV)) { error in
             guard let storageError = error as? StorageError, case .productionAccessForbidden = storageError else {
@@ -136,19 +144,14 @@ final class DataSafetyAndRetentionTests: XCTestCase {
     }
 
     func testScanLogGuardedInTestMode() {
-        let prodLog = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans/scan-debug.log")
-        let sizeBefore = (try? FileManager.default.attributesOfItem(atPath: prodLog.path)[.size] as? UInt64) ?? 0
-        let mtimeBefore = try? FileManager.default.attributesOfItem(atPath: prodLog.path)[.modificationDate] as? Date
-
+        let fakeProdRoot = tempDir.appendingPathComponent("fake_prod_log", isDirectory: true)
+        let fakeProdLog = fakeProdRoot.appendingPathComponent("scan-debug.log")
+        StorageConfiguration.shared.setCustomProductionRoot(fakeProdRoot)
         ScanLog.shared.resetToDefaults()
-        StorageConfiguration.shared.resetToDefaults()
+
         ScanLog.shared.write("test log entry during unit test that must not write to production")
 
-        let sizeAfter = (try? FileManager.default.attributesOfItem(atPath: prodLog.path)[.size] as? UInt64) ?? 0
-        let mtimeAfter = try? FileManager.default.attributesOfItem(atPath: prodLog.path)[.modificationDate] as? Date
-
-        XCTAssertEqual(sizeBefore, sizeAfter, "Production log must not grow in test mode")
-        XCTAssertEqual(mtimeBefore, mtimeAfter, "Production log modification date must not change in test mode")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fakeProdLog.path), "ScanLog in test mode must not write to configured production log")
 
         // Restore custom roots
         StorageConfiguration.shared.setCustomRoots(
@@ -161,10 +164,8 @@ final class DataSafetyAndRetentionTests: XCTestCase {
     }
 
     func testApplicationLifecycleDoesNotTouchProduction() {
-        let prodDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans", isDirectory: true)
-        let entriesBefore = (try? FileManager.default.contentsOfDirectory(atPath: prodDir.path)) ?? []
-        let prodDB = prodDir.appendingPathComponent("bonds.sqlite3")
-        let dbMtimeBefore = try? FileManager.default.attributesOfItem(atPath: prodDB.path)[.modificationDate] as? Date
+        let fakeProdRoot = tempDir.appendingPathComponent("fake_prod_lifecycle", isDirectory: true)
+        StorageConfiguration.shared.setCustomProductionRoot(fakeProdRoot)
 
         let app = BondScannerApp()
         let didFinishNotification = Notification(name: NSApplication.didFinishLaunchingNotification)
@@ -173,11 +174,25 @@ final class DataSafetyAndRetentionTests: XCTestCase {
         app.applicationDidFinishLaunching(didFinishNotification)
         app.applicationWillTerminate(willTerminateNotification)
 
-        let entriesAfter = (try? FileManager.default.contentsOfDirectory(atPath: prodDir.path)) ?? []
-        let dbMtimeAfter = try? FileManager.default.attributesOfItem(atPath: prodDB.path)[.modificationDate] as? Date
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fakeProdRoot.path), "No production directory or files must be created during test lifecycle")
+    }
 
-        XCTAssertEqual(entriesBefore.sorted(), entriesAfter.sorted(), "No new files must be created in ~/BondScans during test lifecycle")
-        XCTAssertEqual(dbMtimeBefore, dbMtimeAfter, "Production database must not be modified during test lifecycle")
+    func testSharedDatabaseFallsBackToInMemoryInTestMode() throws {
+        DatabaseManager.setSharedInstance(nil)
+        let shared = DatabaseManager.shared
+        XCTAssertTrue(shared.isInMemory, "DatabaseManager.shared must fall back to in-memory mode when test mode is active")
+        XCTAssertEqual(shared.currentURL.absoluteString, "file::memory:")
+
+        // Verify that no file named ':memory:' was created on disk in the working directory
+        let cwdMemory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(":memory:")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cwdMemory.path), "Must not create a literal ':memory:' file on disk")
+
+        let rec = makeRecord(id: "mem-1", serial: "M123456789EE")
+        try shared.upsertRecord(rec)
+        let fetched = try shared.fetchRecord(id: "mem-1")
+        XCTAssertEqual(fetched?.serial, "M123456789EE")
+
+        DatabaseManager.setSharedInstance(testDb)
     }
 
     // MARK: - 2. Photograph Ownership and Retention Tracking
@@ -327,14 +342,43 @@ final class DataSafetyAndRetentionTests: XCTestCase {
         try testDb.upsertRecord(recB)
 
         // Attempting to trash recA's photo should NOT trash it because recB references it
-        _ = safelyTrashPhotographs(for: recA, existingRecords: [recA, recB])
+        _ = try? safelyTrashPhotographs(for: recA, existingRecords: [recA, recB], database: testDb, root: StorageConfiguration.shared.outputRoot)
         XCTAssertTrue(FileManager.default.fileExists(atPath: photoURL.path), "Shared photo must NOT be trashed while recB references it")
 
         // Now delete recB from DB as well
         try testDb.deleteRecord(id: "rec-B")
         // Now photo is unreferenced anywhere outside recA
-        _ = safelyTrashPhotographs(for: recA, existingRecords: [recA])
+        _ = try? safelyTrashPhotographs(for: recA, existingRecords: [recA], database: testDb, root: StorageConfiguration.shared.outputRoot)
         XCTAssertFalse(FileManager.default.fileExists(atPath: photoURL.path), "Unreferenced photo should be trashed")
+    }
+
+    func testSafelyTrashPhotographsAuthoritativeDatabaseCheck() throws {
+        let (photoURL, relPhoto) = createDummyImageFile(named: "authoritative.jpg")
+        let existing = makeRecord(id: "rec-auth", serial: "AUTH12345EE", photo: relPhoto)
+        try testDb.upsertRecord(existing)
+
+        let candidateToDelete = makeRecord(id: "other-rec", photo: relPhoto)
+        // Pass empty in-memory array, but pass database
+        let trashed = try safelyTrashPhotographs(for: candidateToDelete, existingRecords: [], database: testDb, root: StorageConfiguration.shared.outputRoot)
+
+        XCTAssertTrue(trashed.isEmpty, "Photograph must not be trashed when referenced in the database, even if existingRecords array is empty")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: photoURL.path))
+    }
+
+    func testSafelyTrashPhotographsRejectsPathTraversalAndProduction() throws {
+        let fakeProdRoot = tempDir.appendingPathComponent("fake_prod_trash", isDirectory: true)
+        StorageConfiguration.shared.setCustomProductionRoot(fakeProdRoot)
+
+        let record = makeRecord(id: "traversal", photo: "../../secret.jpg")
+        let trashed = try safelyTrashPhotographs(for: record, existingRecords: [], database: testDb, root: StorageConfiguration.shared.outputRoot)
+        XCTAssertTrue(trashed.isEmpty, "Path traversal photo must not be trashed")
+
+        XCTAssertThrowsError(try safelyTrashPhotographs(for: record, existingRecords: [], database: testDb, root: fakeProdRoot)) { error in
+            guard let storageError = error as? StorageError, case .productionAccessForbidden = storageError else {
+                XCTFail("Expected StorageError.productionAccessForbidden, got: \(error)")
+                return
+            }
+        }
     }
 
     func testLegacyJSONMigrationExtractsAssociatedPhotosFromNotes() throws {
@@ -425,6 +469,137 @@ final class DataSafetyAndRetentionTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: photoURL.path))
     }
 
+    func testBackupFailurePreservesPreexistingFilesInDestination() throws {
+        let callerDestDir = tempDir.appendingPathComponent("caller_backup_dest", isDirectory: true)
+        try FileManager.default.createDirectory(at: callerDestDir, withIntermediateDirectories: true)
+        let canaryFile = callerDestDir.appendingPathComponent("important_user_file.txt")
+        try Data("DO_NOT_DELETE".utf8).write(to: canaryFile)
+
+        // Create a record that references a missing photo so backup fails
+        let missingRecord = makeRecord(id: "rec-missing", serial: "X123456789EE", photo: "photos/non_existent.jpg")
+        try testDb.upsertRecord(missingRecord)
+
+        XCTAssertThrowsError(try testDb.backupCollection(to: callerDestDir, photosSourceDir: testPhotosDir))
+
+        // Verify the caller directory and canary file were NOT deleted on failure
+        XCTAssertTrue(FileManager.default.fileExists(atPath: callerDestDir.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: canaryFile.path))
+        let content = try? String(contentsOf: canaryFile, encoding: .utf8)
+        XCTAssertEqual(content, "DO_NOT_DELETE")
+    }
+
+    func testBackupRefusesCollectionRootAsDestination() throws {
+        let collectionRoot = StorageConfiguration.shared.outputRoot
+        XCTAssertThrowsError(try testDb.backupCollection(to: collectionRoot, photosSourceDir: testPhotosDir)) { error in
+            guard let dbError = error as? DatabaseError, case .permissionDenied = dbError else {
+                XCTFail("Expected DatabaseError.permissionDenied, got: \(error)")
+                return
+            }
+        }
+    }
+
+    func testRestoreRollbackOnPhotoCopyFailure() throws {
+        let (originalPhotoURL, relOriginalPhoto) = createDummyImageFile(named: "orig_photo.jpg")
+        let origRec = makeRecord(id: "orig-1", serial: "ORIG123456EE", photo: relOriginalPhoto)
+        try testDb.upsertRecord(origRec)
+
+        // Create a valid backup in backupDir with a different record
+        let (_, relBackupPhoto) = createDummyImageFile(named: "backup_photo.jpg")
+        let backupRec = makeRecord(id: "backup-1", serial: "BACKUP98765EE", photo: relBackupPhoto)
+        let tempBackupDBURL = tempDir.appendingPathComponent("temp_for_backup.sqlite3")
+        let tempBackupDB = try DatabaseManager(url: tempBackupDBURL)
+        try tempBackupDB.upsertRecord(backupRec)
+
+        let validBackupDir = tempDir.appendingPathComponent("valid_backup_source", isDirectory: true)
+        try tempBackupDB.backupCollection(to: validBackupDir, photosSourceDir: testPhotosDir)
+
+        // Inject failure after database replacement but before photo copy finishes
+        XCTAssertThrowsError(
+            try testDb.restoreCollection(
+                from: validBackupDir,
+                destinationDBURL: testDbURL,
+                destinationPhotosDir: testPhotosDir,
+                authorized: true,
+                _injectedFailureAfterDB: true
+            )
+        ) { error in
+            guard let dbError = error as? DatabaseError, case .restoreFailed = dbError else {
+                XCTFail("Expected DatabaseError.restoreFailed, got: \(error)")
+                return
+            }
+        }
+
+        // Verify active database rolled back to original records
+        let recordsAfterRollback = try testDb.loadAllRecords()
+        XCTAssertEqual(recordsAfterRollback.count, 1)
+        XCTAssertEqual(recordsAfterRollback.first?.id, "orig-1")
+        XCTAssertEqual(recordsAfterRollback.first?.serial, "ORIG123456EE")
+
+        // Verify original photo remains intact
+        XCTAssertTrue(FileManager.default.fileExists(atPath: originalPhotoURL.path))
+    }
+
+    func testRestoreFailsWhenManifestRecordCountMismatchesDatabase() throws {
+        let (_, relPhoto) = createDummyImageFile(named: "test_mismatch.jpg")
+        let rec = makeRecord(id: "rec-mm", serial: "MM12345678EE", photo: relPhoto)
+        try testDb.upsertRecord(rec)
+
+        let backupDir = tempDir.appendingPathComponent("mismatch_manifest_backup", isDirectory: true)
+        try testDb.backupCollection(to: backupDir, photosSourceDir: testPhotosDir)
+
+        // Tamper manifest with wrong record count
+        let manifestURL = backupDir.appendingPathComponent("backup_manifest.json")
+        let manifestData = try Data(contentsOf: manifestURL)
+        let manifest = try JSONDecoder().decode(CollectionBackupManifest.self, from: manifestData)
+        let tampered = CollectionBackupManifest(
+            timestamp: manifest.timestamp,
+            schemaVersion: manifest.schemaVersion,
+            recordCount: manifest.recordCount + 10,
+            databaseFileName: manifest.databaseFileName,
+            photoFiles: manifest.photoFiles
+        )
+        try JSONEncoder().encode(tampered).write(to: manifestURL)
+
+        let restoreDBURL = tempDir.appendingPathComponent("tampered_restore.sqlite3")
+        let restorePhotosDir = tempDir.appendingPathComponent("tampered_photos", isDirectory: true)
+
+        XCTAssertThrowsError(try testDb.restoreCollection(from: backupDir, destinationDBURL: restoreDBURL, destinationPhotosDir: restorePhotosDir, authorized: true)) { error in
+            guard let dbError = error as? DatabaseError, case .restoreFailed = dbError else {
+                XCTFail("Expected DatabaseError.restoreFailed, got: \(error)")
+                return
+            }
+        }
+    }
+
+    func testRestoreFailsOnMalformedRecordJSON() throws {
+        let badDBURL = tempDir.appendingPathComponent("malformed_json.sqlite3")
+        let badDB = try DatabaseManager(url: badDBURL)
+        try badDB.execute("INSERT INTO bonds (id, sort_order, captured_at, updated_at, record_json) VALUES ('bad-1', 1, 'now', 'now', 'NOT_VALID_JSON');")
+
+        let badBackupDir = tempDir.appendingPathComponent("bad_backup_dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: badBackupDir, withIntermediateDirectories: true)
+        try badDB.backupDatabase(to: badBackupDir.appendingPathComponent("bonds.sqlite3"))
+
+        let manifest = CollectionBackupManifest(
+            timestamp: "2026-11-15T00:00:00Z",
+            schemaVersion: 1,
+            recordCount: 1,
+            databaseFileName: "bonds.sqlite3",
+            photoFiles: []
+        )
+        try JSONEncoder().encode(manifest).write(to: badBackupDir.appendingPathComponent("backup_manifest.json"))
+
+        let restoreDBURL = tempDir.appendingPathComponent("restore_fail.sqlite3")
+        let restorePhotosDir = tempDir.appendingPathComponent("photos_fail", isDirectory: true)
+
+        XCTAssertThrowsError(try testDb.restoreCollection(from: badBackupDir, destinationDBURL: restoreDBURL, destinationPhotosDir: restorePhotosDir, authorized: true)) { error in
+            guard let dbError = error as? DatabaseError, case .restoreFailed = dbError else {
+                XCTFail("Expected DatabaseError.restoreFailed, got: \(error)")
+                return
+            }
+        }
+    }
+
     // MARK: - 4. Issue-Date OCR Multi-line and Dating Stamp Logic
 
     func testExtractIssueDateReadingWithAdjacentTwoDigitMonthAndYear() {
@@ -449,5 +624,32 @@ final class DataSafetyAndRetentionTests: XCTestCase {
         XCTAssertEqual(stamp?.month, "04")
         XCTAssertEqual(stamp?.day, 14)
         XCTAssertTrue(stamp?.raw.contains("APR") ?? false)
+    }
+
+    func testExtractIssueDateRejectsDistantNumbers() {
+        // Month at top-left, year at bottom-right (spatially separated)
+        let distantLines = [
+            OCRLine(text: "05", confidence: 0.9, box: CGRect(x: 0.1, y: 0.9, width: 0.05, height: 0.03)),
+            OCRLine(text: "1995", confidence: 0.9, box: CGRect(x: 0.85, y: 0.15, width: 0.08, height: 0.03)),
+        ]
+        let reading = extractIssueDateReading(distantLines, series: "EE")
+        XCTAssertNotEqual(reading.value, "05/1995", "Distant numbers must not be paired as an issue date")
+    }
+
+    func testExtractIssueDateRejectsRulerTicksOrNumbersWithoutYear() {
+        let rulerLines = [
+            OCRLine(text: "1 2 3 4 5 6 7 8 9 10 11 12", confidence: 0.85, box: CGRect(x: 0.5, y: 0.5, width: 0.4, height: 0.02)),
+            OCRLine(text: "04", confidence: 0.9, box: CGRect(x: 0.7, y: 0.7, width: 0.04, height: 0.02)),
+        ]
+        let reading = extractIssueDateReading(rulerLines, series: "EE")
+        XCTAssertTrue(reading.value.isEmpty, "Ruler ticks or solo month numbers without year must not produce issue date")
+    }
+
+    func testExtractIssueDatePenalizesCompetingDatingStampLine() {
+        let stampLines = [
+            OCRLine(text: "DATING STAMP 14 APR 1986", confidence: 0.95, box: CGRect(x: 0.65, y: 0.45, width: 0.25, height: 0.03)),
+        ]
+        let reading = extractIssueDateReading(stampLines, series: "EE")
+        XCTAssertTrue(reading.value.isEmpty || !reading.isHigh, "Dating stamp line must not produce high confidence issue date")
     }
 }

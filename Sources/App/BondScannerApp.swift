@@ -1422,7 +1422,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     }
 
     private func trashCapturePhotos(_ record: BondRecord) {
-        safelyTrashPhotographs(for: record, existingRecords: records, root: outputRoot)
+        _ = try? safelyTrashPhotographs(for: record, existingRecords: records, database: DatabaseManager.shared, root: outputRoot)
     }
 
     private func priorRecord(for incoming: BondRecord) -> BondRecord? {
@@ -1931,7 +1931,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         do {
             try deleteRecordLive(id: last.id, allRecords: Array(remaining))
             records.removeLast()
-            safelyTrashPhotographs(for: last, existingRecords: records, root: outputRoot)
+            _ = try? safelyTrashPhotographs(for: last, existingRecords: records, database: DatabaseManager.shared, root: outputRoot)
             updateCount()
             lockedAfterCapture = false
             awaitingSerialFromCapture = false

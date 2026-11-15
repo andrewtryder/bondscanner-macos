@@ -12,6 +12,7 @@ final class StorageConfiguration {
     private let lock = NSLock()
     private var customOutputRoot: URL?
     private var customBackupsRoot: URL?
+    private var customProductionRoot: URL?
 
     var outputRoot: URL {
         lock.lock()
@@ -37,6 +38,15 @@ final class StorageConfiguration {
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans_backups", isDirectory: true)
     }
 
+    var productionRoot: URL {
+        lock.lock()
+        defer { lock.unlock() }
+        if let custom = customProductionRoot {
+            return custom
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans", isDirectory: true)
+    }
+
     func setCustomOutputRoot(_ url: URL?) {
         lock.lock()
         defer { lock.unlock() }
@@ -49,11 +59,18 @@ final class StorageConfiguration {
         customBackupsRoot = url
     }
 
-    func setCustomRoots(outputRoot: URL?, backupsRoot: URL?) {
+    func setCustomProductionRoot(_ url: URL?) {
+        lock.lock()
+        defer { lock.unlock() }
+        customProductionRoot = url
+    }
+
+    func setCustomRoots(outputRoot: URL?, backupsRoot: URL?, productionRoot: URL? = nil) {
         lock.lock()
         defer { lock.unlock() }
         customOutputRoot = outputRoot
         customBackupsRoot = backupsRoot
+        customProductionRoot = productionRoot
     }
 
     func resetToDefaults() {
@@ -61,6 +78,7 @@ final class StorageConfiguration {
         defer { lock.unlock() }
         customOutputRoot = nil
         customBackupsRoot = nil
+        customProductionRoot = nil
     }
 }
 
@@ -109,9 +127,11 @@ func isProductionStorageProtected() -> Bool {
 
 func isProductionStorageProtected(destination: URL) -> Bool {
     guard isTestModeActive else { return false }
-    let defaultProd = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans", isDirectory: true).standardized.path
+    let configuredProd = StorageConfiguration.shared.productionRoot.standardized.path
+    let defaultHomeProd = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BondScans", isDirectory: true).standardized.path
     let destPath = destination.standardized.path
-    return destPath == defaultProd || destPath.hasPrefix(defaultProd + "/")
+    return destPath == configuredProd || destPath.hasPrefix(configuredProd + "/")
+        || destPath == defaultHomeProd || destPath.hasPrefix(defaultHomeProd + "/")
 }
 
 func addAssociatedPhotos(to record: inout BondRecord, newPhotos: [String]) {
@@ -144,7 +164,15 @@ func isPhotographReferenced(_ photoPath: String, excludingRecordId: String? = ni
 }
 
 @discardableResult
-func safelyTrashPhotographs(for record: BondRecord, existingRecords: [BondRecord], root: URL = outputRoot) -> [String] {
+func safelyTrashPhotographs(
+    for record: BondRecord,
+    existingRecords: [BondRecord],
+    database: DatabaseManager? = nil,
+    root: URL = outputRoot
+) throws -> [String] {
+    if isProductionStorageProtected(destination: root) {
+        throw StorageError.productionAccessForbidden("Cannot trash photographs in production storage during test mode: \(root.path)")
+    }
     var trashed: [String] = []
     var candidatePhotos = Set<String>()
     if !record.photo.isEmpty {
@@ -165,10 +193,25 @@ func safelyTrashPhotographs(for record: BondRecord, existingRecords: [BondRecord
     }
 
     for rel in candidatePhotos {
-        if isPhotographReferenced(rel, excludingRecordId: record.id, among: existingRecords) {
+        // Authoritative database check if database is available; otherwise fallback to in-memory array
+        if let db = database {
+            if (try? db.isPhotographReferenced(rel, excludingRecordId: record.id)) == true {
+                continue
+            }
+        } else if isPhotographReferenced(rel, excludingRecordId: record.id, among: existingRecords) {
             continue
         }
-        let url = root.appendingPathComponent(rel)
+
+        let url = rel.hasPrefix("/") ? URL(fileURLWithPath: rel).standardized : root.appendingPathComponent(rel).standardized
+        // Ensure path remains strictly inside the intended storage root (prevent path traversal)
+        guard url.path.hasPrefix(root.standardized.path) else {
+            ScanLog.shared.write("Attempted photograph path traversal prevented: \(rel)")
+            continue
+        }
+        if isProductionStorageProtected(destination: url) {
+            throw StorageError.productionAccessForbidden("Cannot trash production photograph in test mode: \(url.path)")
+        }
+
         if FileManager.default.fileExists(atPath: url.path) {
             do {
                 try FileManager.default.trashItem(at: url, resultingItemURL: nil)
