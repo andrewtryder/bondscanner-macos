@@ -9,14 +9,20 @@ import FoundationModels
 
 /// The only production inference implementation. It explicitly instantiates
 /// `SystemLanguageModel.default`; it never constructs a cloud/PCC model.
+enum BondAIAnalysisMode: String, Sendable { case automatic, textOnly, multimodal }
+
 struct LocalBondAIAnalyzer: BondAIAnalyzing {
+    /// Evaluation can force a mode while production continues to select the best
+    /// available local capability automatically.
+    let mode: BondAIAnalysisMode
+    init(mode: BondAIAnalysisMode = .automatic) { self.mode = mode }
     func analyze(record: BondRecord, imageURL: URL) async -> BondAIAnalysis {
         let revision = record.revision ?? 0
         #if canImport(FoundationModels)
-        if #available(macOS 27.0, *), SystemLanguageModel.default.isAvailable {
+        if #available(macOS 27.0, *), mode != .textOnly, SystemLanguageModel.default.isAvailable {
             return await analyzeMultimodal(record: record, imageURL: imageURL, revision: revision)
         }
-        if #available(macOS 26.0, *), SystemLanguageModel.default.isAvailable {
+        if #available(macOS 26.0, *), mode != .multimodal, SystemLanguageModel.default.isAvailable {
             return await analyzeTextOnly(record: record, revision: revision)
         }
         #endif
@@ -116,12 +122,14 @@ struct LocalBondAIAnalyzer: BondAIAnalyzing {
             guard permitted.contains(item.field) else { return nil }
             let proposed = item.proposedValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let abstained = item.abstained || proposed.isEmpty
-            // Format validity is never evidence.  A serial needs both normal validation
-            // and independent Vision OCR corroboration; ambiguous characters abstain.
-            if !abstained && item.field == "serial" && (!validatedSerial(cleanAlnum(proposed), series: record.series).isHigh || !BondAIEvidence.corroboratesSerial(proposed, in: record)) { return nil }
+            // Format validity is never evidence.  A non-corroborated visual serial is
+            // retained only as explicitly unverified, inspection-required advice.
+            if !abstained && item.field == "serial" && !validatedSerial(cleanAlnum(proposed), series: record.series).isHigh { return nil }
             if !abstained && item.field == "series" && !validSeriesValues().contains(proposed.uppercased()) { return nil }
+            let visionCorroborated = item.field != "serial" || BondAIEvidence.corroboratesSerial(proposed, in: record)
             let assessment = BondAISuggestion.Assessment(rawValue: item.assessment) ?? .insufficientEvidence
-            return BondAISuggestion(field: item.field, existingValue: BondAIEvidence.value(for: item.field, record: record), proposedValue: abstained ? nil : proposed, abstained: abstained, evidence: String(item.evidence.prefix(160)), imageRegion: item.evidence.contains("region") ? item.evidence : nil, ambiguity: String(item.ambiguity.prefix(300)), assessment: assessment, requiresOriginalInspection: item.requiresOriginalInspection || assessment != .strongEvidence)
+            let evidence = visionCorroborated ? String(item.evidence.prefix(160)) : "visual-unverified:\(String(item.evidence.prefix(140)))"
+            return BondAISuggestion(field: item.field, existingValue: BondAIEvidence.value(for: item.field, record: record), proposedValue: abstained ? nil : proposed, abstained: abstained, evidence: evidence, imageRegion: item.evidence.contains("region") ? item.evidence : nil, ambiguity: String(item.ambiguity.prefix(300)), assessment: visionCorroborated ? assessment : .conflictingEvidence, requiresOriginalInspection: !visionCorroborated || item.requiresOriginalInspection || assessment != .strongEvidence)
         }
         return BondAIAnalysis(recordID: record.id, recordRevision: revision, analyzedAt: Date(), runtime: "Apple SystemLanguageModel (on-device)", promptVersion: BondAIAnalysis.currentPromptVersion, status: suggestions.allSatisfy(\.abstained) ? .abstained : .ready, suggestions: suggestions, summary: String(generated.summary.prefix(300)), failureKind: nil)
     }
