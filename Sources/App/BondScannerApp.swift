@@ -46,6 +46,20 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     var focusLabel: NSTextField!
     var focusInfo = "Focus: awaiting camera"
     var captureDevice: AVCaptureDevice?
+    var currentDeviceInput: AVCaptureDeviceInput?
+    var currentExposureCapabilities: CameraHardwareExposureCapabilities = .inspect(device: nil)
+    var webcamPreferences = WebcamPreferences()
+    var smartExposurePreferences = SmartExposurePreferences()
+    var captureTransactionCoordinator = CaptureTransactionCoordinator()
+    var pendingReconnectionDeviceID: String?
+    var stabilizationStartTime: TimeInterval = 0
+    var priorFrameLuminance: Float = 0
+    var isCameraSwitching = false
+    var connectedDeviceDescriptors: [WebcamDescriptor] = []
+    var cameraSubmenu: NSMenu?
+    var settingsCameraPopUp: NSPopUpButton?
+    var settingsSmartExposurePopUp: NSPopUpButton?
+    var settingsCameraStatusLabel: NSTextField?
     var nextAutoAllowedAt: TimeInterval = 0
     var lastHuntAt: TimeInterval = 0
     var huntRunning = false
@@ -113,7 +127,14 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     let analysisQueue = DispatchQueue(label: "bondscanner.analysis", qos: .userInitiated)
     let ocrQueue = DispatchQueue(label: "bondscanner.ocr", qos: .userInitiated)
     let saveQueue = DispatchQueue(label: "bondscanner.save", qos: .userInitiated)
-    var photoRequests: [Int64: (automatic: Bool, requestedAt: TimeInterval)] = [:]
+    struct PhotoRequestInfo {
+        let automatic: Bool
+        let requestedAt: TimeInterval
+        var biasEV: Float = 0.0
+        var completion: ((Result<CapturedExposure, Error>) -> Void)?
+    }
+
+    var photoRequests: [Int64: PhotoRequestInfo] = [:]
 
     struct OCRJobContext {
         let id: String
@@ -123,6 +144,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         let recentIssueDates: [(month: String, year: String)]
         let captureRequestedAt: TimeInterval
         let enqueuedAt: TimeInterval
+        var bracketedExposures: [(biasEV: Float, url: URL, relativePath: String)] = []
     }
 
     var ocrPending: [OCRJobContext] = []
@@ -283,7 +305,6 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         }
     }
 
-
     func setupMenu() {
         let bar = NSMenu()
         let appItem = NSMenuItem()
@@ -338,11 +359,10 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         bar.addItem(debugItem)
         let cameraItem = NSMenuItem()
         let cameraMenu = NSMenu(title: "Camera")
-        let refocus = NSMenuItem(title: "Request Refocus", action: #selector(refocusCamera), keyEquivalent: "r")
-        refocus.target = self
-        cameraMenu.addItem(refocus)
         cameraItem.submenu = cameraMenu
         bar.addItem(cameraItem)
+        cameraSubmenu = cameraMenu
+        refreshCameraMenu()
         NSApp.mainMenu = bar
     }
 
@@ -612,7 +632,6 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         }
     }
 
-
     func updateCount(syncReviewCoordinator: Bool = true) {
         let processing = records.filter { $0.status == "PROCESSING" }.count
         let duplicates = records.filter { $0.status == "DUPLICATE" }.count
@@ -670,5 +689,4 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     @objc func openFolder() {
         NSWorkspace.shared.open(outputRoot)
     }
-
 }

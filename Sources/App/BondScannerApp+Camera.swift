@@ -241,38 +241,72 @@ extension BondScannerApp {
     }
 
     func startCamera() {
+        setupCameraNotifications()
         let devices = videoCaptureDevices()
-        ScanLog.shared.write("video devices found=\(devices.count)")
-        guard let camera = devices.first(where: { $0.uniqueID.lowercased().contains("1bcf0b26") || $0.localizedName.lowercased().contains("nexigo") }) ?? devices.first else {
-            status("No webcam found. Plug in the NexiGo, then relaunch; you can still import photos.")
+        connectedDeviceDescriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
+        ScanLog.shared.write("video devices found=\(devices.count) descriptors=\(connectedDeviceDescriptors.map(\.displayNameWithCategory))")
+
+        let selection = webcamPreferences.loadSelection()
+        let resolution = WebcamResolver.resolveActiveCamera(selection: selection, available: connectedDeviceDescriptors)
+
+        guard let chosenDescriptor = resolution.selected,
+              let camera = devices.first(where: { $0.uniqueID == chosenDescriptor.id })
+        else {
+            captureDevice = nil
+            currentDeviceInput = nil
+            currentExposureCapabilities = .inspect(device: nil)
+            status("No camera available. Connect a webcam or built-in camera; you can still import photos.")
+            focusInfo = "Focus: no camera available"
+            focusLabel?.stringValue = focusInfo
+            refreshCameraMenu()
+            refreshSettingsCamera()
             return
         }
+
+        attachAndStartCamera(camera, descriptor: chosenDescriptor)
+    }
+
+    func attachAndStartCamera(_ camera: AVCaptureDevice, descriptor: WebcamDescriptor) {
         do {
             captureDevice = camera
+            currentExposureCapabilities = CameraHardwareExposureCapabilities.inspect(device: camera)
             logAllCameraFormats(camera)
             let input = try AVCaptureDeviceInput(device: camera)
             session.beginConfiguration()
-            // .inputPriority is unavailable on macOS. Do not set .high: that lets
-            // the session override a later activeFormat and deliver 1920x1080.
-            // Set activeFormat AFTER inputs and outputs are attached, then lock it.
-            guard session.canAddInput(input) else { throw NSError(domain: "Camera", code: 1, userInfo: [NSLocalizedDescriptionKey: "Camera input unavailable"]) }
+            if let old = currentDeviceInput {
+                session.removeInput(old)
+            }
+            guard session.canAddInput(input) else {
+                session.commitConfiguration()
+                throw NSError(domain: "Camera", code: 1, userInfo: [NSLocalizedDescriptionKey: "Camera input unavailable"])
+            }
             session.addInput(input)
+            currentDeviceInput = input
 
-            let output = AVCaptureVideoDataOutput()
-            output.alwaysDiscardsLateVideoFrames = true
-            output.setSampleBufferDelegate(self, queue: cameraQueue)
-            guard session.canAddOutput(output) else { throw NSError(domain: "Camera", code: 2, userInfo: [NSLocalizedDescriptionKey: "Video output unavailable"]) }
-            session.addOutput(output)
-            videoDataOutput = output
+            if videoDataOutput == nil {
+                let output = AVCaptureVideoDataOutput()
+                output.alwaysDiscardsLateVideoFrames = true
+                output.setSampleBufferDelegate(self, queue: cameraQueue)
+                guard session.canAddOutput(output) else {
+                    session.commitConfiguration()
+                    throw NSError(domain: "Camera", code: 2, userInfo: [NSLocalizedDescriptionKey: "Video output unavailable"])
+                }
+                session.addOutput(output)
+                videoDataOutput = output
+            }
 
             photoCaptureSupported = false
-            if session.canAddOutput(photoOutput) {
-                session.addOutput(photoOutput)
-                photoCaptureSupported = true
-                let codecs = photoOutput.availablePhotoCodecTypes.map { $0.rawValue }.joined(separator: ",")
-                ScanLog.shared.write("photo output attached codecs=[\(codecs)]")
+            if !session.outputs.contains(where: { $0 === photoOutput }) {
+                if session.canAddOutput(photoOutput) {
+                    session.addOutput(photoOutput)
+                    photoCaptureSupported = true
+                    let codecs = photoOutput.availablePhotoCodecTypes.map { $0.rawValue }.joined(separator: ",")
+                    ScanLog.shared.write("photo output attached codecs=[\(codecs)]")
+                } else {
+                    ScanLog.shared.write("photo output not supported; stills will use the latest video frame")
+                }
             } else {
-                ScanLog.shared.write("photo output not supported; stills will use the latest video frame")
+                photoCaptureSupported = true
             }
 
             if let best = selectBestCaptureFormat(from: camera.formats) {
@@ -316,21 +350,147 @@ extension BondScannerApp {
             logCameraControls(camera)
             focusInfo = continuous ? "Focus: continuous autofocus requested" :
                 (autoFocus ? "Focus: one-shot autofocus requested" : "Focus: webcam controls unavailable / hardware-managed")
-            focusLabel.stringValue = focusInfo
+            focusLabel?.stringValue = focusInfo
 
             session.commitConfiguration()
             logActiveFormatState(camera, at: "after_commit")
-            ScanLog.shared.write("camera=\(camera.localizedName) uid_matches_nexigo=\(camera.localizedName.lowercased().contains("nexigo")) continuous_focus=\(continuous) one_shot_focus=\(autoFocus) focus_point=\(pointSupported)")
-            status("Camera: \(camera.localizedName). Finding bond outline or printed text…")
+            ScanLog.shared.write("camera=\(camera.localizedName) category=\(descriptor.category.rawValue) continuous_focus=\(continuous) one_shot_focus=\(autoFocus) focus_point=\(pointSupported) hardware_exposure=\(currentExposureCapabilities.supportsHardwareAdjustment)")
+            status("Camera: [\(descriptor.category.displayBadge)] \(descriptor.localizedName). Finding bond outline or printed text…")
             deliveredFrameLogged = false
             resolutionSettled = false
             didReassertFormat = false
             didTryHigherFormat = false
             cameraQueue.async {
-                self.session.startRunning()
+                if !self.session.isRunning {
+                    self.session.startRunning()
+                }
                 self.reassertChosenFormatIfNeeded(afterStart: true)
             }
-        } catch { status("Camera error: \(error.localizedDescription)") }
+            refreshCameraMenu()
+            refreshSettingsCamera()
+        } catch {
+            status("Camera error: \(error.localizedDescription)")
+            refreshCameraMenu()
+            refreshSettingsCamera()
+        }
+    }
+
+    /// Safely switches camera to the selected device, draining active captures if necessary.
+    func switchCamera(to descriptor: WebcamDescriptor, isExplicit: Bool = false) {
+        if isExplicit {
+            webcamPreferences.saveSelection(.explicit(uniqueID: descriptor.id))
+        }
+
+        if captureDevice?.uniqueID == descriptor.id {
+            refreshCameraMenu()
+            refreshSettingsCamera()
+            return
+        }
+
+        // If a capture transaction is running, defer switch until capture transaction completes
+        if captureTransactionCoordinator.isBusy || isProcessing {
+            pendingReconnectionDeviceID = descriptor.id
+            ScanLog.shared.write("camera switch to '\(descriptor.localizedName)' deferred: capture in progress")
+            return
+        }
+
+        isCameraSwitching = true
+        _ = captureTransactionCoordinator.cancelActiveTransaction()
+
+        cameraQueue.async { [weak self] in
+            guard let self = self else { return }
+            let devices = videoCaptureDevices()
+            guard let newDevice = devices.first(where: { $0.uniqueID == descriptor.id }) else {
+                DispatchQueue.main.async {
+                    self.isCameraSwitching = false
+                    self.status("Selected camera '\(descriptor.localizedName)' is not available.")
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.attachAndStartCamera(newDevice, descriptor: descriptor)
+                self.isCameraSwitching = false
+                ScanLog.shared.write("successfully switched camera to '\(descriptor.localizedName)' [\(descriptor.category.rawValue)]")
+            }
+        }
+    }
+
+    func setupCameraNotifications() {
+        NotificationCenter.default.removeObserver(self, name: AVCaptureDevice.wasConnectedNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: AVCaptureDevice.wasDisconnectedNotification, object: nil)
+
+        NotificationCenter.default.addObserver(self, selector: #selector(handleCameraConnected(_:)), name: AVCaptureDevice.wasConnectedNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleCameraDisconnected(_:)), name: AVCaptureDevice.wasDisconnectedNotification, object: nil)
+    }
+
+    @objc func handleCameraConnected(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let devices = videoCaptureDevices()
+            self.connectedDeviceDescriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
+            self.refreshCameraMenu()
+            self.refreshSettingsCamera()
+
+            let selection = self.webcamPreferences.loadSelection()
+            let resolution = WebcamResolver.resolveActiveCamera(selection: selection, available: self.connectedDeviceDescriptors)
+
+            guard let best = resolution.selected else { return }
+
+            // If the best available device is different from current active device, switch to it safely
+            if self.captureDevice?.uniqueID != best.id {
+                ScanLog.shared.write("preferred camera connected or available: '\(best.localizedName)' [\(best.category.rawValue)]")
+                self.switchCamera(to: best, isExplicit: false)
+            }
+        }
+    }
+
+    @objc func handleCameraDisconnected(_ notification: Notification) {
+        guard let disconnectedDevice = notification.object as? AVCaptureDevice else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            ScanLog.shared.write("camera disconnected: '\(disconnectedDevice.localizedName)' (uid: \(disconnectedDevice.uniqueID))")
+            let devices = videoCaptureDevices()
+            self.connectedDeviceDescriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
+            self.refreshCameraMenu()
+            self.refreshSettingsCamera()
+
+            // If the disconnected device was the active camera, failover safely
+            if self.captureDevice?.uniqueID == disconnectedDevice.uniqueID {
+                _ = self.captureTransactionCoordinator.cancelActiveTransaction()
+                self.isProcessing = false
+
+                let selection = self.webcamPreferences.loadSelection()
+                let resolution = WebcamResolver.resolveActiveCamera(selection: selection, available: self.connectedDeviceDescriptors)
+
+                if let fallback = resolution.selected,
+                   let fallbackDevice = devices.first(where: { $0.uniqueID == fallback.id })
+                {
+                    self.status("Selected camera disconnected. Active camera: [\(fallback.category.displayBadge)] \(fallback.localizedName).")
+                    self.attachAndStartCamera(fallbackDevice, descriptor: fallback)
+                } else {
+                    self.captureDevice = nil
+                    self.currentDeviceInput = nil
+                    self.currentExposureCapabilities = .inspect(device: nil)
+                    self.status("Active camera disconnected. No remaining cameras; you can still import photos.")
+                    self.focusInfo = "Focus: camera disconnected"
+                    self.focusLabel?.stringValue = self.focusInfo
+                    self.refreshCameraMenu()
+                    self.refreshSettingsCamera()
+                }
+            }
+        }
+    }
+
+    func checkPendingCameraSwitchAfterCapture() {
+        guard let pendingID = pendingReconnectionDeviceID else { return }
+        pendingReconnectionDeviceID = nil
+        let devices = videoCaptureDevices()
+        let descriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
+        if let target = descriptors.first(where: { $0.id == pendingID }) {
+            ScanLog.shared.write("applying deferred camera switch to '\(target.localizedName)'")
+            switchCamera(to: target, isExplicit: false)
+        }
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -390,6 +550,31 @@ extension BondScannerApp {
             let requestInfo = self.photoRequests.removeValue(forKey: uniqueID)
             let automatic = requestInfo?.automatic ?? false
             let requestedAt = requestInfo?.requestedAt ?? Date().timeIntervalSince1970
+            let biasEV = requestInfo?.biasEV ?? 0.0
+
+            if let completion = requestInfo?.completion {
+                if let failure = failure {
+                    completion(.failure(failure))
+                    return
+                }
+                guard let image = cg ?? jpeg.flatMap({ cgImageFromData($0) }) else {
+                    completion(.failure(NSError(domain: "Camera", code: 4, userInfo: [NSLocalizedDescriptionKey: "Photograph could not be decoded"])))
+                    return
+                }
+                let quality = evaluateImageQuality(image)
+                let exp = CapturedExposure(
+                    biasEV: biasEV,
+                    image: image,
+                    jpegBytes: jpeg,
+                    capturedAt: Date().timeIntervalSince1970,
+                    meanLuminance: quality.meanLuminance,
+                    sharpnessScore: quality.sharpnessScore,
+                    isBaseline: biasEV == 0.0
+                )
+                completion(.success(exp))
+                return
+            }
+
             if failure != nil {
                 ScanLog.shared.write("photo output failed; falling back to video frame")
                 if let frame = self.latestImage {
@@ -417,6 +602,225 @@ extension BondScannerApp {
                 return
             }
             self.finishCapture(image: image, jpegBytes: jpeg, automatic: automatic, requestedAt: requestedAt)
+        }
+    }
+
+    // MARK: - Camera Menu & Settings Controls
+
+    func refreshCameraMenu() {
+        guard let cameraMenu = cameraSubmenu else { return }
+        cameraMenu.removeAllItems()
+
+        // 1. Select Webcam submenu
+        let selectItem = NSMenuItem(title: "Select Webcam…", action: nil, keyEquivalent: "")
+        let selectMenu = NSMenu(title: "Select Webcam")
+
+        let autoItem = NSMenuItem(
+            title: "Automatic — Prefer USB Webcam (Recommended)",
+            action: #selector(selectAutomaticWebcam),
+            keyEquivalent: ""
+        )
+        autoItem.target = self
+        let currentSelection = webcamPreferences.loadSelection()
+        autoItem.state = (currentSelection == .automaticPreferUSB) ? .on : .off
+        selectMenu.addItem(autoItem)
+        selectMenu.addItem(NSMenuItem.separator())
+
+        if connectedDeviceDescriptors.isEmpty {
+            let noneItem = NSMenuItem(title: "No Cameras Connected", action: nil, keyEquivalent: "")
+            noneItem.isEnabled = false
+            selectMenu.addItem(noneItem)
+        } else {
+            for descriptor in connectedDeviceDescriptors {
+                let item = NSMenuItem(
+                    title: descriptor.displayNameWithCategory,
+                    action: #selector(selectExplicitWebcam(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = descriptor
+                let isCurrent = (captureDevice?.uniqueID == descriptor.id)
+                item.state = isCurrent ? .on : .off
+                selectMenu.addItem(item)
+            }
+        }
+        selectItem.submenu = selectMenu
+        cameraMenu.addItem(selectItem)
+
+        // 2. Smart Exposure Capture submenu
+        let exposureItem = NSMenuItem(title: "Smart Exposure Capture", action: nil, keyEquivalent: "")
+        let exposureMenu = NSMenu(title: "Smart Exposure Capture")
+
+        let currentMode = smartExposurePreferences.loadMode()
+        let autoExpItem = NSMenuItem(
+            title: "Automatic — Multi-Exposure when supported",
+            action: #selector(selectSmartExposureModeAuto),
+            keyEquivalent: ""
+        )
+        autoExpItem.target = self
+        autoExpItem.state = (currentMode == .automatic) ? .on : .off
+        exposureMenu.addItem(autoExpItem)
+
+        let offExpItem = NSMenuItem(
+            title: "Off — Single-Photo Capture",
+            action: #selector(selectSmartExposureModeOff),
+            keyEquivalent: ""
+        )
+        offExpItem.target = self
+        offExpItem.state = (currentMode == .off) ? .on : .off
+        exposureMenu.addItem(offExpItem)
+
+        exposureMenu.addItem(NSMenuItem.separator())
+
+        let infoItem = NSMenuItem(
+            title: currentExposureCapabilities.statusDescription,
+            action: nil,
+            keyEquivalent: ""
+        )
+        infoItem.isEnabled = false
+        exposureMenu.addItem(infoItem)
+
+        exposureItem.submenu = exposureMenu
+        cameraMenu.addItem(exposureItem)
+
+        cameraMenu.addItem(NSMenuItem.separator())
+
+        // 3. Request Refocus
+        let refocus = NSMenuItem(title: "Request Refocus", action: #selector(refocusCamera), keyEquivalent: "r")
+        refocus.target = self
+        cameraMenu.addItem(refocus)
+
+        // 4. Hardware Diagnostics
+        let diagItem = NSMenuItem(title: "Hardware Diagnostics…", action: #selector(showHardwareDiagnostics), keyEquivalent: "d")
+        diagItem.keyEquivalentModifierMask = [.command, .control]
+        diagItem.target = self
+        cameraMenu.addItem(diagItem)
+    }
+
+    @objc func selectAutomaticWebcam() {
+        webcamPreferences.saveSelection(.automaticPreferUSB)
+        let selection = webcamPreferences.loadSelection()
+        let resolution = WebcamResolver.resolveActiveCamera(selection: selection, available: connectedDeviceDescriptors)
+        if let best = resolution.selected {
+            switchCamera(to: best, isExplicit: false)
+        }
+        refreshCameraMenu()
+        refreshSettingsCamera()
+    }
+
+    @objc func selectExplicitWebcam(_ sender: NSMenuItem) {
+        guard let descriptor = sender.representedObject as? WebcamDescriptor else { return }
+        switchCamera(to: descriptor, isExplicit: true)
+        refreshCameraMenu()
+        refreshSettingsCamera()
+    }
+
+    @objc func selectSmartExposureModeAuto() {
+        smartExposurePreferences.saveMode(.automatic)
+        refreshCameraMenu()
+        refreshSettingsCamera()
+        status("Smart Exposure set to Automatic. Multi-exposure will be used when supported by hardware.")
+    }
+
+    @objc func selectSmartExposureModeOff() {
+        smartExposurePreferences.saveMode(.off)
+        refreshCameraMenu()
+        refreshSettingsCamera()
+        status("Smart Exposure turned Off. Standard single-photo capture will be used.")
+    }
+
+    @objc func showHardwareDiagnostics() {
+        let activeName = captureDevice?.localizedName ?? "None"
+        let activeCategory = captureDevice.map { WebcamResolver.categorize(device: $0).rawValue } ?? "None"
+        let transportStr = captureDevice.map { d -> String in
+            let t = d.transportType
+            let bytes = [UInt8((t >> 24) & 0xFF), UInt8((t >> 16) & 0xFF), UInt8((t >> 8) & 0xFF), UInt8(t & 0xFF)]
+            return String(bytes: bytes, encoding: .ascii) ?? String(t)
+        } ?? "None"
+        let modelStr = captureDevice?.modelID ?? "None"
+        let dims = captureDevice.map { CMVideoFormatDescriptionGetDimensions($0.activeFormat.formatDescription) }
+        let dimsStr = dims.map { "\($0.width)x\($0.height)" } ?? "None"
+        let subStr = chosenFormatSubtype.isEmpty ? "None" : chosenFormatSubtype
+        let maxPhotoStr = photoOutput != nil ? "\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height)" : "N/A"
+
+        var expModes: [String] = []
+        if let camera = captureDevice {
+            if camera.isExposureModeSupported(.continuousAutoExposure) {
+                expModes.append("continuousAutoExposure")
+            }
+            if camera.isExposureModeSupported(.autoExpose) {
+                expModes.append("autoExpose")
+            }
+            if camera.isExposureModeSupported(.locked) {
+                expModes.append("locked")
+            }
+            if camera.isExposureModeSupported(.custom) {
+                expModes.append("custom")
+            }
+        }
+
+        var focusModes: [String] = []
+        if let camera = captureDevice {
+            if camera.isFocusModeSupported(.continuousAutoFocus) {
+                focusModes.append("continuousAutoFocus")
+            }
+            if camera.isFocusModeSupported(.autoFocus) {
+                focusModes.append("autoFocus")
+            }
+            if camera.isFocusModeSupported(.locked) {
+                focusModes.append("locked")
+            }
+        }
+
+        var wbModes: [String] = []
+        if let camera = captureDevice {
+            if camera.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                wbModes.append("continuousAutoWhiteBalance")
+            }
+            if camera.isWhiteBalanceModeSupported(.autoWhiteBalance) {
+                wbModes.append("autoWhiteBalance")
+            }
+            if camera.isWhiteBalanceModeSupported(.locked) {
+                wbModes.append("locked")
+            }
+        }
+
+        let summary = connectedDeviceDescriptors.map { "\($0.displayNameWithCategory) (id: \($0.id.prefix(12))...)" }
+
+        let report = HardwareDiagnosticReport(
+            activeDeviceName: activeName,
+            activeDeviceCategory: activeCategory,
+            activeDeviceTransport: transportStr,
+            activeDeviceModelID: modelStr,
+            activeFormatDimensions: dimsStr,
+            activeFormatSubtype: subStr,
+            isPhotoOutputSupported: photoCaptureSupported,
+            maxPhotoDimensions: maxPhotoStr,
+            supportedExposureModes: expModes,
+            supportedFocusModes: focusModes,
+            supportedWhiteBalanceModes: wbModes,
+            hardwareExposureAdjustmentSupported: currentExposureCapabilities.supportsHardwareAdjustment,
+            minExposureBias: currentExposureCapabilities.minBias,
+            maxExposureBias: currentExposureCapabilities.maxBias,
+            smartExposureMode: smartExposurePreferences.loadMode().rawValue,
+            totalConnectedCameras: connectedDeviceDescriptors.count,
+            connectedCamerasSummary: summary,
+            totalCaptures: diagnostics.totalCaptures,
+            averageCaptureLatencyMs: diagnostics.averageCaptureLatencyMs,
+            averageOCRLatencyMs: diagnostics.averageOCRLatencyMs
+        )
+
+        ScanLog.shared.write("Hardware diagnostics requested:\n\(report.formattedText)")
+
+        let alert = NSAlert()
+        alert.messageText = "Hardware Diagnostics"
+        alert.informativeText = report.formattedText
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Copy Report")
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(report.formattedText, forType: .string)
         }
     }
 }

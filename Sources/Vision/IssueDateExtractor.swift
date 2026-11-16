@@ -183,7 +183,6 @@ func yearMonthIndex(_ month: String, _ year: String) -> Int? {
     return y * 12 + (m - 1)
 }
 
-
 func allIssueDateCandidates(_ lines: [OCRLine], series: String) -> [(month: String, year: String, score: Int)] {
     var dateCandidates: [(String, String, Int)] = []
     let upper = lines.map(\.text).joined(separator: "\n").uppercased()

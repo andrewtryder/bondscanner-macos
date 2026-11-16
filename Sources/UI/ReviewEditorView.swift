@@ -907,5 +907,4 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
             popup.selectItem(withTitle: value)
         }
     }
-
 }

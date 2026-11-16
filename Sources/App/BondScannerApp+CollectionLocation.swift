@@ -72,7 +72,9 @@ extension BondScannerApp {
                 alert.addButton(withTitle: "Create New Collection…")
                 alert.addButton(withTitle: "Quit")
                 let response = alert.runModal()
-                if response == .alertFirstButtonReturn { continue }
+                if response == .alertFirstButtonReturn {
+                    continue
+                }
                 let action: CollectionSwitchAction
                 if response == .alertSecondButtonReturn {
                     action = .open
@@ -123,40 +125,162 @@ extension BondScannerApp {
     @objc func openSettings() {
         if let settingsWindow = settingsWindow {
             refreshSettingsLocation()
+            refreshSettingsCamera()
             settingsWindow.makeKeyAndOrderFront(nil)
             return
         }
-        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 610, height: 250),
+        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 490),
                              styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         panel.title = "Settings"
         panel.isReleasedWhenClosed = false
         let content = panel.contentView!
+
+        // Section 1: Collection Storage
         let heading = NSTextField(labelWithString: "Collection Storage")
-        heading.font = .boldSystemFont(ofSize: 16)
-        heading.frame = NSRect(x: 24, y: 210, width: 560, height: 22)
+        heading.font = .boldSystemFont(ofSize: 15)
+        heading.frame = NSRect(x: 24, y: 450, width: 570, height: 22)
         content.addSubview(heading)
+
         let location = NSTextField(wrappingLabelWithString: "")
-        location.frame = NSRect(x: 24, y: 145, width: 560, height: 60)
+        location.frame = NSRect(x: 24, y: 390, width: 570, height: 55)
         location.lineBreakMode = .byTruncatingMiddle
         content.addSubview(location)
         settingsLocationLabel = location
+
         let explanation = NSTextField(wrappingLabelWithString: "This folder contains the SQLite database, original and processed photos, and automatic CSV and JSON exports.")
-        explanation.frame = NSRect(x: 24, y: 105, width: 560, height: 38)
+        explanation.frame = NSRect(x: 24, y: 350, width: 570, height: 36)
+        explanation.textColor = .secondaryLabelColor
         content.addSubview(explanation)
+
         let choose = NSButton(title: "Choose Folder…", target: self, action: #selector(chooseCollectionFolder))
-        choose.frame = NSRect(x: 24, y: 55, width: 130, height: 32)
+        choose.frame = NSRect(x: 24, y: 310, width: 130, height: 32)
         content.addSubview(choose)
+
         let finder = NSButton(title: "Open in Finder", target: self, action: #selector(openCollectionInFinder))
-        finder.frame = NSRect(x: 162, y: 55, width: 130, height: 32)
+        finder.frame = NSRect(x: 162, y: 310, width: 130, height: 32)
         content.addSubview(finder)
+
         let restore = NSButton(title: "Restore Default Location", target: self, action: #selector(restoreDefaultCollection))
-        restore.frame = NSRect(x: 300, y: 55, width: 200, height: 32)
+        restore.frame = NSRect(x: 300, y: 310, width: 180, height: 32)
         content.addSubview(restore)
+
+        // Separator
+        let sep = NSBox(frame: NSRect(x: 24, y: 290, width: 570, height: 1))
+        sep.boxType = .separator
+        content.addSubview(sep)
+
+        // Section 2: Camera
+        let camHeading = NSTextField(labelWithString: "Camera")
+        camHeading.font = .boldSystemFont(ofSize: 15)
+        camHeading.frame = NSRect(x: 24, y: 255, width: 570, height: 22)
+        content.addSubview(camHeading)
+
+        let camLabel = NSTextField(labelWithString: "Webcam:")
+        camLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        camLabel.frame = NSRect(x: 24, y: 220, width: 130, height: 20)
+        content.addSubview(camLabel)
+
+        let camPopUp = NSPopUpButton(frame: NSRect(x: 155, y: 216, width: 440, height: 26), pullsDown: false)
+        camPopUp.target = self
+        camPopUp.action = #selector(settingsCameraChanged(_:))
+        content.addSubview(camPopUp)
+        settingsCameraPopUp = camPopUp
+
+        let expLabel = NSTextField(labelWithString: "Smart Exposure:")
+        expLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        expLabel.frame = NSRect(x: 24, y: 175, width: 130, height: 20)
+        content.addSubview(expLabel)
+
+        let expPopUp = NSPopUpButton(frame: NSRect(x: 155, y: 171, width: 440, height: 26), pullsDown: false)
+        expPopUp.target = self
+        expPopUp.action = #selector(settingsSmartExposureChanged(_:))
+        content.addSubview(expPopUp)
+        settingsSmartExposurePopUp = expPopUp
+
+        let camStatus = NSTextField(wrappingLabelWithString: "")
+        camStatus.font = .systemFont(ofSize: 12)
+        camStatus.textColor = .secondaryLabelColor
+        camStatus.frame = NSRect(x: 24, y: 95, width: 570, height: 65)
+        content.addSubview(camStatus)
+        settingsCameraStatusLabel = camStatus
+
+        let diagBtn = NSButton(title: "Hardware Diagnostics…", target: self, action: #selector(showHardwareDiagnostics))
+        diagBtn.frame = NSRect(x: 24, y: 45, width: 180, height: 32)
+        content.addSubview(diagBtn)
+
         settingsWindow = panel
         refreshSettingsLocation()
+        refreshSettingsCamera()
         panel.center()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func refreshSettingsCamera() {
+        guard let camPopUp = settingsCameraPopUp,
+              let expPopUp = settingsSmartExposurePopUp,
+              let statusLabel = settingsCameraStatusLabel
+        else { return }
+
+        // Populate camera popup
+        camPopUp.removeAllItems()
+        camPopUp.addItem(withTitle: "Automatic — Prefer USB Webcam (Recommended)")
+        camPopUp.lastItem?.representedObject = "automatic"
+
+        let currentSelection = webcamPreferences.loadSelection()
+        var selectedIndex = 0
+
+        for (idx, descriptor) in connectedDeviceDescriptors.enumerated() {
+            camPopUp.addItem(withTitle: descriptor.displayNameWithCategory)
+            camPopUp.lastItem?.representedObject = descriptor
+            if case let .explicit(id) = currentSelection, id == descriptor.id {
+                selectedIndex = idx + 1
+            }
+        }
+
+        if currentSelection == .automaticPreferUSB {
+            selectedIndex = 0
+        }
+        camPopUp.selectItem(at: selectedIndex)
+
+        // Populate exposure mode popup
+        expPopUp.removeAllItems()
+        for mode in SmartExposureMode.allCases {
+            expPopUp.addItem(withTitle: mode.title)
+            expPopUp.lastItem?.representedObject = mode
+        }
+        let currentMode = smartExposurePreferences.loadMode()
+        if let idx = SmartExposureMode.allCases.firstIndex(of: currentMode) {
+            expPopUp.selectItem(at: idx)
+        }
+
+        // Status text
+        let activeDeviceText = captureDevice.map { d -> String in
+            let cat = WebcamResolver.categorize(device: d)
+            return "Active Camera: [\(cat.displayBadge)] \(d.localizedName)"
+        } ?? "Active Camera: None connected"
+
+        let expText = "Smart Exposure: \(currentExposureCapabilities.statusDescription)"
+        statusLabel.stringValue = "\(activeDeviceText)\n\(expText)"
+    }
+
+    @objc func settingsCameraChanged(_ sender: NSPopUpButton) {
+        guard let item = sender.selectedItem else { return }
+        if let desc = item.representedObject as? WebcamDescriptor {
+            switchCamera(to: desc, isExplicit: true)
+        } else {
+            selectAutomaticWebcam()
+        }
+        refreshCameraMenu()
+        refreshSettingsCamera()
+    }
+
+    @objc func settingsSmartExposureChanged(_ sender: NSPopUpButton) {
+        guard let item = sender.selectedItem, let mode = item.representedObject as? SmartExposureMode else { return }
+        smartExposurePreferences.saveMode(mode)
+        refreshCameraMenu()
+        refreshSettingsCamera()
+        status("Smart Exposure set to \(mode.rawValue).")
     }
 
     func refreshSettingsLocation() {

@@ -266,7 +266,6 @@ extension ReviewEditorView {
         completionStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
     }
 
-
     // MARK: - Badges and Provenance
 
     func updateFieldBadgesAndErrors() {
@@ -522,5 +521,4 @@ extension ReviewEditorView {
 
         duplicateStack.addArrangedSubview(actionsRow)
     }
-
 }

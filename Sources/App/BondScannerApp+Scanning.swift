@@ -61,26 +61,50 @@ extension BondScannerApp {
         if let rect = rect {
             let maxShift: CGFloat = fastScanEnabled ? 0.025 : 0.05
             let maxScale: CGFloat = fastScanEnabled ? 0.04 : 0.075
+            let quality = evaluateImageQuality(frame, region: rect)
+            let isSharp = quality.sharpnessScore >= (fastScanEnabled ? 8.0 : 10.0)
+            let motionDelta = abs(quality.meanLuminance - priorFrameLuminance)
+            let isMotionLow = motionDelta < 0.12
+            priorFrameLuminance = quality.meanLuminance
+            let isAutofocusSettled = (captureDevice?.isAdjustingFocus != true)
+
+            let isPositionStable: Bool
             if let prior = priorRect,
                abs(rect.midX - prior.midX) < maxShift,
                abs(rect.midY - prior.midY) < maxShift,
                abs(rect.width - prior.width) < maxScale,
                abs(rect.height - prior.height) < maxScale
             {
+                isPositionStable = true
+            } else {
+                isPositionStable = false
+            }
+
+            if stabilizationStartTime == 0 {
+                stabilizationStartTime = now
+            }
+
+            if isPositionStable, isMotionLow, isAutofocusSettled {
                 stableFrames += 1
             } else {
                 stableFrames = 1
             }
             priorRect = rect
-            if stableFrames >= 2 {
+
+            let elapsedStabilizing = now - stabilizationStartTime
+            let boundedTimeoutReached = elapsedStabilizing >= (fastScanEnabled ? 0.8 : 1.2) && isSharp
+
+            if (stableFrames >= 2 && isSharp) || boundedTimeoutReached {
                 stableFrames = 0
+                stabilizationStartTime = 0
                 huntHits = 0
-                ScanLog.shared.write("auto capture: stable outline; OCR starts")
+                ScanLog.shared.write("auto capture: stable outline (sharpness=\(String(format: "%.1f", quality.sharpnessScore)) timeoutReached=\(boundedTimeoutReached)); OCR starts")
                 performScan(frame, automaticScan: true)
                 return
             }
         } else {
             stableFrames = 0
+            stabilizationStartTime = 0
             priorRect = nil
         }
         if now - lastDiagnosticAt > 4 {
@@ -201,6 +225,27 @@ extension BondScannerApp {
 
     func requestPhotograph(automatic: Bool, fallback: CGImage? = nil) {
         let requestedAt = Date().timeIntervalSince1970
+        let mode = smartExposurePreferences.loadMode()
+        let targetBiases = currentExposureCapabilities.targetExposureBiases(requestedMode: mode)
+
+        if targetBiases.count > 1, photoCaptureSupported, session.isRunning, let camera = captureDevice {
+            // Multi-exposure Smart Exposure capture
+            guard let transaction = captureTransactionCoordinator.startTransaction(automatic: automatic, targetBiases: targetBiases) else {
+                return
+            }
+            if automatic {
+                isProcessing = true
+            } else {
+                lockedAfterCapture = true
+            }
+            ScanLog.shared.write("smart exposure bracket started targets=\(targetBiases)")
+            status("Smart Exposure: capturing multi-exposure sequence (\(targetBiases.count) exposures)…")
+
+            executeMultiExposureCapture(transaction: transaction, camera: camera, requestedAt: requestedAt, fallback: fallback)
+            return
+        }
+
+        // Single photo capture (standard path)
         if photoCaptureSupported, session.isRunning {
             let settings = AVCapturePhotoSettings()
             if #available(macOS 13.0, *) {
@@ -210,7 +255,7 @@ extension BondScannerApp {
                     settings.maxPhotoDimensions = max
                 }
             }
-            photoRequests[settings.uniqueID] = (automatic: automatic, requestedAt: requestedAt)
+            photoRequests[settings.uniqueID] = PhotoRequestInfo(automatic: automatic, requestedAt: requestedAt, biasEV: 0.0, completion: nil)
             if automatic {
                 isProcessing = true
             } else {
@@ -242,6 +287,257 @@ extension BondScannerApp {
         }
         ScanLog.shared.write("photograph requested mode=\(automatic ? "auto" : "manual") via=videoFrame frame=\(image.width)x\(image.height)")
         finishCapture(image: image, jpegBytes: nil, automatic: automatic, requestedAt: requestedAt)
+    }
+
+    func captureOnePhoto(biasEV: Float, fallback: CGImage?, completion: @escaping (Result<CapturedExposure, Error>) -> Void) {
+        if photoCaptureSupported, session.isRunning {
+            let settings = AVCapturePhotoSettings()
+            if #available(macOS 13.0, *) {
+                let max = photoOutput.maxPhotoDimensions
+                let supported = captureDevice?.activeFormat.supportedMaxPhotoDimensions ?? []
+                if max.width > 0, max.height > 0, photoDimension(max, isIn: supported) {
+                    settings.maxPhotoDimensions = max
+                }
+            }
+            photoRequests[settings.uniqueID] = PhotoRequestInfo(
+                automatic: true,
+                requestedAt: Date().timeIntervalSince1970,
+                biasEV: biasEV,
+                completion: completion
+            )
+            photoOutput.capturePhoto(with: settings, delegate: self)
+            return
+        }
+
+        if let image = fallback ?? latestImage {
+            let quality = evaluateImageQuality(image)
+            let exp = CapturedExposure(
+                biasEV: biasEV,
+                image: image,
+                jpegBytes: nil,
+                capturedAt: Date().timeIntervalSince1970,
+                meanLuminance: quality.meanLuminance,
+                sharpnessScore: quality.sharpnessScore,
+                isBaseline: biasEV == 0.0
+            )
+            completion(.success(exp))
+        } else {
+            completion(.failure(NSError(domain: "Camera", code: 5, userInfo: [NSLocalizedDescriptionKey: "No video frame available"])))
+        }
+    }
+
+    func executeMultiExposureCapture(transaction: CaptureTransaction, camera: AVCaptureDevice, requestedAt: TimeInterval, fallback: CGImage?) {
+        captureOnePhoto(biasEV: 0.0, fallback: fallback) { [weak self] baseResult in
+            guard let self = self else { return }
+            switch baseResult {
+            case let .failure(error):
+                self.isProcessing = false
+                self.captureTransactionCoordinator.finishTransaction(id: transaction.id)
+                self.status("Smart Exposure failed on baseline: \(error.localizedDescription)")
+                self.preview.captureFlash(color: .systemRed)
+            case let .success(baseExp):
+                transaction.addExposure(baseExp)
+                let remainingTargets = Array(transaction.targetBiases.dropFirst())
+                self.stepMultiExposure(transaction: transaction, camera: camera, remainingTargets: remainingTargets, fallback: fallback)
+            }
+        }
+    }
+
+    private func stepMultiExposure(transaction: CaptureTransaction, camera: AVCaptureDevice, remainingTargets: [Float], fallback: CGImage?) {
+        guard !transaction.isCancelled, let nextBias = remainingTargets.first else {
+            restoreCameraExposure(camera)
+            captureTransactionCoordinator.finishTransaction(id: transaction.id)
+            finishMultiExposureCapture(transaction: transaction)
+            return
+        }
+
+        let applied = applyHardwareExposureBias(nextBias, on: camera)
+        if !applied {
+            restoreCameraExposure(camera)
+            captureTransactionCoordinator.finishTransaction(id: transaction.id)
+            finishMultiExposureCapture(transaction: transaction)
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self = self else { return }
+            self.captureOnePhoto(biasEV: nextBias, fallback: fallback) { [weak self] photoResult in
+                guard let self = self else { return }
+                switch photoResult {
+                case let .success(exp):
+                    transaction.addExposure(exp)
+                case .failure:
+                    ScanLog.shared.write("bracket step for \(nextBias) EV failed; continuing with gathered exposures")
+                }
+                self.stepMultiExposure(transaction: transaction, camera: camera, remainingTargets: Array(remainingTargets.dropFirst()), fallback: fallback)
+            }
+        }
+    }
+
+    private func applyHardwareExposureBias(_ bias: Float, on camera: AVCaptureDevice) -> Bool {
+        var success = false
+        _ = bondScanTry("set exposure bias \(bias)") {
+            if camera.responds(to: NSSelectorFromString("setExposureTargetBias:completionHandler:")) {
+                do {
+                    try camera.lockForConfiguration()
+                    typealias Fn = @convention(c) (AnyObject, Selector, Float, ((CMTime) -> Void)?) -> Void
+                    let sel = NSSelectorFromString("setExposureTargetBias:completionHandler:")
+                    let imp = camera.method(for: sel)
+                    let fn = unsafeBitCast(imp, to: Fn.self)
+                    fn(camera, sel, bias, nil)
+                    camera.unlockForConfiguration()
+                    success = true
+                } catch {
+                    success = false
+                }
+            }
+        }
+        return success
+    }
+
+    private func restoreCameraExposure(_ camera: AVCaptureDevice) {
+        _ = bondScanTry("restore camera exposure") {
+            do {
+                try camera.lockForConfiguration()
+                if camera.isExposureModeSupported(.continuousAutoExposure) {
+                    camera.exposureMode = .continuousAutoExposure
+                }
+                if camera.responds(to: NSSelectorFromString("setExposureTargetBias:completionHandler:")) {
+                    typealias Fn = @convention(c) (AnyObject, Selector, Float, ((CMTime) -> Void)?) -> Void
+                    let sel = NSSelectorFromString("setExposureTargetBias:completionHandler:")
+                    let imp = camera.method(for: sel)
+                    let fn = unsafeBitCast(imp, to: Fn.self)
+                    fn(camera, sel, 0.0, nil)
+                }
+                camera.unlockForConfiguration()
+            } catch {
+                ScanLog.shared.write("could not restore camera exposure configuration")
+            }
+        }
+    }
+
+    func finishMultiExposureCapture(transaction: CaptureTransaction) {
+        guard let baseline = transaction.baselineExposure else {
+            isProcessing = false
+            status("Capture failed: No exposures captured.")
+            return
+        }
+
+        if transaction.capturedExposures.count <= 1 {
+            finishCapture(image: baseline.image, jpegBytes: baseline.jpegBytes, automatic: transaction.automatic, requestedAt: transaction.requestedAt)
+            return
+        }
+
+        let id = transaction.id.uuidString
+        let capturedAt = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: transaction.requestedAt))
+        let baseFilename = "\(capturedAt.replacingOccurrences(of: ":", with: "-"))_\(id.prefix(8)).jpg"
+        let primaryOriginalRel = "photos/original_" + baseFilename
+        let primaryProcessedRel = "photos/" + baseFilename
+        let primaryOriginalURL = outputRoot.appendingPathComponent(primaryOriginalRel)
+
+        var savedBracketed: [(biasEV: Float, url: URL, relativePath: String)] = []
+        var qualityNotes: [String] = []
+
+        let quality = evaluateImageQuality(baseline.image)
+        if quality.isBlurry {
+            qualityNotes.append("blurry (\(String(format: "%.1f", quality.sharpnessScore)))")
+        }
+        if quality.isUnderExposed {
+            qualityNotes.append("underexposed")
+        }
+        if quality.isOverExposed {
+            qualityNotes.append("overexposed")
+        }
+
+        saveQueue.async { [weak self] in
+            guard let self = self else { return }
+            do {
+                try FileManager.default.createDirectory(at: photosRoot, withIntermediateDirectories: true)
+
+                guard let baseData = baseline.jpegBytes ?? jpegData(baseline.image) else {
+                    throw NSError(domain: "Save", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to encode baseline photo"])
+                }
+                try baseData.write(to: primaryOriginalURL, options: .atomic)
+
+                for exp in transaction.capturedExposures where !exp.isBaseline {
+                    let biasStr = String(format: "%+.1fEV", exp.biasEV)
+                    let bracketFilename = "original_\(capturedAt.replacingOccurrences(of: ":", with: "-"))_\(id.prefix(8))_\(biasStr).jpg"
+                    let bracketRel = "photos/" + bracketFilename
+                    let bracketURL = outputRoot.appendingPathComponent(bracketRel)
+                    if let expData = exp.jpegBytes ?? jpegData(exp.image) {
+                        try expData.write(to: bracketURL, options: .atomic)
+                        savedBracketed.append((biasEV: exp.biasEV, url: bracketURL, relativePath: bracketRel))
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isProcessing = false
+                    self.status("SAVE FAILED: \(error.localizedDescription)")
+                    self.preview.captureFlash(color: .systemRed)
+                    NSSound.beep()
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                let captureLatencyMs = (Date().timeIntervalSince1970 - transaction.requestedAt) * 1000.0
+                self.diagnostics.totalCaptures += 1
+                self.diagnostics.totalCaptureTimeMs += captureLatencyMs
+
+                var record = emptyBondRecord(id: id, capturedAt: capturedAt)
+                record.photo = primaryProcessedRel
+                record.sourcePhoto = primaryOriginalRel
+                let bracketedPaths = savedBracketed.map(\.relativePath)
+                record.associatedPhotos = bracketedPaths.isEmpty ? nil : bracketedPaths
+                if !qualityNotes.isEmpty {
+                    record.notes = "Quality: \(qualityNotes.joined(separator: ", "))"
+                }
+                let countStr = "Multi-Exposure (\(transaction.capturedExposures.count) captures)"
+                record.notes = record.notes.isEmpty ? countStr : "\(record.notes) • \(countStr)"
+
+                let previous = self.records
+                self.records.append(record)
+                do {
+                    try saveRecordLive(record, allRecords: self.records, sortOrder: self.records.count - 1)
+                } catch {
+                    self.isProcessing = false
+                    self.records = previous
+                    self.status("DATABASE SAVE FAILED: \(error.localizedDescription). Photos preserved.")
+                    self.preview.captureFlash(color: .systemRed)
+                    NSSound.beep()
+                    return
+                }
+
+                self.updateCount()
+                self.preview.captureFlash(color: .systemBlue)
+                NSSound(named: NSSound.Name("Glass"))?.play()
+                self.isProcessing = false
+                self.lockedAfterCapture = true
+                self.awaitingSerialFromCapture = true
+                self.emptyFrames = 0
+
+                let waiting = self.ocrPending.count + (self.ocrBusy ? 1 : 0)
+                self.diagnostics.highWaterQueueDepth = max(self.diagnostics.highWaterQueueDepth, waiting + 1)
+                self.status("Smart Exposure captured (\(transaction.capturedExposures.count) photos)! Reading in background…")
+                self.lastLabel.stringValue = "Last: multi-exposure saved, OCR pending…"
+
+                let focus = self.shouldFocusIssueDate()
+                let recent = recentScanIssueDates(before: ISO8601DateFormatter().string(from: Date()), among: self.records)
+                let job = OCRJobContext(
+                    id: id,
+                    originalURL: primaryOriginalURL,
+                    automatic: transaction.automatic,
+                    focusIssueDate: focus,
+                    recentIssueDates: recent,
+                    captureRequestedAt: transaction.requestedAt,
+                    enqueuedAt: Date().timeIntervalSince1970,
+                    bracketedExposures: savedBracketed
+                )
+                self.ocrPending.append(job)
+                self.pumpOCR()
+                self.checkPendingCameraSwitchAfterCapture()
+            }
+        }
     }
 
     func shouldFocusIssueDate() -> Bool {
@@ -390,13 +686,36 @@ extension BondScannerApp {
             }
             let ocrStartTime = Date().timeIntervalSince1970
             ScanLog.shared.write("ocr of saved photograph started frame=\(image.width)x\(image.height)")
-            let result = scanImage(image, focusIssueDate: job.focusIssueDate, recentIssueDates: job.recentIssueDates)
+            let baselineResult = scanImage(image, focusIssueDate: job.focusIssueDate, recentIssueDates: job.recentIssueDates)
+
+            if !job.bracketedExposures.isEmpty {
+                var bracketedResults: [(biasEV: Float, result: OCRResult, photoRel: String)] = []
+                for b in job.bracketedExposures {
+                    if let bImg = cgImageFromFile(b.url) {
+                        let bRes = scanImage(bImg, focusIssueDate: job.focusIssueDate, recentIssueDates: job.recentIssueDates)
+                        bracketedResults.append((biasEV: b.biasEV, result: bRes, photoRel: b.relativePath))
+                    }
+                }
+                let processingMs = (Date().timeIntervalSince1970 - ocrStartTime) * 1000.0
+                DispatchQueue.main.async {
+                    self.diagnostics.totalOCRCompleted += 1
+                    self.diagnostics.totalProcessingTimeMs += processingMs
+                    ScanLog.shared.write("multi-exposure ocr finished exposures=\(job.bracketedExposures.count + 1) processing_ms=\(String(format: "%.1f", processingMs))")
+                    let basePhotoRel = "photos/original_" + job.originalURL.lastPathComponent.replacingOccurrences(of: "original_", with: "")
+                    self.applyMultiExposureOCR(baselineResult: baselineResult, baselinePhotoRel: basePhotoRel, bracketedResults: bracketedResults, to: job.id)
+                    self.ocrBusy = false
+                    self.pumpOCR()
+                    self.reviewWindowController?.coordinator.setAIBackgroundWorkDeferred(self.ocrBusy || !self.ocrPending.isEmpty)
+                }
+                return
+            }
+
             let processingMs = (Date().timeIntervalSince1970 - ocrStartTime) * 1000.0
             DispatchQueue.main.async {
                 self.diagnostics.totalOCRCompleted += 1
                 self.diagnostics.totalProcessingTimeMs += processingMs
                 ScanLog.shared.write("ocr finished processing_ms=\(String(format: "%.1f", processingMs)) avg_ocr_ms=\(String(format: "%.1f", self.diagnostics.averageOCRLatencyMs)) bpm=\(String(format: "%.1f", self.diagnostics.throughputBondsPerMinute)) queue_remaining=\(self.ocrPending.count)")
-                self.applyOCR(result, to: job.id)
+                self.applyOCR(baselineResult, to: job.id)
                 self.ocrBusy = false
                 self.pumpOCR()
                 self.reviewWindowController?.coordinator.setAIBackgroundWorkDeferred(self.ocrBusy || !self.ocrPending.isEmpty)
@@ -691,6 +1010,44 @@ extension BondScannerApp {
             ? "OCR complete — automatic validation passed. Remove the bond, then show the next one."
             : "OCR complete — review needed (\(requiredFieldsMissing(incoming).joined(separator: ", "))). Remove the bond, then show the next one."
         presentRecord(incoming, flash: flash, message: message, automatic: false, contributed: true, isNew: true)
+        checkPendingCameraSwitchAfterCapture()
+    }
+
+    func applyMultiExposureOCR(
+        baselineResult: OCRResult,
+        baselinePhotoRel: String,
+        bracketedResults: [(biasEV: Float, result: OCRResult, photoRel: String)],
+        to id: String
+    ) {
+        guard let index = records.firstIndex(where: { $0.id == id }) else { return }
+        let baseRecord = records[index]
+
+        let evalResult = MultiExposureOCREvaluator.evaluate(
+            baselineResult: baselineResult,
+            baselinePhotoRel: baselinePhotoRel,
+            bracketedResults: bracketedResults,
+            baseRecord: baseRecord
+        )
+
+        var record = evalResult.reconciledRecord
+        record.revision = (record.revision ?? 0) + 1
+
+        let flashColor: NSColor
+        let message: String
+        let isNew = (record.userConfirmedFields ?? []).isEmpty
+        if record.status == "OK" {
+            flashColor = .systemGreen
+            message = "Verified! \(record.series) serial \(record.serial) | $\(record.denomination)"
+        } else {
+            flashColor = .systemOrange
+            let reasons = (record.reviewReasons ?? []).joined(separator: ", ")
+            message = "Need review: \(reasons.isEmpty ? "unverified fields" : reasons)"
+        }
+
+        records[index] = record
+        try? saveRecordLive(record, allRecords: records, sortOrder: index)
+        presentRecord(record, flash: flashColor, message: message, automatic: true, contributed: true, isNew: isNew)
+        checkPendingCameraSwitchAfterCapture()
     }
 
     func handleOCR(_ result: OCRResult, auto: Bool) {

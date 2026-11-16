@@ -54,8 +54,10 @@ final class StatChipView: NSView {
         setAccessibilityLabel("\(captionLabel.stringValue): \(value)")
     }
 
-    // The tinted background is resolved in updateLayer so it follows light/dark changes.
-    override var wantsUpdateLayer: Bool { true }
+    /// The tinted background is resolved in updateLayer so it follows light/dark changes.
+    override var wantsUpdateLayer: Bool {
+        true
+    }
 
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {

@@ -139,8 +139,7 @@ final class ReviewCoordinator {
 
     func enqueueAIReview(recordID: String, force: Bool = false) {
         runOnMain { [weak self] in
-            guard let self else { return }
-            guard let record = self.allRecords.first(where: { $0.id == recordID }), record.status == "REVIEW", force || !self.hasCurrentAIAnalysis(record) else { return }
+            guard let self, let record = self.allRecords.first(where: { $0.id == recordID }), record.status == "REVIEW", force || !self.hasCurrentAIAnalysis(record) else { return }
             let photo = record.sourcePhoto.isEmpty ? record.photo : record.sourcePhoto
             let root = self.customOutputRoot ?? outputRoot
             guard !photo.isEmpty, FileManager.default.fileExists(atPath: root.appendingPathComponent(photo).path), !self.aiQueuedIDs.contains(recordID) else { return }
@@ -396,7 +395,6 @@ final class ReviewCoordinator {
         return nil
     }
 
-
     // MARK: - Image Caching
 
     func loadImage(relativePath: String) -> NSImage? {
@@ -419,7 +417,7 @@ final class ReviewCoordinator {
               let idx = queueRecordIds.firstIndex(of: currentId) else { return }
 
         let pathsToLoad: [String] = [idx - 1, idx + 1].compactMap { nIdx in
-            guard nIdx >= 0 && nIdx < queueRecordIds.count else { return nil }
+            guard nIdx >= 0, nIdx < queueRecordIds.count else { return nil }
             let id = queueRecordIds[nIdx]
             guard let rec = allRecords.first(where: { $0.id == id }) else { return nil }
             let path = rec.photo.isEmpty ? rec.sourcePhoto : rec.photo

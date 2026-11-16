@@ -521,5 +521,4 @@ extension ReviewCoordinator {
             return (latest, suggestions)
         }
     }
-
 }

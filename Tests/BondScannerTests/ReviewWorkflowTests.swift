@@ -987,12 +987,15 @@ final class ReviewWorkflowTests: XCTestCase {
             func reviewCoordinator(_ coordinator: ReviewCoordinator, didUpdateRecords records: [BondRecord]) {
                 lock.lock(); didUpdateRecordsThreads.append(Thread.isMainThread); lock.unlock()
             }
+
             func reviewCoordinator(_ coordinator: ReviewCoordinator, didSelectRecord record: BondRecord?) {
                 lock.lock(); didSelectRecordThreads.append(Thread.isMainThread); lock.unlock()
             }
+
             func reviewCoordinator(_ coordinator: ReviewCoordinator, didChangeProgress progress: ReviewProgress) {
                 lock.lock(); didChangeProgressThreads.append(Thread.isMainThread); lock.unlock()
             }
+
             func reviewCoordinator(_ coordinator: ReviewCoordinator, didUpdateSelectedRecord record: BondRecord) {
                 lock.lock(); didUpdateSelectedRecordThreads.append(Thread.isMainThread); lock.unlock()
             }

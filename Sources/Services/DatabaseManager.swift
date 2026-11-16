@@ -567,7 +567,6 @@ final class DatabaseManager {
         }
     }
 
-
     func findRecordsByNormalizedSerial(_ rawSerial: String, excludingId: String? = nil) throws -> [BondRecord] {
         let key = normalizeSerial(rawSerial)
         guard !key.isEmpty else { return [] }
@@ -579,5 +578,4 @@ final class DatabaseManager {
         try bindText(stmt, index: 2, value: excludingId ?? "")
         return try decodeRecords(from: stmt)
     }
-
 }
