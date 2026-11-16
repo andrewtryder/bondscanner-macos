@@ -25,6 +25,10 @@ extension ReviewEditorView {
         delegate?.reviewEditorDidRequestRevert(self)
     }
 
+    @objc func deleteClicked() {
+        delegate?.reviewEditorDidRequestDelete(self)
+    }
+
     func discardDraft() {
         userEdits.removeAll()
         if let r = currentRecord {
@@ -61,6 +65,18 @@ extension ReviewEditorView {
         } else {
             reprocessSpinner.stopAnimation(nil)
             reprocessBtn.isEnabled = true
+        }
+    }
+
+    func setAIAnalyzing(_ inProgress: Bool) {
+        if inProgress {
+            reprocessSpinner.startAnimation(nil)
+            aiAnalyzeBtn.isEnabled = false
+            aiAnalyzeBtn.title = "Analyzing with AI…"
+        } else {
+            reprocessSpinner.stopAnimation(nil)
+            aiAnalyzeBtn.isEnabled = true
+            aiAnalyzeBtn.title = "Analyze with AI"
         }
     }
 

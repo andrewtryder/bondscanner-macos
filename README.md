@@ -1,151 +1,175 @@
-# Bond Scanner (macOS)
+# Bond Scanner for macOS
 
-<img src="Resources/BondScanner-navy-1024.png" alt="Bond Scanner app icon" width="128">
+<p align="center">
+  <img src="Resources/BondScanner-navy-1024.png" alt="Bond Scanner Icon" width="128" style="vertical-align: middle;">
+</p>
 
-A lightweight, native macOS desktop application to scan and catalogue physical United States paper savings bonds (Series E, EE, and I) using Apple Vision OCR and a connected webcam.
+<p align="center">
+  <strong>Fast, native, and 100% private scanning and auditing for US Paper Savings Bonds.</strong>
+</p>
 
-All processing occurs 100% locally on your Mac. No images, personal names, tax IDs, or serial numbers are ever transmitted or uploaded anywhere.
-
----
-
-## Features
-
-- **Real-Time OCR & Edge Detection**: Automatically detects paper savings bond boundaries and extracts denominations, serial numbers, issue dates, and cancellation stamps.
-- **Series-Specific Validation**:
-  - **Series E**: Validates variable serial lengths (8, 9, 10 digits + `E`), issue years (1941–1980), and standard denominations ($10, $25, $50, $75, $100, $200, $500, $1,000, $5,000, $10,000).
-  - **Series EE & I**: Validates modern 10-digit serial patterns.
-- **Error-Resistant Heuristics**: Fuzzy word matching (`TWENTY FIVE` vs OCR noise like `TVENTYFINE`), corner numeral extraction, and cancellation stamp date resolution.
-- **100% Offline & Private**: High-resolution photos, structured `records.json`, and sanitized `bonds.csv` exports are saved locally to `~/Bondscans/`.
-- **Zero Third-Party Dependencies**: Pure native Swift using Apple's `Vision`, `AVFoundation`, `AppKit`, and `CoreImage`.
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-macOS%2014.0%2B-blue" alt="macOS 14.0+">
+  <img src="https://img.shields.io/badge/swift-5.9%2B-orange" alt="Swift 5.9+">
+  <img src="https://img.shields.io/badge/privacy-100%25%20On--Device-success" alt="100% On-Device Privacy">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
+</p>
 
 ---
 
-## Building and Running
+<p align="center">
+  <img src="Resources/screenshot.jpg" alt="Bond Scanner Application Interface" width="860">
+</p>
 
-This project uses [XcodeGen](https://github.com/yonaskolb/XcodeGen) to define a clean, reproducible Xcode project structure (`project.yml`).
+**Bond Scanner** is a native macOS application designed to quickly digitize, catalogue, and audit collections of United States paper savings bonds (**Series E**, **Series EE**, and **Series I**). 
 
-### Quick Start
+Using Apple's Vision framework and continuous camera feeds (webcam or iPhone Continuity Camera), Bond Scanner automatically detects bonds, captures high-resolution photographs, extracts key metadata, validates serial formats, and maintains a local inventory.
 
-1. Install XcodeGen (if not already installed):
+**Your financial data remains strictly yours:** All processing, OCR, image storage, and database operations execute 100% locally on your Mac. No images, names, Social Security numbers, or serial numbers are ever transmitted over the network.
+
+---
+
+## Highlights
+
+- ⚡ **Hands-Free Auto-Capture**: Point the camera at a bond. The app detects rectangular boundaries, waits for motion to settle, and automatically snaps a high-resolution frame.
+- 🔍 **Real-Time Vision OCR**: Extracts series, denomination ($10 to $10,000), serial numbers, issue month/year, and red cancellation/dating stamps with series-specific validation heuristics.
+- 🔎 **Interactive Review Workbench**:
+  - **Hovering Magnifying Loupe (2.8x)**: Inspect faint serials, cancellation stamps, and issue dates effortlessly.
+  - **Smooth Zoom & Pan**: Pinch-to-zoom on trackpads or use `⌘+Scroll` / `⌥+Scroll`.
+  - **Smart Discrepancy Highlighting**: Easily identify missing or uncertain fields with color-coded status badges.
+  - **Apple Intelligence Integration**: On-device AI analysis to help resolve ambiguous, worn, or low-contrast characters.
+  - **Safe Deletion (`⌘⌫`)**: Easily purge accidental or errant captures with a single confirmation shortcut.
+- 🔒 **Zero-Cloud, Crash-Resilient Storage**:
+  - High-resolution original photos saved locally to `~/BondScans/photos/`.
+  - WAL-backed SQLite database (`bonds.sqlite3`) with schema migrations and automatic duplicate deduplication.
+  - Live, auto-syncing `bonds.csv` and `records.json` exports kept in sync with every edit.
+- ⚙️ **Hardware Camera Controls**: Live auto-contrast, manual brightness/contrast sliders, autofocus trigger, and camera device switching.
+
+---
+
+## Quick Start & Installation
+
+### Requirements
+- **Operating System**: macOS 14.0 (Sonoma) or macOS 15.0+ (Sequoia)
+- **Architecture**: Apple Silicon (M1/M2/M3/M4) or Intel Mac
+- **Camera**: Built-in Mac camera, USB document camera / webcam, or an iPhone with Continuity Camera
+
+### Option 1: Fast One-Command Install (Recommended)
+
+From the project root in Terminal, run:
+```bash
+./build.sh --install
+```
+This compiles the release binary and installs it directly into `~/Applications/BondScanner.app`.
+
+### Option 2: Build with Xcode
+
+If you prefer building within Xcode:
+1. Install [XcodeGen](https://github.com/yonaskolb/XcodeGen) (if not already installed):
    ```bash
    brew install xcodegen
    ```
-2. Generate the Xcode project:
+2. Generate and open the project:
    ```bash
    xcodegen generate
+   open BondScanner.xcodeproj
    ```
-3. Open `BondScanner.xcodeproj` in Xcode and press **Cmd+R** to build and run.
-   *The project is pre-configured with local ad-hoc code signing ("Sign to Run Locally"), so no paid Apple Developer team certificate is required.*
+3. Press **⌘R** to build and run. *(Configured with ad-hoc signing; no paid developer account required).*
 
-### Testing
+---
 
-Run the standard unit test suite in Xcode with **Cmd+U** or from the terminal:
+## User Guide
+
+### 1. Setting Up Your Camera
+- Place your paper bond flat under good, even lighting (a document camera stand or desk mount works best).
+- Toggle **Auto-Contrast** on for automatic histogram stretching, or fine-tune **Brightness** and **Contrast** using the HUD sliders on the video preview.
+- Toggle between **Fast** and **High Quality** camera resolutions in the toolbar depending on your camera's frame rate.
+
+### 2. Scanning Bonds
+- **Automatic Mode**: Align the paper bond within the viewfinder brackets. Once the bond edges stabilize for a couple of frames, the app automatically triggers a high-resolution photo and runs OCR.
+- **Manual Mode**: Press the **Scan** button in the toolbar (or press **Space**) to snap immediately.
+- The bottom status HUD will display real-time feedback: *"Hunting for bond"*, *"Photo saved, OCR pending"*, or validation warnings.
+
+### 3. Reviewing & Editing
+Double-click any entry in the database list (or click the blue **Review Next** banner) to open the Review Window:
+- **Hovering Loupe**: Hover your cursor over the photograph on the left to activate the 2.8x circular magnifying glass.
+- **Zooming**: Use trackpad pinch-to-zoom, `⌘+Scroll`, or the toolbar zoom controls (`+`, `-`, `Actual Size`).
+- **Editing Fields**: Click into any field (Series, Denomination, Serial, Issue Date) to adjust values. Bond Scanner validates inputs against official Treasury rules in real time.
+- **AI Assistance**: Click **Analyze with AI** to invoke local Apple Intelligence models for suggestions on difficult characters.
+- **Deleting Errant Scans**: Click **Delete** or press **⌘⌫** to remove a false capture. The record is removed from the database and exports, and the photo is safely moved to the macOS Trash.
+
+---
+
+## Keyboard Shortcuts
+
+| Shortcut | Action | Where |
+| :--- | :--- | :--- |
+| **Return** | Open Review for selected record / Edit field | Main Window Table |
+| **⌘S** | Save changes and mark as verified | Review Window |
+| **⌘⌥S** / **Return** | Save & Next (advance to next review item) | Review Window |
+| **⌘⌫** | Delete current record & trash photo (with confirmation) | Review Window |
+| **⌘R** | Revert unsaved edits | Review Window |
+| **⌘→** / **⌘←** | Navigate to Next / Previous record | Review Window |
+| **L** | Toggle hovering magnifying loupe | Review Window |
+| **+** / **-** | Zoom photo in / out | Review Window |
+| **0** | Reset photo zoom to 100% | Review Window |
+| **⌘,** | Open Settings (storage location & backups) | Everywhere |
+
+---
+
+## Data Storage & Privacy
+
+All application data is kept locally in your chosen collection directory (defaults to `~/BondScans/`):
+
+```text
+~/BondScans/
+├── bonds.sqlite3         # Authoritative SQLite database (WAL-journaled)
+├── bonds.sqlite3-wal     # SQLite Write-Ahead Log
+├── bonds.sqlite3-shm     # SQLite Shared-Memory index
+├── photos/               # Full-resolution original photos (original_*.jpg)
+├── bonds.csv             # Auto-synchronized CSV export for Excel / Numbers
+├── records.json          # Formatted JSON export for programmatic access
+└── scan-debug.log        # Diagnostic capture & OCR evaluation log
+```
+
+### Changing Storage Location & Backups
+- Go to **Bond Scanner → Settings…** (`⌘,`) to move or select a custom collection folder (e.g. an encrypted volume or external drive).
+- **CSV Formula Sanitization**: All CSV exports automatically sanitize formula injection characters (`=`, `+`, `-`, `@`) to protect against spreadsheet vulnerabilities.
+- **Disaster Recovery**: Backups can be scheduled or exported via SQLite's atomic `VACUUM INTO` command. To preserve both data and imagery, ensure you back up the entire `~/BondScans/` folder.
+
+---
+
+## Architecture & Codebase
+
+```text
+Sources/
+├── Camera/      # AVFoundation camera discovery, 4K/1080p formats, and photo capture
+├── Models/      # BondRecord schema, status enums, and OCR data models
+├── Review/      # Review queue coordinator, background AI analysis, and deletion logic
+├── Services/    # SQLite DatabaseManager, CSV/JSON StorageManager, and logger
+├── UI/          # AppKit camera view, review window, zoomable photo view, and loupe
+└── Vision/      # Edge detection, orientation normalization, series & date parsers
+```
+
+### Running Tests & Verification
+
+Bond Scanner includes a comprehensive suite of unit and integration tests (200+ tests) verifying serial number patterns, denomination heuristics, cancellation stamp parsing, and review workflows:
+
 ```bash
+# Run local verification and test suite
+./scripts/local-ci.sh
+
+# Or run directly via xcodebuild
 xcodebuild test -project BondScanner.xcodeproj -scheme BondScanner
 ```
 
----
+### Private Local OCR Regression Framework
+To test against real, private paper bond photos without committing sensitive financial or personal data, Bond Scanner includes an isolated regression framework in `Tests/BondScannerTests/PrivateOCRRegressionTests.swift`. 
 
-## Local-Only Private OCR Regression Testing
-
-This repository includes a local-only image regression framework (`Tests/BondScannerTests/PrivateOCRRegressionTests.swift`) designed to evaluate Vision OCR against real bond photographs without committing sensitive financial or personal information.
-
-### Strict Privacy Guarantee
-- The directories `local-fixtures/synthetic/`, `local-fixtures/real/`, and `local-fixtures/reports/` are strictly ignored by `.gitignore`.
-- Fixture images, private manifests, and reports remain outside the `Sources/` and `Tests/` directories so XcodeGen will never bundle them into the application.
-- Public CI environments or local environments without private real fixtures automatically skip the real photo tests cleanly (`XCTSkip`).
-- Test assertion failures never print raw OCR, serial numbers, tax IDs, or owner names to test logs.
-- Synthetic and real photo datasets are evaluated separately; their accuracy metrics and reports are never combined.
-
-### Setting Up Private Fixtures
-
-1. **Synthetic Fixtures:**
-   Generated locally and written exclusively to `local-fixtures/synthetic/`:
-   ```bash
-   swift scripts/generate_fixtures.swift
-   ```
-   This generates synthetic images in `local-fixtures/synthetic/images/` and the synthetic manifest `local-fixtures/synthetic/manifest.json`.
-
-2. **Real Photograph Fixtures (Privately Held Paper Bonds):**
-   Place your physical bond photographs in `local-fixtures/real/images/`:
-   ```bash
-   mkdir -p local-fixtures/real/images
-   cp /path/to/my-bonds/*.jpg local-fixtures/real/images/
-   ```
-
-3. **Create your verified real manifest (`local-fixtures/real/manifest.json`):**
-   Copy the example template `local-fixtures.example.json` or `local-fixtures/real/manifest.example.json`:
-   ```bash
-   cp local-fixtures.example.json local-fixtures/real/manifest.json
-   ```
-   Open `local-fixtures/real/manifest.json` and adjust the ground-truth values (`series`, `denomination`, `serial`, `issueMonth`, `issueYear`, `datingStamp`) to match your physical documents based on manual verification (never from OCR output). Any omitted field is treated as "not evaluated".
-
-4. **Verify Git ignores the private fixtures:**
-   Confirm no private files or images are tracked by Git before testing:
-   ```bash
-   git check-ignore -v local-fixtures/synthetic/manifest.json
-   git check-ignore -v local-fixtures/real/manifest.json
-   git ls-files -- local-fixtures/
-   git status --short
-   ```
-   *(Ensure `git ls-files -- local-fixtures/` returns zero output).*
-
-5. **Run the regression tests:**
-   ```bash
-   xcodebuild test -project BondScanner.xcodeproj -scheme BondScanner
-   ```
-
-6. **Review Quality Metrics & Reports:**
-   Each test run writes isolated, privacy-safe aggregate metrics for each dataset:
-   - Synthetic fixtures:
-     - `local-fixtures/reports/synthetic/latest.txt` & `latest.json`
-     - `local-fixtures/reports/latest-synthetic.txt` & `latest-synthetic.json`
-   - Real photographs:
-     - `local-fixtures/reports/real/latest.txt` & `latest.json`
-     - `local-fixtures/reports/latest-real.txt` & `latest-real.json`
-
----
-
-## Architecture
-
-- **`Sources/Models/`**: `BondRecord`, schema definitions, and OCR parsing types.
-- **`Sources/Vision/`**: OCR extraction algorithms, denomination parsers, dating stamp detectors, and image quality evaluation.
-- **`Sources/Camera/`**: Camera discovery, format negotiation (4K/1080p), and frame capture.
-- **`Sources/Services/`**: SQLite persistence engine (`DatabaseManager`), automated JSON/CSV exporter (`StorageManager`), and operational logging.
-- **`Sources/UI/`**: AppKit preview overlays, window controller, and review table.
-- **`Tests/`**: Unit tests verifying serial number patterns, denominations, date algorithms, database transactions, and orientation invariance.
-
----
-
-## Data Integrity, Exports & Backup
-
-### Collection location
-
-Bond Scanner saves collections in `~/BondScans` by default. The folder contains `bonds.sqlite3`, its SQLite journal files, the `photos` folder, automatic `records.json` and `bonds.csv` exports, and `scan-debug.log`.
-
-Choose **Bond Scanner → Settings…** (⌘,) to see the current folder, open it in Finder, choose another folder, or restore the default location. When choosing an empty folder, you can copy the current collection or explicitly start an empty one. To reopen a collection, choose its existing folder. A change takes effect on the next launch. A copy includes changes made before quitting; the original collection is left in place. Existing destination files are never overwritten. If the selected location is unavailable, reconnect the drive or restore access and retry; Bond Scanner does not silently open a different collection.
-
-The independent backup location defaults to `~/BondScans_backups`. Changing the collection location does not move backups, and the collection and backup folders must not overlap.
-
-### Storage Architecture
-- **Primary Store**: `bonds.sqlite3` inside the collection folder is the authoritative, WAL-backed, crash-resilient SQLite database.
-- **Schema Versioning**: Managed via `PRAGMA user_version` (Version 1) with forward migration support.
-- **Automatic Live Exports**: Every scan capture, edit, merge, or deletion automatically schedules a debounced background export to `records.json` and `bonds.csv` inside the collection folder. Exports are synchronously flushed on application termination.
-- **Manual CSV Export**: Users can export a custom CSV snapshot at any time via the toolbar "Export CSV…" button. Formula characters (`=`, `+`, `-`, `@`) are automatically sanitized to prevent CSV injection.
-
-### Photograph Preservation & Duplicate Safety
-- **Zero Data Loss**: High-resolution original photographs (`photos/original_*.jpg`) are written and flushed to disk *before* database records are inserted.
-- **Photo Preservation on DB Failure**: If a database write throws an error, the original photo remains untouched on disk.
-- **Atomic Duplicate Consolidations**: Multi-record merges execute inside an immediate SQLite transaction. Duplicate captures only consolidate when serials are exact validated matches with zero conflicting fields. Near-matches are preserved as separate records for user review. Original photographs are never trashed during duplicate merges.
-
-### Backup and Disaster Recovery
-- **Online Backup**: Consistent point-in-time snapshots can be created safely using SQLite's native `VACUUM INTO` (`DatabaseManager.shared.backupDatabase(to:)`), verified immediately with SQLite `integrity_check`.
-- **Restoration Safety**: Restores stage into a temporary database first, verify SQLite integrity and schema compatibility, and safeguard the original database, WAL, and SHM files before atomic swap. If restoration fails, the original database is automatically restored.
-- **Photographs Scope**: A database backup alone preserves the structured SQLite records, review reasons, and metadata, but **does not include the associated photographs** in the collection's `photos` folder. For complete disaster recovery, back up the entire collection folder.
-- **Explicit Recovery & UI Reporting**: Initialization failures are never confused with database corruption. Locked or read-only databases are reported directly in the UI without modifying files. Validated database corruption prompts for explicit recovery, preserving existing DB, WAL, and SHM files to a timestamped archive before clean replacement. Silent fallbacks to temporary or in-memory databases are completely disallowed in production.
+All directories under `local-fixtures/` (synthetic, real, and reports) are strictly ignored by `.gitignore`. See `local-fixtures.example.json` for details on structuring local ground-truth evaluation manifests.
 
 ---
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+Distributed under the MIT License. See [LICENSE](LICENSE) for more information.

@@ -521,4 +521,56 @@ extension ReviewCoordinator {
             return (latest, suggestions)
         }
     }
+
+    // MARK: - Deleting Record
+
+    /// Permanently removes a bond record from the database, trashes associated photos,
+    /// and advances the review queue.
+    func deleteRecord(record: BondRecord) throws {
+        let root = customOutputRoot ?? outputRoot
+        guard let idx = allRecords.firstIndex(where: { $0.id == record.id }) else {
+            throw ReviewError.recordNotFound(record.id)
+        }
+
+        var proposedRecords = allRecords
+        proposedRecords.remove(at: idx)
+
+        // 1. Cancel background AI review if queued or active for this record
+        cancelAIReview(for: record.id)
+
+        // 2. Persist deletion to SQLite and schedule export BEFORE modifying in-memory allRecords
+        try deleteRecordLive(id: record.id, allRecords: proposedRecords)
+
+        // 3. Move photos to macOS Trash safely (verifying no other records reference them)
+        _ = try? safelyTrashPhotographs(for: record, existingRecords: proposedRecords, database: DatabaseManager.shared, root: root)
+
+        // 4. Determine next record to select in the queue
+        let nextSelectedId: String?
+        if let queueIdx = queueRecordIds.firstIndex(of: record.id) {
+            if queueIdx + 1 < queueRecordIds.count {
+                nextSelectedId = queueRecordIds[queueIdx + 1]
+            } else if queueIdx > 0 {
+                nextSelectedId = queueRecordIds[queueIdx - 1]
+            } else {
+                nextSelectedId = nil
+            }
+        } else {
+            nextSelectedId = queueRecordIds.first
+        }
+
+        // 5. Commit to in-memory state
+        self.allRecords = proposedRecords
+        recalculateQueue()
+        delegate?.reviewCoordinator(self, didUpdateRecords: allRecords)
+
+        // 6. Select the next record
+        if let nextId = nextSelectedId, allRecords.contains(where: { $0.id == nextId }) {
+            selectRecord(id: nextId)
+        } else if let firstQueueId = queueRecordIds.first {
+            selectRecord(id: firstQueueId)
+        } else {
+            currentRecordId = nil
+            delegate?.reviewCoordinator(self, didSelectRecord: nil)
+        }
+    }
 }

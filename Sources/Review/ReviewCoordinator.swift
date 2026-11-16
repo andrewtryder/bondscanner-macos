@@ -137,6 +137,34 @@ final class ReviewCoordinator {
         }
     }
 
+    func analyzeRecordWithAI(record: BondRecord) async throws -> BondAIAnalysis {
+        let photo = record.sourcePhoto.isEmpty ? record.photo : record.sourcePhoto
+        let root = customOutputRoot ?? outputRoot
+        let imageURL = root.appendingPathComponent(photo)
+        let analysis = await aiAnalyzer.analyze(record: record, imageURL: imageURL)
+        await MainActor.run {
+            if let idx = allRecords.firstIndex(where: { $0.id == record.id }) {
+                var updated = allRecords[idx]
+                updated.aiAnalysis = analysis
+                var proposed = allRecords
+                proposed[idx] = updated
+                try? saveRecordLive(updated, allRecords: proposed, sortOrder: idx)
+                allRecords = proposed
+                switch analysis.status {
+                case .ready: aiCompleted += 1
+                case .abstained, .unavailable: aiAbstained += 1
+                default: aiFailed += 1
+                }
+                recalculateQueue()
+                delegate?.reviewCoordinator(self, didUpdateRecords: allRecords)
+                if currentRecordId == record.id {
+                    delegate?.reviewCoordinator(self, didUpdateSelectedRecord: updated)
+                }
+            }
+        }
+        return analysis
+    }
+
     func enqueueAIReview(recordID: String, force: Bool = false) {
         runOnMain { [weak self] in
             guard let self, let record = self.allRecords.first(where: { $0.id == recordID }), record.status == "REVIEW", force || !self.hasCurrentAIAnalysis(record) else { return }
@@ -196,6 +224,21 @@ final class ReviewCoordinator {
             self.aiActiveToken = nil
             self.aiQueuedIDs.removeAll()
             self.aiPaused = false
+            self.persistAIQueue()
+        }
+    }
+
+    func cancelAIReview(for recordID: String) {
+        runOnMain { [weak self] in
+            guard let self else { return }
+            if self.aiActiveID == recordID {
+                self.aiTask?.cancel()
+                self.aiTask = nil
+                self.aiActiveID = nil
+                self.aiActiveToken = nil
+                self.startNextAIJobIfPossible()
+            }
+            self.aiQueuedIDs.removeAll(where: { $0 == recordID })
             self.persistAIQueue()
         }
     }

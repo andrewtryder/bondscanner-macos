@@ -14,6 +14,9 @@ final class ReviewPhotoView: NSView {
     private let rotateBtn = NSButton(title: "Rotate ⟳", target: nil, action: nil)
     private let togglePhotoBtn = NSButton(title: "Photo: Original", target: nil, action: nil)
     private let zoomLabel = NSTextField(labelWithString: "100%")
+    private let loupeBtn = NSButton(title: "🔍 Loupe", target: nil, action: nil)
+    private let loupeView = LoupeView(frame: NSRect(x: 0, y: 0, width: 160, height: 160))
+    private(set) var loupeEnabled = true
 
     private var originalImage: NSImage?
     private var processedImage: NSImage?
@@ -39,7 +42,7 @@ final class ReviewPhotoView: NSView {
         layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
         // Configure Toolbar Buttons
-        for btn in [zoomOutBtn, zoomInBtn, zoomFitBtn, zoomActualBtn, rotateBtn, togglePhotoBtn] {
+        for btn in [zoomOutBtn, zoomInBtn, zoomFitBtn, zoomActualBtn, loupeBtn, rotateBtn, togglePhotoBtn] {
             btn.bezelStyle = .rounded
             btn.controlSize = .small
             btn.target = self
@@ -53,6 +56,9 @@ final class ReviewPhotoView: NSView {
         zoomFitBtn.toolTip = "Zoom to Fit (⌘0)"
         zoomActualBtn.action = #selector(zoomActualClicked)
         zoomActualBtn.toolTip = "Actual Size 100%"
+        loupeBtn.action = #selector(toggleLoupeClicked)
+        loupeBtn.toolTip = "Toggle Hovering Magnifying Loupe"
+        loupeBtn.state = .on
         rotateBtn.action = #selector(rotateClicked)
         rotateBtn.toolTip = "Rotate View 90° Clockwise (⌘R)"
         togglePhotoBtn.action = #selector(togglePhotoClicked)
@@ -72,6 +78,7 @@ final class ReviewPhotoView: NSView {
         toolbar.addArrangedSubview(zoomInBtn)
         toolbar.addArrangedSubview(zoomLabel)
         toolbar.addArrangedSubview(NSView()) // Spacer
+        toolbar.addArrangedSubview(loupeBtn)
         toolbar.addArrangedSubview(rotateBtn)
         toolbar.addArrangedSubview(togglePhotoBtn)
 
@@ -85,6 +92,8 @@ final class ReviewPhotoView: NSView {
 
         addSubview(toolbar)
         addSubview(scrollView)
+        addSubview(loupeView)
+        loupeView.isHidden = true
 
         NSLayoutConstraint.activate([
             toolbar.topAnchor.constraint(equalTo: topAnchor, constant: 8),
@@ -101,6 +110,41 @@ final class ReviewPhotoView: NSView {
         innerImageView.onZoomChanged = { [weak self] scale in
             self?.updateZoomLabel(scale)
         }
+
+        innerImageView.onMouseHover = { [weak self] viewPoint, imgPoint in
+            guard let self = self else { return }
+            guard self.loupeEnabled, let img = self.activeImage, let imgPt = imgPoint, let vPt = viewPoint else {
+                self.loupeView.isHidden = true
+                return
+            }
+            let windowPoint = self.innerImageView.convert(vPt, to: nil)
+            let photoPoint = self.convert(windowPoint, from: nil)
+
+            let loupeDiameter: CGFloat = 160
+            let loupeRadius = loupeDiameter / 2.0
+
+            var centerX = photoPoint.x
+            // Position above cursor so user's cursor doesn't obscure the magnified region
+            var centerY = photoPoint.y + 105
+            if centerY + loupeRadius > self.bounds.height - 35 {
+                // If near the top toolbar, flip below the cursor
+                centerY = photoPoint.y - 105
+            }
+            // Clamp within view bounds
+            centerX = max(loupeRadius + 10, min(centerX, self.bounds.width - loupeRadius - 10))
+            centerY = max(loupeRadius + 10, min(centerY, self.bounds.height - loupeRadius - 10))
+
+            self.loupeView.frame = NSRect(
+                x: centerX - loupeRadius,
+                y: centerY - loupeRadius,
+                width: loupeDiameter,
+                height: loupeDiameter
+            )
+            self.loupeView.sourceImage = img
+            self.loupeView.quarterTurns = self.rotationQuarterTurns
+            self.loupeView.focusImagePoint = imgPt
+            self.loupeView.isHidden = false
+        }
     }
 
     func setImages(original: NSImage?, processed: NSImage?) {
@@ -108,6 +152,7 @@ final class ReviewPhotoView: NSView {
         self.processedImage = processed
         self.showingProcessed = false
         self.rotationQuarterTurns = 0
+        self.loupeView.isHidden = true
 
         togglePhotoBtn.isEnabled = (original != nil && processed != nil)
         togglePhotoBtn.title = "Photo: Original"
@@ -160,6 +205,7 @@ final class ReviewPhotoView: NSView {
 
     func rotateClockwise() {
         rotationQuarterTurns = (rotationQuarterTurns + 1) % 4
+        loupeView.isHidden = true
         innerImageView.setImage(activeImage, quarterTurns: rotationQuarterTurns)
         zoomToFit()
     }
@@ -180,12 +226,21 @@ final class ReviewPhotoView: NSView {
         zoomToActual()
     }
 
+    @objc private func toggleLoupeClicked() {
+        loupeEnabled.toggle()
+        loupeBtn.state = loupeEnabled ? .on : .off
+        if !loupeEnabled {
+            loupeView.isHidden = true
+        }
+    }
+
     @objc private func rotateClicked() {
         rotateClockwise()
     }
 
     func togglePhoto() {
         showingProcessed.toggle()
+        loupeView.isHidden = true
         togglePhotoBtn.title = showingProcessed ? "Photo: Processed" : "Photo: Original"
         displayActiveImage(fitInitially: false)
     }
@@ -207,15 +262,107 @@ final class ReviewPhotoView: NSView {
     }
 }
 
+// MARK: - Magnifying Loupe Overlay
+
+private final class LoupeView: NSView {
+    var sourceImage: NSImage?
+    var quarterTurns: Int = 0
+    var focusImagePoint: NSPoint? {
+        didSet { needsDisplay = true }
+    }
+
+    var magnification: CGFloat = 2.8
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = frameRect.width / 2.0
+        layer?.masksToBounds = true
+        layer?.borderWidth = 3.0
+        layer?.borderColor = NSColor.white.cgColor
+        layer?.backgroundColor = NSColor.black.cgColor
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+        layer?.cornerRadius = frame.width / 2.0
+        layer?.masksToBounds = true
+        layer?.borderWidth = 3.0
+        layer?.borderColor = NSColor.white.cgColor
+        layer?.backgroundColor = NSColor.black.cgColor
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Transparent to clicks and drags so viewer remains fully interactive
+        return nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let img = sourceImage, let pt = focusImagePoint else { return }
+
+        let context = NSGraphicsContext.current?.cgContext
+        context?.saveGState()
+
+        let path = NSBezierPath(ovalIn: bounds)
+        path.addClip()
+
+        NSColor.black.setFill()
+        path.fill()
+
+        NSGraphicsContext.current?.imageInterpolation = .high
+
+        let centerX = bounds.width / 2.0
+        let centerY = bounds.height / 2.0
+        context?.translateBy(x: centerX, y: centerY)
+
+        // Rotate by quarter turns to match photo viewer orientation
+        let angle = -CGFloat(quarterTurns) * (.pi / 2.0)
+        context?.rotate(by: angle)
+
+        let drawW = img.size.width * magnification
+        let drawH = img.size.height * magnification
+        let originX = -pt.x * magnification
+        let originY = -pt.y * magnification
+
+        let destRect = NSRect(x: originX, y: originY, width: drawW, height: drawH)
+        img.draw(in: destRect, from: .zero, operation: .sourceOver, fraction: 1.0)
+
+        context?.restoreGState()
+
+        // Subtle center reticle (12pt crosshair)
+        NSColor.systemBlue.withAlphaComponent(0.7).setStroke()
+        let reticle = NSBezierPath()
+        reticle.lineWidth = 1.0
+        reticle.move(to: NSPoint(x: centerX - 8, y: centerY))
+        reticle.line(to: NSPoint(x: centerX - 2, y: centerY))
+        reticle.move(to: NSPoint(x: centerX + 2, y: centerY))
+        reticle.line(to: NSPoint(x: centerX + 8, y: centerY))
+        reticle.move(to: NSPoint(x: centerX, y: centerY - 8))
+        reticle.line(to: NSPoint(x: centerX, y: centerY - 2))
+        reticle.move(to: NSPoint(x: centerX, y: centerY + 2))
+        reticle.line(to: NSPoint(x: centerX, y: centerY + 8))
+        reticle.stroke()
+
+        // Inner circular border ring for optical lens effect
+        NSColor.white.withAlphaComponent(0.85).setStroke()
+        let innerRing = NSBezierPath(ovalIn: bounds.insetBy(dx: 1.5, dy: 1.5))
+        innerRing.lineWidth = 2.0
+        innerRing.stroke()
+    }
+}
+
 // MARK: - Zoomable & Rotatable Image View
 
 private final class ZoomableImageView: NSView {
     var onZoomChanged: ((CGFloat) -> Void)?
+    var onMouseHover: ((NSPoint?, NSPoint?) -> Void)?
     private(set) var isFitMode = true
 
     private var image: NSImage?
     private var quarterTurns: Int = 0
     private var zoomScale: CGFloat = 1.0
+    private var trackingArea: NSTrackingArea?
 
     var currentZoomScale: CGFloat {
         zoomScale
@@ -234,6 +381,82 @@ private final class ZoomableImageView: NSView {
         super.init(coder: coder)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingArea {
+            removeTrackingArea(existing)
+        }
+        let options: NSTrackingArea.Options = [
+            .mouseMoved,
+            .mouseEnteredAndExited,
+            .activeInKeyWindow,
+            .inVisibleRect,
+        ]
+        let area = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
+        addTrackingArea(area)
+        self.trackingArea = area
+    }
+
+    func imagePoint(from viewPoint: NSPoint) -> NSPoint? {
+        guard let img = image else { return nil }
+        let isRotated = (quarterTurns % 2 != 0)
+        let naturalW = isRotated ? img.size.height : img.size.width
+        let naturalH = isRotated ? img.size.width : img.size.height
+        let targetW = naturalW * zoomScale
+        let targetH = naturalH * zoomScale
+        let drawX = (bounds.width - targetW) / 2.0
+        let drawY = (bounds.height - targetH) / 2.0
+
+        let imageRect = NSRect(x: drawX, y: drawY, width: targetW, height: targetH)
+        guard imageRect.contains(viewPoint) else { return nil }
+
+        let centerX = drawX + targetW / 2.0
+        let centerY = drawY + targetH / 2.0
+
+        let relX = (viewPoint.x - centerX) / zoomScale
+        let relY = (viewPoint.y - centerY) / zoomScale
+
+        let angle = CGFloat(quarterTurns) * (.pi / 2.0)
+        let cosA = cos(angle)
+        let sinA = sin(angle)
+        let localX = relX * cosA - relY * sinA
+        let localY = relX * sinA + relY * cosA
+
+        let imgX = localX + img.size.width / 2.0
+        let imgY = localY + img.size.height / 2.0
+
+        guard imgX >= 0, imgX <= img.size.width, imgY >= 0, imgY <= img.size.height else { return nil }
+        return NSPoint(x: imgX, y: imgY)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard dragStartLocation == nil else { return }
+        let viewPoint = convert(event.locationInWindow, from: nil)
+        let imgPt = imagePoint(from: viewPoint)
+        onMouseHover?(viewPoint, imgPt)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onMouseHover?(nil, nil)
+    }
+
+    // MARK: - Pinch & Scroll Wheel Zoom
+
+    override func magnify(with event: NSEvent) {
+        let factor = 1.0 + event.magnification
+        multiplyZoom(by: factor)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        if event.modifierFlags.contains(.command) || event.modifierFlags.contains(.option) {
+            let delta = event.scrollingDeltaY
+            let factor = delta > 0 ? 1.08 : 0.92
+            multiplyZoom(by: factor)
+        } else {
+            super.scrollWheel(with: event)
+        }
     }
 
     func setImage(_ img: NSImage?, quarterTurns: Int) {
@@ -317,11 +540,13 @@ private final class ZoomableImageView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        onMouseHover?(nil, nil)
         dragStartLocation = event.locationInWindow
         dragStartOrigin = enclosingScrollView?.contentView.bounds.origin
     }
 
     override func mouseDragged(with event: NSEvent) {
+        onMouseHover?(nil, nil)
         guard let startLoc = dragStartLocation,
               let startOrigin = dragStartOrigin,
               let clipView = enclosingScrollView?.contentView else { return }
@@ -344,5 +569,8 @@ private final class ZoomableImageView: NSView {
     override func mouseUp(with event: NSEvent) {
         dragStartLocation = nil
         dragStartOrigin = nil
+        let viewPoint = convert(event.locationInWindow, from: nil)
+        let imgPt = imagePoint(from: viewPoint)
+        onMouseHover?(viewPoint, imgPt)
     }
 }

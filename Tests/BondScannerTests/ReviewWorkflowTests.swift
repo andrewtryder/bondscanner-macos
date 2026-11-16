@@ -1082,6 +1082,7 @@ final class ReviewWorkflowTests: XCTestCase {
                 ("aiAnalyzeBtn", editor.aiAnalyzeBtn),
                 ("confirmAllBtn", editor.confirmAllBtn),
                 ("revertBtn", editor.revertBtn),
+                ("deleteBtn", editor.deleteBtn),
                 ("saveBtn", editor.saveBtn),
                 ("saveAndNextBtn", editor.saveAndNextBtn),
             ]
@@ -1123,5 +1124,203 @@ final class ReviewWorkflowTests: XCTestCase {
 
         editor.updateAIProgress("")
         XCTAssertEqual(editor.progressLabel.stringValue, progress.displayString)
+    }
+
+    // MARK: - 32. Delete Record From Review Coordinator and UI
+
+    func testDeleteRecordRemovesFromDatabaseAndQueue() throws {
+        StorageConfiguration.shared.setCustomRoots(outputRoot: tempDir, backupsRoot: tempDir.appendingPathComponent("backups"))
+        defer { StorageConfiguration.shared.resetToDefaults() }
+
+        // Create dummy photo files in tempDir/photos
+        let photosDir = tempDir.appendingPathComponent("photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: photosDir, withIntermediateDirectories: true)
+        let photoFile = photosDir.appendingPathComponent("test_photo.jpg")
+        try Data("dummy".utf8).write(to: photoFile)
+
+        let rec1 = makeSampleRecord(id: "rec1", serial: "C1111111111EE", status: "REVIEW")
+        var rec2 = makeSampleRecord(id: "rec2", serial: "C2222222222EE", status: "REVIEW")
+        rec2.photo = "photos/test_photo.jpg"
+        let rec3 = makeSampleRecord(id: "rec3", serial: "C3333333333EE", status: "REVIEW")
+
+        try testDb.upsertRecords([rec1, rec2, rec3])
+
+        let coordinator = ReviewCoordinator(records: [rec1, rec2, rec3], outputRoot: tempDir)
+        let controller = ReviewWindowController(coordinator: coordinator)
+        controller.suppressModalAlerts = true
+
+        coordinator.selectRecord(id: "rec2")
+        XCTAssertEqual(coordinator.currentRecordId, "rec2")
+
+        // Trigger delete
+        try coordinator.deleteRecord(record: rec2)
+
+        // Verify rec2 is removed from SQLite database
+        let inDb = try testDb.loadAllRecords()
+        XCTAssertEqual(inDb.count, 2)
+        XCTAssertFalse(inDb.contains(where: { $0.id == "rec2" }))
+
+        // Verify in-memory state and queue
+        XCTAssertEqual(coordinator.allRecords.count, 2)
+        XCTAssertEqual(coordinator.currentRecordId, "rec3", "Queue should advance to the next record")
+        XCTAssertEqual(coordinator.queuedRecords.map(\.id), ["rec1", "rec3"])
+    }
+
+    func testDeleteRecordViaControllerWithConfirmation() throws {
+        StorageConfiguration.shared.setCustomRoots(outputRoot: tempDir, backupsRoot: tempDir.appendingPathComponent("backups"))
+        defer { StorageConfiguration.shared.resetToDefaults() }
+
+        let rec1 = makeSampleRecord(id: "rec1", serial: "C1111111111EE", status: "REVIEW")
+        let rec2 = makeSampleRecord(id: "rec2", serial: "C2222222222EE", status: "REVIEW")
+        try testDb.upsertRecords([rec1, rec2])
+
+        let coordinator = ReviewCoordinator(records: [rec1, rec2], outputRoot: tempDir)
+        let controller = ReviewWindowController(coordinator: coordinator)
+
+        coordinator.selectRecord(id: "rec1")
+
+        // 1. User cancels delete dialog
+        controller.deletePromptHandler = { .alertSecondButtonReturn }
+        controller.reviewEditorDidRequestDelete(controller.editorView)
+        XCTAssertEqual(coordinator.allRecords.count, 2, "Record must NOT be deleted when user cancels confirmation")
+        XCTAssertEqual(coordinator.currentRecordId, "rec1")
+
+        // 2. User confirms delete dialog
+        controller.deletePromptHandler = { .alertFirstButtonReturn }
+        controller.reviewEditorDidRequestDelete(controller.editorView)
+        XCTAssertEqual(coordinator.allRecords.count, 1, "Record must be deleted when user confirms")
+        XCTAssertEqual(coordinator.currentRecordId, "rec2", "Queue must advance to the next record")
+    }
+
+    func testDeleteLastRecordShowsQueueCompleted() throws {
+        StorageConfiguration.shared.setCustomRoots(outputRoot: tempDir, backupsRoot: tempDir.appendingPathComponent("backups"))
+        defer { StorageConfiguration.shared.resetToDefaults() }
+
+        let rec1 = makeSampleRecord(id: "rec1", serial: "C1111111111EE", status: "REVIEW")
+        try testDb.upsertRecords([rec1])
+
+        let coordinator = ReviewCoordinator(records: [rec1], outputRoot: tempDir)
+        let controller = ReviewWindowController(coordinator: coordinator)
+        controller.suppressModalAlerts = true
+        coordinator.selectRecord(id: "rec1")
+
+        controller.reviewEditorDidRequestDelete(controller.editorView)
+        XCTAssertEqual(coordinator.allRecords.count, 0)
+        XCTAssertNil(coordinator.currentRecord)
+        XCTAssertFalse(controller.editorView.deleteBtn.isEnabled, "Delete button should be disabled when no record is selected")
+        XCTAssertFalse(controller.editorView.completionBox.isHidden)
+    }
+
+    func testDeleteKeyEquivalentTriggersDelete() throws {
+        StorageConfiguration.shared.setCustomRoots(outputRoot: tempDir, backupsRoot: tempDir.appendingPathComponent("backups"))
+        defer { StorageConfiguration.shared.resetToDefaults() }
+
+        let rec1 = makeSampleRecord(id: "rec1", serial: "C1111111111EE", status: "REVIEW")
+        try testDb.upsertRecords([rec1])
+
+        let coordinator = ReviewCoordinator(records: [rec1], outputRoot: tempDir)
+        let controller = ReviewWindowController(coordinator: coordinator)
+        controller.suppressModalAlerts = true
+        coordinator.selectRecord(id: "rec1")
+
+        // Simulate ⌘⌫ (Command + Delete / Backspace, keyCode 51)
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "\u{7f}",
+            charactersIgnoringModifiers: "\u{7f}",
+            isARepeat: false,
+            keyCode: 51
+        ))
+
+        let handled = controller.handleKeyEquivalent(event)
+        XCTAssertTrue(handled)
+        XCTAssertEqual(coordinator.allRecords.count, 0)
+    }
+
+    // MARK: - 33. Legacy Review Auto-Resolve and Specific Reason Display
+
+    func testLegacyReviewAutoResolvesWhenFieldsConfirmed() {
+        var rec = makeSampleRecord(
+            status: "REVIEW",
+            reviewReasons: ["legacy_review: manual verification required"]
+        )
+        rec.fieldConfidence = ["serial": "high", "denomination": "high", "issueDate": "high"]
+        rec.userConfirmedFields = ["denomination"]
+
+        applyRequiredStatus(&rec)
+        XCTAssertEqual(rec.status, "OK", "Legacy review reason must clear when user has confirmed fields and no hard errors remain")
+        XCTAssertNil(rec.reviewReasons)
+    }
+
+    func testLegacyReviewDisplaysHistoricalNoteInBanner() {
+        var rec = makeSampleRecord(
+            status: "REVIEW",
+            reviewReasons: ["legacy_review: manual verification required"]
+        )
+        rec.notes = "Missing or uncertain: face value"
+
+        let editor = ReviewEditorView(frame: NSRect(x: 0, y: 0, width: 500, height: 700))
+        editor.setRecord(rec)
+
+        // The banner stack should contain the note text instead of purely generic placeholder
+        let reasonLabels = editor.reasonsStack.subviews.flatMap { ($0 as? NSBox)?.contentView?.subviews ?? [] }
+            .flatMap { ($0 as? NSStackView)?.arrangedSubviews ?? [] }
+            .compactMap { ($0 as? NSStackView)?.arrangedSubviews.first as? NSTextField }
+            .map(\.stringValue)
+
+        XCTAssertTrue(
+            reasonLabels.contains(where: { $0.contains("face value") }),
+            "Review banner must surface specific historical note ('face value') for legacy review"
+        )
+    }
+
+    // MARK: - 34. Photo Viewer Hover Loupe & Gesture Zoom
+
+    func testPhotoViewHoverLoupeAndGestureZoom() throws {
+        let photoView = ReviewPhotoView(frame: NSRect(x: 0, y: 0, width: 600, height: 500))
+
+        // Create a dummy image
+        let rep = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 400,
+            pixelsHigh: 300,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ))
+        let image = NSImage(size: NSSize(width: 400, height: 300))
+        image.addRepresentation(rep)
+
+        photoView.setImages(original: image, processed: image)
+        photoView.layoutSubtreeIfNeeded()
+
+        // 1. Initial zoom scale
+        let initialZoom = photoView.currentZoomScale
+        XCTAssertGreaterThan(initialZoom, 0)
+
+        // 2. Zoom In / Zoom Out
+        photoView.zoomIn()
+        XCTAssertGreaterThan(photoView.currentZoomScale, initialZoom, "Zoom in must increase scale")
+
+        photoView.zoomOut()
+        photoView.zoomToActual()
+        XCTAssertEqual(photoView.currentZoomScale, 1.0, accuracy: 0.001)
+
+        // 3. Loupe toggle
+        XCTAssertTrue(photoView.loupeEnabled)
+        let loupeBtn = try XCTUnwrap(photoView.subviews.compactMap { $0 as? NSStackView }.first?.arrangedSubviews.compactMap { $0 as? NSButton }.first(where: { $0.title.contains("Loupe") }))
+        loupeBtn.performClick(nil)
+        XCTAssertFalse(photoView.loupeEnabled)
+        loupeBtn.performClick(nil)
+        XCTAssertTrue(photoView.loupeEnabled)
     }
 }

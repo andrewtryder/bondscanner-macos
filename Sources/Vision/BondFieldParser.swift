@@ -367,8 +367,8 @@ func applyRequiredStatus(_ record: inout BondRecord) {
     var reasons = Set(record.reviewReasons ?? [])
     let resolved = Set(record.resolvedReviewReasons ?? [])
 
-    // Filter out previous dynamic validation and missing-field reasons before re-evaluating
-    reasons = reasons.filter { !$0.hasPrefix("validation:") && !$0.hasPrefix("missing_required:") }
+    // Filter out previous dynamic validation, missing-field, and legacy review reasons before re-evaluating
+    reasons = reasons.filter { !$0.hasPrefix("validation:") && !$0.hasPrefix("missing_required:") && !$0.hasPrefix("legacy_review") }
 
     // If notes historically indicated a near-match, ensure it is recorded in structured reasons
     let hasResolvedNearMatchOrKeepSeparate = resolved.contains("near_match") || resolved.contains(where: { $0.hasPrefix("keep_separate:") || $0.hasPrefix("near_match:") })
@@ -391,9 +391,11 @@ func applyRequiredStatus(_ record: inout BondRecord) {
 
     // Preserve legacy review intent:
     // If a record historically had REVIEW status, but has no structured reasons and the user has not
-    // explicitly confirmed it or resolved the legacy review, retain a legacy review reason.
-    if upper == "REVIEW" && reasons.isEmpty && (record.userConfirmedFields ?? []).isEmpty && !resolved.contains("legacy_review") {
-        reasons.insert("legacy_review: manual verification required")
+    // explicitly confirmed it or resolved the legacy review, retain a legacy review reason with the note context.
+    let hasResolvedLegacy = resolved.contains("legacy_review") || resolved.contains(where: { $0.hasPrefix("legacy_review") })
+    if upper == "REVIEW" && reasons.isEmpty && (record.userConfirmedFields ?? []).isEmpty && !hasResolvedLegacy {
+        let noteDetail = record.notes.isEmpty ? "manual verification required" : record.notes
+        reasons.insert("legacy_review: \(noteDetail)")
     }
 
     // Remove any explicitly resolved reasons

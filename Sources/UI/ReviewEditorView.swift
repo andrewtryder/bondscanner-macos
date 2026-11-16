@@ -6,6 +6,7 @@ protocol ReviewEditorViewDelegate: AnyObject {
     func reviewEditorDidRequestPrevious(_ editor: ReviewEditorView)
     func reviewEditorDidRequestNext(_ editor: ReviewEditorView)
     func reviewEditorDidRequestRevert(_ editor: ReviewEditorView)
+    func reviewEditorDidRequestDelete(_ editor: ReviewEditorView)
     func reviewEditorDidRequestReprocess(_ editor: ReviewEditorView)
     func reviewEditorDidRequestAIAnalysis(_ editor: ReviewEditorView)
     func reviewEditorDidRequestAnalyzeExistingAI(_ editor: ReviewEditorView)
@@ -115,11 +116,12 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
     let saveAndNextBtn = NSButton(title: "Save & Next", target: nil, action: nil)
     let saveBtn = NSButton(title: "Save", target: nil, action: nil)
     let revertBtn = NSButton(title: "Revert", target: nil, action: nil)
+    let deleteBtn = NSButton(title: "Delete", target: nil, action: nil)
     let reprocessBtn = NSButton(title: "Reprocess Photo", target: nil, action: nil)
     let aiAnalyzeBtn = NSButton(title: "Analyze with AI", target: nil, action: nil)
     let reprocessSpinner = NSProgressIndicator()
     let confirmAllBtn = NSButton(title: "Confirm All Valid ✓", target: nil, action: nil)
-    let shortcutsLabel = NSTextField(labelWithString: "Shortcuts: ⌘⏎ Save & Next  •  ⌘S Save  •  ⌘[ / ⌘] Prev/Next  •  ⌘K Confirm Field  •  ⌘P Reprocess  •  ⌘R Rotate  •  ⌘T Toggle Photo  •  ⌘0 Fit")
+    let shortcutsLabel = NSTextField(labelWithString: "Shortcuts: ⌘⏎ Save & Next  •  ⌘S Save  •  ⌘[ / ⌘] Prev/Next  •  ⌘K Confirm Field  •  ⌘P Reprocess  •  ⌘⌫ Delete  •  ⌘R Rotate  •  ⌘T Toggle Photo  •  ⌘0 Fit")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -274,6 +276,13 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
         revertBtn.toolTip = "Discard uncommitted changes"
         revertBtn.translatesAutoresizingMaskIntoConstraints = false
 
+        deleteBtn.bezelStyle = .rounded
+        deleteBtn.controlSize = .regular
+        deleteBtn.target = self
+        deleteBtn.action = #selector(deleteClicked)
+        deleteBtn.toolTip = "Delete this bond record and move its photo to the Trash (⌘⌫)"
+        deleteBtn.translatesAutoresizingMaskIntoConstraints = false
+
         reprocessBtn.bezelStyle = .rounded
         reprocessBtn.controlSize = .small
         reprocessBtn.target = self
@@ -309,6 +318,7 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
         bottomBar.addSubview(saveAndNextBtn)
         bottomBar.addSubview(saveBtn)
         bottomBar.addSubview(revertBtn)
+        bottomBar.addSubview(deleteBtn)
         bottomBar.addSubview(reprocessBtn)
         bottomBar.addSubview(aiAnalyzeBtn)
         bottomBar.addSubview(reprocessSpinner)
@@ -334,7 +344,10 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
             revertBtn.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: 16),
             revertBtn.topAnchor.constraint(equalTo: reprocessBtn.bottomAnchor, constant: 10),
 
-            saveBtn.leadingAnchor.constraint(greaterThanOrEqualTo: revertBtn.trailingAnchor, constant: 12),
+            deleteBtn.leadingAnchor.constraint(equalTo: revertBtn.trailingAnchor, constant: 8),
+            deleteBtn.centerYAnchor.constraint(equalTo: revertBtn.centerYAnchor),
+
+            saveBtn.leadingAnchor.constraint(greaterThanOrEqualTo: deleteBtn.trailingAnchor, constant: 12),
             saveBtn.trailingAnchor.constraint(equalTo: saveAndNextBtn.leadingAnchor, constant: -10),
             saveBtn.centerYAnchor.constraint(equalTo: revertBtn.centerYAnchor),
 
@@ -721,8 +734,11 @@ final class ReviewEditorView: NSView, NSTextFieldDelegate {
             statusBadge.stringValue = "—"
             statusBadge.layer?.backgroundColor = NSColor.secondaryLabelColor.cgColor
             clearFields()
+            deleteBtn.isEnabled = false
             return
         }
+
+        deleteBtn.isEnabled = true
 
         // If the same record is currently selected and has unsaved edits in draft that are not yet in `r`, protect the draft!
         if let existing = activeDraft, existing.recordId == r.id, existing.hasUnsavedChanges, !recordContainsDraftChanges(r) {

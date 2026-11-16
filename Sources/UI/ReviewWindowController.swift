@@ -25,6 +25,7 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
 
     var onRecordsChanged: (([BondRecord]) -> Void)?
     var unsavedChangesPromptHandler: (() -> NSApplication.ModalResponse)?
+    var deletePromptHandler: (() -> NSApplication.ModalResponse)?
     var suppressModalAlerts: Bool = false
     private(set) var lastErrorAlertMessage: String?
 
@@ -233,6 +234,35 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
         loadRecordIntoViews(current)
     }
 
+    func reviewEditorDidRequestDelete(_ editor: ReviewEditorView) {
+        guard let current = coordinator.currentRecord else { return }
+
+        if let customHandler = deletePromptHandler {
+            guard customHandler() == .alertFirstButtonReturn else { return }
+        } else if !suppressModalAlerts {
+            let alert = NSAlert()
+            alert.messageText = "Delete Bond Record?"
+            let idPrefix = String(current.id.prefix(8))
+            let serialInfo = current.serial.isEmpty ? "Record #\(idPrefix)" : "Bond #\(idPrefix) (\(current.serial))"
+            alert.informativeText = "Are you sure you want to delete \(serialInfo)? The record will be permanently removed from your collection and its photograph will be moved to the Trash."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Delete")
+            alert.addButton(withTitle: "Cancel")
+            let resp = alert.runModal()
+            guard resp == .alertFirstButtonReturn else { return }
+        }
+
+        do {
+            editor.discardDraft()
+            try coordinator.deleteRecord(record: current)
+            if coordinator.currentRecord == nil {
+                editor.showQueueCompleted(message: "All items in this review queue have been reviewed.")
+            }
+        } catch {
+            showErrorAlert(title: "Delete Failed", message: error.localizedDescription)
+        }
+    }
+
     func reviewEditorDidRequestReprocess(_ editor: ReviewEditorView) {
         guard let current = coordinator.currentRecord else { return }
         editor.setReprocessing(true)
@@ -255,7 +285,37 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
 
     func reviewEditorDidRequestAIAnalysis(_ editor: ReviewEditorView) {
         guard let current = coordinator.currentRecord else { return }
-        coordinator.enqueueAIReview(recordID: current.id, force: true)
+        editor.setAIAnalyzing(true)
+
+        Task { @MainActor in
+            defer { editor.setAIAnalyzing(false) }
+            do {
+                let analysis = try await coordinator.analyzeRecordWithAI(record: current)
+                editor.showAIAnalysis(analysis, for: current)
+                if !analysis.suggestions.isEmpty {
+                    let fields = analysis.suggestions.compactMap { sug -> String? in
+                        guard let val = sug.proposedValue else { return nil }
+                        return "\(sug.field): \(val)"
+                    }.joined(separator: ", ")
+                    showInfoAlert(title: "AI Analysis Complete", message: "Found \(analysis.suggestions.count) suggestion(s): \(fields)")
+                } else if analysis.status == .unavailable {
+                    showInfoAlert(
+                        title: "AI Analysis Unavailable",
+                        message: "On-device AI analysis is unavailable on this Mac (requires Apple Intelligence). Manual field review and OCR reprocessing remain available."
+                    )
+                } else if analysis.status == .abstained {
+                    showInfoAlert(
+                        title: "AI Analysis Complete",
+                        message: "The on-device model reviewed the bond photograph but did not find higher-confidence corrections than the current OCR readings."
+                    )
+                } else {
+                    let msg = analysis.summary.isEmpty ? "No conflicting or missing field suggestions detected." : analysis.summary
+                    showInfoAlert(title: "AI Analysis Complete", message: msg)
+                }
+            } catch {
+                showErrorAlert(title: "AI Analysis Failed", message: error.localizedDescription)
+            }
+        }
     }
 
     func reviewEditorDidRequestAnalyzeExistingAI(_ editor: ReviewEditorView) {
@@ -381,6 +441,10 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
         if event.keyCode == 36 || event.keyCode == 76 || chars == "\r" || chars == "\n" {
             reviewEditorDidRequestSave(editorView, andNext: true)
+            return true
+        }
+        if event.keyCode == 51 {
+            reviewEditorDidRequestDelete(editorView)
             return true
         }
 

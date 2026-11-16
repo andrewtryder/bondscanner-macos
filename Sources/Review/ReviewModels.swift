@@ -172,7 +172,12 @@ struct FormattedReviewReason: Identifiable, Equatable {
             self.isResolvable = true
         } else if rawKey.hasPrefix("legacy_review") {
             self.title = "Legacy Review"
-            self.detail = "Historical record marked for review. Please inspect photograph and confirm fields."
+            let detailPart = rawKey.replacingOccurrences(of: "legacy_review:", with: "").replacingOccurrences(of: "legacy_review", with: "").trimmingCharacters(in: .whitespaces)
+            if detailPart.isEmpty || detailPart == "manual verification required" {
+                self.detail = "Historical record marked for review. Please inspect photograph and confirm fields."
+            } else {
+                self.detail = detailPart
+            }
             self.isWarning = true
             self.isResolvable = true
         } else if rawKey.hasPrefix("stalled_processing") {

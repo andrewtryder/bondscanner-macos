@@ -414,7 +414,13 @@ extension ReviewEditorView {
             row.spacing = 8
             row.translatesAutoresizingMaskIntoConstraints = false
 
-            let desc = NSTextField(labelWithString: "• \(fmt.title): \(fmt.detail)")
+            let detailText: String
+            if fmt.rawKey.hasPrefix("legacy_review"), !r.notes.isEmpty, fmt.detail.hasPrefix("Historical record") {
+                detailText = r.notes
+            } else {
+                detailText = fmt.detail
+            }
+            let desc = NSTextField(labelWithString: "• \(fmt.title): \(detailText)")
             desc.font = .systemFont(ofSize: 11)
             desc.lineBreakMode = .byWordWrapping
             row.addArrangedSubview(desc)
