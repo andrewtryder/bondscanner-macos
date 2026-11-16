@@ -14,7 +14,9 @@ final class ReviewWorkflowTests: XCTestCase {
             }
         }
 
-        func hasStarted(_ id: String) -> Bool { continuations[id] != nil }
+        func hasStarted(_ id: String) -> Bool {
+            continuations[id] != nil
+        }
 
         func resume(_ record: BondRecord, status: BondAIAnalysis.Status = .ready) {
             guard let continuation = continuations.removeValue(forKey: record.id) else { return }
@@ -26,11 +28,13 @@ final class ReviewWorkflowTests: XCTestCase {
             ))
         }
     }
+
     private struct SuggestingAI: BondAIAnalyzing {
         func analyze(record: BondRecord, imageURL: URL) async -> BondAIAnalysis {
             BondAIAnalysis(recordID: record.id, recordRevision: record.revision ?? 0, analyzedAt: Date(), runtime: "test", promptVersion: BondAIAnalysis.currentPromptVersion, status: .ready, suggestions: [BondAISuggestion(field: "serial", existingValue: record.serial, proposedValue: "C1234567890EE", abstained: false, evidence: "synthetic", imageRegion: nil, ambiguity: "test", assessment: .conflictingEvidence, requiresOriginalInspection: true)], summary: "Synthetic result", failureKind: nil)
         }
     }
+
     private var tempDir: URL!
     private var testDbURL: URL!
     private var testDb: DatabaseManager!
@@ -161,17 +165,23 @@ final class ReviewWorkflowTests: XCTestCase {
         let coordinator = ReviewCoordinator(records: [first, second], outputRoot: tempDir, aiAnalyzer: analyzer)
         coordinator.enqueueAIReview(recordID: first.id)
         coordinator.enqueueAIReview(recordID: second.id)
-        for _ in 0..<50 where !(await analyzer.hasStarted(first.id)) { try await Task.sleep(for: .milliseconds(10)) }
+        for _ in 0 ..< 50 where !(await analyzer.hasStarted(first.id)) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         let firstStarted = await analyzer.hasStarted(first.id)
         XCTAssertTrue(firstStarted)
 
         coordinator.setAllRecords([second]) // simulates a merge/delete while inference is suspended
         await analyzer.resume(first)
-        for _ in 0..<50 where !(await analyzer.hasStarted(second.id)) { try await Task.sleep(for: .milliseconds(10)) }
+        for _ in 0 ..< 50 where !(await analyzer.hasStarted(second.id)) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         let secondStarted = await analyzer.hasStarted(second.id)
         XCTAssertTrue(secondStarted, "Deleted work must always release the queue")
         await analyzer.resume(second)
-        for _ in 0..<50 where coordinator.allRecords.first?.aiAnalysis == nil { try await Task.sleep(for: .milliseconds(10)) }
+        for _ in 0 ..< 50 where coordinator.allRecords.first?.aiAnalysis == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertEqual(coordinator.allRecords.first?.aiAnalysis?.recordRevision, second.revision)
     }
 
@@ -185,7 +195,9 @@ final class ReviewWorkflowTests: XCTestCase {
         let analyzer = SuspendedAI()
         let coordinator = ReviewCoordinator(records: [record], outputRoot: tempDir, aiAnalyzer: analyzer)
         coordinator.enqueueAIReview(recordID: record.id)
-        for _ in 0..<50 where !(await analyzer.hasStarted(record.id)) { try await Task.sleep(for: .milliseconds(10)) }
+        for _ in 0 ..< 50 where !(await analyzer.hasStarted(record.id)) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         _ = try coordinator.saveRecord(record: record, userEdits: ["owner": "Changed while AI ran"], confirmedFields: ["owner"])
         await analyzer.resume(record)
         try await Task.sleep(for: .milliseconds(100))

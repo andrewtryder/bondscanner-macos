@@ -34,6 +34,9 @@ targets:
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: YES
         ENABLE_HARDENED_RUNTIME: NO
+        # A hosted XCTest bundle links the app module via TEST_HOST. Xcode 27's
+        # debug-dylib executor leaves the bundle without a resolvable app dylib.
+        ENABLE_DEBUG_DYLIB: NO
     dependencies:
       - sdk: AppKit.framework
       - sdk: AVFoundation.framework
@@ -63,6 +66,12 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: YES
+        # Hosted macOS XCTest must load the built application, not XcodeGen's
+        # legacy build/Debug path. Disable debug dylib indirection so the test
+        # bundle has one stable host executable/rpath in CLI and Xcode launches.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/BondScanner.app/Contents/MacOS/BondScanner"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        ENABLE_DEBUG_DYLIB: NO
 
 schemes:
   BondScanner:
@@ -74,5 +83,53 @@ schemes:
       config: Debug
     test:
       config: Debug
+      environmentVariables:
+        BONDSCANNER_TEST_MODE: "1"
+      targets:
+        - BondScannerTests
+
+  BondScannerHardwareEvaluation:
+    build:
+      targets:
+        BondScanner: all
+        BondScannerTests: [test]
+    test:
+      config: Debug
+      # This is deliberately a separate, explicit scheme. It is the only
+      # generated configuration that can invoke private local-model inference.
+      environmentVariables:
+        BONDSCANNER_TEST_MODE: "1"
+        BONDSCANNER_RUN_LOCAL_AI_EVAL: "1"
+        BONDSCANNER_AI_EVAL_LIMIT: "5"
+        BONDSCANNER_AI_EVAL_MODE: "review"
+      targets:
+        - BondScannerTests
+
+  BondScannerManifestDraft:
+    build:
+      targets:
+        BondScanner: all
+        BondScannerTests: [test]
+    test:
+      config: Debug
+      # Creates an ignored, explicitly unverified draft only. It never changes
+      # manifest.json, which remains reserved for human-verified ground truth.
+      environmentVariables:
+        BONDSCANNER_TEST_MODE: "1"
+        BONDSCANNER_GENERATE_AI_DRAFT: "1"
+        BONDSCANNER_AI_DRAFT_LIMIT: "5"
+      targets:
+        - BondScannerTests
+
+  BondScannerRealOCRRegression:
+    build:
+      targets:
+        BondScanner: all
+        BondScannerTests: [test]
+    test:
+      config: Debug
+      environmentVariables:
+        BONDSCANNER_TEST_MODE: "1"
+        BONDSCANNER_RUN_PRIVATE_REAL_OCR_REGRESSION: "1"
       targets:
         - BondScannerTests

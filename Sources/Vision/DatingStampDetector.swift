@@ -58,10 +58,12 @@ func extractIssueDateReading(_ lines: [OCRLine], series: String) -> FieldReading
         collect(slashPattern, fromLine: line, namedMonth: false)
     }
     for a in lines {
-        if isRulerLikeText(a.text) {
+        let cleanMonthText = cleanAlnum(a.text)
+        let resolvedMonth = monthFromName(a.text) ?? (cleanMonthText.count <= 2 ? monthNumber(cleanMonthText) : nil)
+        if resolvedMonth == nil, isRulerLikeText(a.text) {
             continue
         }
-        guard let month = monthFromName(a.text) else { continue }
+        guard let month = resolvedMonth else { continue }
         for b in lines {
             if isRulerLikeText(b.text) {
                 continue
@@ -233,8 +235,10 @@ func monthsBetweenIssue(_ monthA: String, _ yearA: String, _ monthB: String, _ y
 
 func extractDatingStamp(_ lines: [OCRLine], series: String) -> DatingStampReading? {
     let months = "JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?"
-    // Day + month name + year, allowing punctuation and O/I/l OCR slips in digits.
-    let pattern = "(?:^|[^A-Z0-9])([0-3IlLO]?[0-9IlLO])[\\.\\-]?\\s+(\(months))\\.?\\s+((?:19|20)[0-9O]{2})(?:[^0-9]|$)"
+    // Pattern 1: Day + month name + year (e.g. 14 APR 1986)
+    let patternDayFirst = "(?:^|[^A-Z0-9])([0-3IlLO]?[0-9IlLO])[\\.\\-]?\\s+(\(months))\\.?\\s+((?:19|20)[0-9O]{2})(?:[^0-9]|$)"
+    // Pattern 2: Month name + day + year (e.g. APR 14, 1986 or APR 14 1986)
+    let patternMonthFirst = "(?:^|[^A-Z0-9])(\(months))\\.?\\s+([0-3IlLO]?[0-9IlLO])[,\\.\\-]?\\s+((?:19|20)[0-9O]{2})(?:[^0-9]|$)"
 
     func stampYear(_ raw: String) -> String? {
         let y = raw.uppercased().replacingOccurrences(of: "O", with: "0")
@@ -264,25 +268,33 @@ func extractDatingStamp(_ lines: [OCRLine], series: String) -> DatingStampReadin
             return
         }
         let u = text.uppercased()
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return }
-        let ns = NSRange(u.startIndex ..< u.endIndex, in: u)
-        for match in re.matches(in: u, range: ns) {
-            guard let dR = Range(match.range(at: 1), in: u),
-                  let mR = Range(match.range(at: 2), in: u),
-                  let yR = Range(match.range(at: 3), in: u),
-                  let day = stampDay(String(u[dR])),
-                  let month = monthFromName(String(u[mR])),
-                  let year = stampYear(String(u[yR])) else { continue }
-            // High only for a single-line day+month+year. Assembled "1" + issue
-            // month + year from "FIRST DAY OF MAR 1960" is not a dating stamp.
-            let conf: String
-            if assembled {
-                conf = "uncertain"
-            } else {
-                conf = (1941 ... 2026).contains(Int(year) ?? 0) ? "high" : "uncertain"
+        if let reDayFirst = try? NSRegularExpression(pattern: patternDayFirst, options: [.caseInsensitive]) {
+            let ns = NSRange(u.startIndex ..< u.endIndex, in: u)
+            for match in reDayFirst.matches(in: u, range: ns) {
+                guard let dR = Range(match.range(at: 1), in: u),
+                      let mR = Range(match.range(at: 2), in: u),
+                      let yR = Range(match.range(at: 3), in: u),
+                      let day = stampDay(String(u[dR])),
+                      let month = monthFromName(String(u[mR])),
+                      let year = stampYear(String(u[yR])) else { continue }
+                let conf = assembled ? "uncertain" : ((1941 ... 2026).contains(Int(year) ?? 0) ? "high" : "uncertain")
+                hits.append(DatingStampReading(day: day, month: month, year: year, confidence: conf,
+                                               raw: "\(day) \(monthAbbrev(month)) \(year)"))
             }
-            hits.append(DatingStampReading(day: day, month: month, year: year, confidence: conf,
-                                           raw: "\(day) \(monthAbbrev(month)) \(year)"))
+        }
+        if let reMonthFirst = try? NSRegularExpression(pattern: patternMonthFirst, options: [.caseInsensitive]) {
+            let ns = NSRange(u.startIndex ..< u.endIndex, in: u)
+            for match in reMonthFirst.matches(in: u, range: ns) {
+                guard let mR = Range(match.range(at: 1), in: u),
+                      let dR = Range(match.range(at: 2), in: u),
+                      let yR = Range(match.range(at: 3), in: u),
+                      let day = stampDay(String(u[dR])),
+                      let month = monthFromName(String(u[mR])),
+                      let year = stampYear(String(u[yR])) else { continue }
+                let conf = assembled ? "uncertain" : ((1941 ... 2026).contains(Int(year) ?? 0) ? "high" : "uncertain")
+                hits.append(DatingStampReading(day: day, month: month, year: year, confidence: conf,
+                                               raw: "\(day) \(monthAbbrev(month)) \(year)"))
+            }
         }
     }
 
@@ -516,10 +528,29 @@ func resolveIssueDate(
     if preferred == nil {
         if let y = agreedYear, let m = agreedMonth {
             preferred = (m, y, "variants")
-        } else if let y = yearCounts.max(by: { $0.value < $1.value })?.key,
-                  let m = agreedMonth ?? candidates.first(where: { $0.year == y })?.month
+        } else if let topYear = yearCounts.keys.sorted(by: { a, b in
+                      let aCount = yearCounts[a, default: 0]
+                      let bCount = yearCounts[b, default: 0]
+                      if aCount != bCount {
+                          return aCount > bCount
+                      }
+                      let aSources = Set(candidates.filter { $0.year == a && $0.source != "paired" }.map(\.source)).count
+                      let bSources = Set(candidates.filter { $0.year == b && $0.source != "paired" }.map(\.source)).count
+                      if aSources != bSources {
+                          return aSources > bSources
+                      }
+                      if let stamp = stamp {
+                          let aStamp = stampConsistent(month: agreedMonth ?? "", year: a, stamp: stamp)
+                          let bStamp = stampConsistent(month: agreedMonth ?? "", year: b, stamp: stamp)
+                          if aStamp != bStamp {
+                              return aStamp
+                          }
+                      }
+                      return a > b
+                  }).first,
+                  let m = agreedMonth ?? candidates.first(where: { $0.year == topYear })?.month
         {
-            preferred = (m, y, "variants-majority")
+            preferred = (m, topYear, "variants-majority")
         } else if let c = candidates.max(by: { a, b in
             if yearCounts[a.year, default: 0] != yearCounts[b.year, default: 0] {
                 return yearCounts[a.year, default: 0] < yearCounts[b.year, default: 0]
@@ -575,6 +606,7 @@ func resolveIssueDate(
 func extractIssueDateFromImage(_ image: CGImage, series: String, baseLines: [OCRLine], intensive: Bool, recent: [(month: String, year: String)]) -> (date: FieldReading, stamp: DatingStampReading?) {
     var candidates: [(month: String, year: String, source: String)] = []
     var stampLines: [OCRLine] = baseLines
+    var dateBoxLines: [OCRLine] = []
     for c in allIssueDateCandidates(baseLines, series: series) {
         candidates.append((c.month, c.year, "base"))
     }
@@ -583,6 +615,7 @@ func extractIssueDateFromImage(_ image: CGImage, series: String, baseLines: [OCR
     for (ci, crop) in crops.enumerated() {
         for (label, variant) in dateBoxVariants(crop, intensive: intensive) {
             let lines = textOCR(variant, fast: false, minimumTextHeight: 0.003, alternateCount: 3)
+            dateBoxLines += lines
             stampLines += lines
             for c in allIssueDateCandidates(lines, series: series) {
                 candidates.append((c.month, c.year, "\(label)-\(ci)"))
@@ -613,10 +646,12 @@ func extractIssueDateFromImage(_ image: CGImage, series: String, baseLines: [OCR
     var isolatedYears: [String] = []
     func harvest(_ lines: [OCRLine]) {
         for line in lines {
-            if isRulerLikeText(line.text) {
+            let clean = cleanAlnum(line.text)
+            let resolvedMonth = monthFromName(line.text) ?? (clean.count <= 2 ? monthNumber(clean) : nil)
+            if resolvedMonth == nil, isRulerLikeText(line.text) {
                 continue
             }
-            if let m = monthFromName(line.text) {
+            if let m = resolvedMonth {
                 isolatedMonths.append(m)
             }
             let u = line.text.uppercased()
@@ -633,7 +668,7 @@ func extractIssueDateFromImage(_ image: CGImage, series: String, baseLines: [OCR
         }
     }
     harvest(baseLines)
-    harvest(stampLines)
+    harvest(dateBoxLines)
     let knownMonths = Set(candidates.map(\.month) + isolatedMonths)
     let knownYears = Set(candidates.map(\.year) + isolatedYears)
     for m in knownMonths {

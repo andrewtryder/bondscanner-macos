@@ -535,6 +535,7 @@ func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord,
         }
         existing.reviewReasons = Array(mergedReasons).sorted()
     }
+    addAssociatedPhotos(to: &existing, newPhotos: [contributingSource, contributingPhoto] + (incoming.associatedPhotos ?? []))
     applyRequiredStatus(&existing)
     // OCR consolidation is a meaningful mutation too.  This makes an in-flight
     // review analysis stale before any of its suggestions can be persisted.
