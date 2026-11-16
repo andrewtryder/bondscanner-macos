@@ -59,19 +59,48 @@ extension BondScannerApp {
         }
         guard automatic, !isProcessing, now >= nextAutoAllowedAt else { return }
         if let rect = rect {
-            let maxShift: CGFloat = fastScanEnabled ? 0.025 : 0.05
-            let maxScale: CGFloat = fastScanEnabled ? 0.04 : 0.075
-            let quality = evaluateImageQuality(frame, region: rect)
-            let minSharpness: Float = fastScanEnabled
-                ? ImageQualityReport.fastScanSharpnessThreshold
-                : ImageQualityReport.standardSharpnessThreshold
-            let isSharp = quality.isSharp || quality.sharpnessScore >= minSharpness
-            let motionDelta = abs(quality.meanLuminance - priorFrameLuminance)
-            let isMotionLow = motionDelta < 0.12
-            priorFrameLuminance = quality.meanLuminance
-            let isAutofocusSettled = (captureDevice?.isAdjustingFocus != true)
+            let gate = evaluateAutomaticCaptureStabilization(frame: frame, rect: rect, now: now)
+            if gate.ready {
+                stableFrames = 0
+                stabilizationStartTime = 0
+                huntHits = 0
+                ScanLog.shared.write("auto capture: stable outline (sharpness=\(String(format: "%.3f", gate.quality.sharpnessScore)) timeoutReached=\(gate.timeoutReached)); OCR starts")
+                performScan(frame, automaticScan: true)
+                return
+            }
+        } else {
+            if huntHits == 0 {
+                stableFrames = 0
+                stabilizationStartTime = 0
+            }
+            priorRect = nil
+        }
+        if now - lastDiagnosticAt > 4 {
+            ScanLog.shared.write("hunting: rectangle=\(rect != nil) stable_frames=\(stableFrames) locked=\(lockedAfterCapture)")
+            lastDiagnosticAt = now
+        }
+        scheduleTextHunt(frame, forRearm: false)
+    }
 
-            let isPositionStable: Bool
+    func evaluateAutomaticCaptureStabilization(
+        frame: CGImage,
+        rect: CGRect?,
+        now: TimeInterval = Date().timeIntervalSince1970
+    ) -> (ready: Bool, quality: ImageQualityReport, timeoutReached: Bool) {
+        let maxShift: CGFloat = fastScanEnabled ? 0.025 : 0.05
+        let maxScale: CGFloat = fastScanEnabled ? 0.04 : 0.075
+        let quality = evaluateImageQuality(frame, region: rect)
+        let minSharpness: Float = fastScanEnabled
+            ? ImageQualityReport.fastScanSharpnessThreshold
+            : ImageQualityReport.standardSharpnessThreshold
+        let isSharp = quality.isSharp || quality.sharpnessScore >= minSharpness
+        let motionDelta = abs(quality.meanLuminance - priorFrameLuminance)
+        let isMotionLow = motionDelta < 0.12
+        priorFrameLuminance = quality.meanLuminance
+        let isAutofocusSettled = (captureDevice?.isAdjustingFocus != true)
+
+        let isPositionStable: Bool
+        if let rect = rect {
             if let prior = priorRect,
                abs(rect.midX - prior.midX) < maxShift,
                abs(rect.midY - prior.midY) < maxShift,
@@ -82,39 +111,26 @@ extension BondScannerApp {
             } else {
                 isPositionStable = false
             }
-
-            if stabilizationStartTime == 0 {
-                stabilizationStartTime = now
-            }
-
-            if isPositionStable, isMotionLow, isAutofocusSettled {
-                stableFrames += 1
-            } else {
-                stableFrames = 1
-            }
             priorRect = rect
-
-            let elapsedStabilizing = now - stabilizationStartTime
-            let boundedTimeoutReached = elapsedStabilizing >= (fastScanEnabled ? 0.8 : 1.2) && isSharp
-
-            if (stableFrames >= 2 && isSharp) || boundedTimeoutReached {
-                stableFrames = 0
-                stabilizationStartTime = 0
-                huntHits = 0
-                ScanLog.shared.write("auto capture: stable outline (sharpness=\(String(format: "%.3f", quality.sharpnessScore)) timeoutReached=\(boundedTimeoutReached)); OCR starts")
-                performScan(frame, automaticScan: true)
-                return
-            }
         } else {
-            stableFrames = 0
-            stabilizationStartTime = 0
             priorRect = nil
+            isPositionStable = true
         }
-        if now - lastDiagnosticAt > 4 {
-            ScanLog.shared.write("hunting: rectangle=\(rect != nil) stable_frames=\(stableFrames) locked=\(lockedAfterCapture)")
-            lastDiagnosticAt = now
+
+        if stabilizationStartTime == 0 {
+            stabilizationStartTime = now
         }
-        scheduleTextHunt(frame, forRearm: false)
+
+        if isPositionStable, isMotionLow, isAutofocusSettled {
+            stableFrames += 1
+        } else {
+            stableFrames = 1
+        }
+
+        let elapsedStabilizing = now - stabilizationStartTime
+        let boundedTimeoutReached = elapsedStabilizing >= (fastScanEnabled ? 0.8 : 1.2) && isSharp
+        let ready = (stableFrames >= 2 && isSharp) || boundedTimeoutReached
+        return (ready, quality, boundedTimeoutReached)
     }
 
     func scheduleTextHunt(_ frame: CGImage, forRearm: Bool, rectangleVisible: Bool = false) {
@@ -195,20 +211,38 @@ extension BondScannerApp {
                     }
                     return
                 }
-                guard !self.lockedAfterCapture, !self.isProcessing, self.automatic else { return }
-                if hasBond {
-                    self.huntHits += 1
-                    self.status("Bond text found (\(self.huntHits)/\(self.requiredHuntHits)). Hold steady…")
-                    if self.huntHits >= self.requiredHuntHits {
-                        self.huntHits = 0
-                        ScanLog.shared.write("auto capture: fallback OCR detected bond without stable outline")
-                        self.performScan(self.latestImage ?? frame, automaticScan: true)
-                    }
-                } else {
-                    self.huntHits = 0
-                    self.status("No readable bond yet — adjust distance/light or press Space to capture for review.")
-                }
+                self.handleAutomaticTextDetection(hasBond: hasBond, frame: frame)
             }
+        }
+    }
+
+    func handleAutomaticTextDetection(hasBond: Bool, frame: CGImage) {
+        let now = Date().timeIntervalSince1970
+        guard !lockedAfterCapture, !isProcessing, automatic, now >= nextAutoAllowedAt else { return }
+        if hasBond {
+            huntHits += 1
+            if huntHits >= requiredHuntHits {
+                let captureFrame = latestImage ?? frame
+                let gate = evaluateAutomaticCaptureStabilization(frame: captureFrame, rect: nil, now: now)
+                if gate.ready {
+                    stableFrames = 0
+                    stabilizationStartTime = 0
+                    huntHits = 0
+                    ScanLog.shared.write("auto capture: fallback OCR stabilized (sharpness=\(String(format: "%.3f", gate.quality.sharpnessScore)) timeoutReached=\(gate.timeoutReached))")
+                    performScan(captureFrame, automaticScan: true)
+                } else {
+                    status("Bond text found — stabilizing before capture…")
+                }
+            } else {
+                status("Bond text found (\(huntHits)/\(requiredHuntHits)). Hold steady…")
+            }
+        } else {
+            huntHits = 0
+            if priorRect == nil {
+                stableFrames = 0
+                stabilizationStartTime = 0
+            }
+            status("No readable bond yet — adjust distance/light or press Space to capture for review.")
         }
     }
 
@@ -389,30 +423,42 @@ extension BondScannerApp {
         exposureBracketController.executeBracket(transaction: transaction, camera: adapter) { [weak self] bracketResult in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.captureTransactionCoordinator.finishTransaction(id: transaction.id)
-                switch bracketResult {
-                case let .failure(error):
-                    self.isProcessing = false
-                    if (error as? ExposureBracketError) == .captureCancelled || transaction.isCancelled {
-                        ScanLog.shared.write("smart exposure bracket cancelled id=\(transaction.id.uuidString.prefix(8))")
-                        self.checkPendingCameraSwitchAfterCapture()
-                        return
-                    }
-                    self.status("Smart Exposure failed: \(error.localizedDescription)")
-                    self.preview?.captureFlash(color: .systemRed)
-                    self.checkPendingCameraSwitchAfterCapture()
-                case let .success(exposures):
-                    transaction.replaceExposures(exposures)
-                    self.finishMultiExposureCapture(transaction: transaction)
-                }
+                self.handleBracketCompletion(transaction: transaction, result: bracketResult)
             }
         }
     }
 
-    func finishMultiExposureCapture(transaction: CaptureTransaction) {
-        guard !transaction.isCancelled else {
+    func handleBracketCompletion(transaction: CaptureTransaction, result: Result<[CapturedExposure], Error>) {
+        let isCurrent = !transaction.isCancelled
+            && transaction.sessionGeneration == cameraSessionGeneration
+            && captureTransactionCoordinator.isTransactionActive(id: transaction.id)
+        captureTransactionCoordinator.finishTransaction(id: transaction.id)
+
+        guard isCurrent else {
+            ScanLog.shared.write("ignoring obsolete bracket completion id=\(transaction.id.uuidString.prefix(8)) gen=\(transaction.sessionGeneration) currentGen=\(cameraSessionGeneration)")
+            return
+        }
+
+        switch result {
+        case let .failure(error):
             isProcessing = false
+            if (error as? ExposureBracketError) == .captureCancelled || transaction.isCancelled {
+                ScanLog.shared.write("smart exposure bracket cancelled id=\(transaction.id.uuidString.prefix(8))")
+                checkPendingCameraSwitchAfterCapture()
+                return
+            }
+            status("Smart Exposure failed: \(error.localizedDescription)")
+            preview?.captureFlash(color: .systemRed)
             checkPendingCameraSwitchAfterCapture()
+        case let .success(exposures):
+            transaction.replaceExposures(exposures)
+            finishMultiExposureCapture(transaction: transaction)
+        }
+    }
+
+    func finishMultiExposureCapture(transaction: CaptureTransaction) {
+        guard !transaction.isCancelled, transaction.sessionGeneration == cameraSessionGeneration else {
+            ScanLog.shared.write("ignoring obsolete finishMultiExposureCapture id=\(transaction.id.uuidString.prefix(8)) gen=\(transaction.sessionGeneration) currentGen=\(cameraSessionGeneration)")
             return
         }
         guard let baseline = transaction.baselineExposure else {
@@ -475,7 +521,12 @@ extension BondScannerApp {
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.isProcessing = false
+                    if !transaction.isCancelled,
+                       transaction.sessionGeneration == self.cameraSessionGeneration,
+                       !self.captureTransactionCoordinator.isBusy
+                    {
+                        self.isProcessing = false
+                    }
                     self.status("SAVE FAILED: \(error.localizedDescription)")
                     self.preview?.captureFlash(color: .systemRed)
                     NSSound.beep()
@@ -505,7 +556,12 @@ extension BondScannerApp {
                 do {
                     try saveRecordLive(record, allRecords: self.records, sortOrder: self.records.count - 1)
                 } catch {
-                    self.isProcessing = false
+                    if !transaction.isCancelled,
+                       transaction.sessionGeneration == self.cameraSessionGeneration,
+                       !self.captureTransactionCoordinator.isBusy
+                    {
+                        self.isProcessing = false
+                    }
                     self.records = previous
                     self.status("DATABASE SAVE FAILED: \(error.localizedDescription). Photos preserved.")
                     self.preview?.captureFlash(color: .systemRed)

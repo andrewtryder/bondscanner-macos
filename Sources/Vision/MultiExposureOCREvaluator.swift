@@ -17,6 +17,11 @@ enum MultiExposureOCREvaluator {
         "owner", "secondName", "address", "issuingAgent", "datingStamp",
     ]
 
+    private static let nonDateImportantFields = [
+        "series", "serial", "denomination",
+        "owner", "secondName", "address", "issuingAgent", "datingStamp",
+    ]
+
     static let coreValidatedFields: Set<String> = [
         "series", "serial", "denomination", "issueMonth", "issueYear",
     ]
@@ -25,6 +30,17 @@ enum MultiExposureOCREvaluator {
         let reconciledRecord: BondRecord
         let conflictingFields: [String: (baseline: String, alternate: String, biasEV: Float)]
         let enrichedFields: [String: (value: String, biasEV: Float)]
+    }
+
+    private struct ReconciliationContext {
+        var record: BondRecord
+        var fieldPhoto: [String: String]
+        var fieldSource: [String: String]
+        var fieldConfidence: [String: String]
+        var previousExtracted: [String: String]
+        var conflicting: [String: (baseline: String, alternate: String, biasEV: Float)] = [:]
+        var enriched: [String: (value: String, biasEV: Float)] = [:]
+        var reviewReasons: Set<String>
     }
 
     static func evaluate(
@@ -123,7 +139,7 @@ enum MultiExposureOCREvaluator {
                     : "\(record.additionalOCR!)\n\(header)\n\(altRec.rawOCR)"
             }
 
-            for field in importantFields {
+            for field in nonDateImportantFields {
                 guard !userConfirmed.contains(field) else { continue }
                 let baseVal = getFieldValue(record, field: field).trimmingCharacters(in: .whitespacesAndNewlines)
                 let altVal = getFieldValue(altRec, field: field).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -172,15 +188,19 @@ enum MultiExposureOCREvaluator {
                                 fieldConfidence[field] = "uncertain"
                             }
                         } else if altIsHigh {
-                            // Confident, validated alternate reading replaces uncertain baseline reading
+                            // Confident, validated alternate reading replaces uncertain baseline reading,
+                            // but the disagreement is recorded and requires human review.
                             if previousExtracted[field] == nil {
                                 previousExtracted[field] = baseVal
                             }
                             setFieldValue(&record, field: field, value: altVal)
                             fieldPhoto[field] = photoPath
                             fieldSource[field] = "exposure_\(String(format: "%+.1f", bias))EV"
-                            fieldConfidence[field] = "high"
+                            fieldConfidence[field] = "uncertain"
                             enriched[field] = (altVal, bias)
+                            conflicting[field] = (baseVal, altVal, bias)
+                            let reason = "exposure_conflict: \(field): baseline '\(baseVal)' vs exposure \(String(format: "%+.1f", bias))EV '\(altVal)'"
+                            reviewReasons.insert(reason)
                         } else {
                             // Both baseline and alternate are uncertain and disagree: retain baseline, keep uncertain, flag conflict
                             fieldConfidence[field] = "uncertain"
@@ -220,6 +240,30 @@ enum MultiExposureOCREvaluator {
             }
         }
 
+        var dateContext = ReconciliationContext(
+            record: record,
+            fieldPhoto: fieldPhoto,
+            fieldSource: fieldSource,
+            fieldConfidence: fieldConfidence,
+            previousExtracted: previousExtracted,
+            conflicting: conflicting,
+            enriched: enriched,
+            reviewReasons: reviewReasons
+        )
+        reconcileIssueDate(
+            context: &dateContext,
+            bracketedResults: bracketedResults,
+            userConfirmed: userConfirmed
+        )
+        record = dateContext.record
+        fieldPhoto = dateContext.fieldPhoto
+        fieldSource = dateContext.fieldSource
+        fieldConfidence = dateContext.fieldConfidence
+        previousExtracted = dateContext.previousExtracted
+        conflicting = dateContext.conflicting
+        enriched = dateContext.enriched
+        reviewReasons = dateContext.reviewReasons
+
         // Synchronize composite "issueDate" confidence with issueMonth & issueYear
         if !userConfirmed.contains("issueDate") {
             let hasMonth = !record.issueMonth.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -227,13 +271,15 @@ enum MultiExposureOCREvaluator {
             if hasMonth || hasYear {
                 let monthHigh = fieldConfidence["issueMonth"] == "high"
                 let yearHigh = fieldConfidence["issueYear"] == "high"
+                let sameExposure = fieldPhoto["issueMonth"] == fieldPhoto["issueYear"]
+                    && fieldSource["issueMonth"] == fieldSource["issueYear"]
                 let dateConsistent = hasMonth && hasYear && isFieldValueValidated(
                     field: "issueYear",
                     value: record.issueYear,
                     effectiveSeries: record.series,
                     effectiveMonth: record.issueMonth
                 )
-                fieldConfidence["issueDate"] = (monthHigh && yearHigh && dateConsistent) ? "high" : "uncertain"
+                fieldConfidence["issueDate"] = (monthHigh && yearHigh && sameExposure && dateConsistent) ? "high" : "uncertain"
             } else {
                 fieldConfidence["issueDate"] = nil
             }
@@ -256,6 +302,177 @@ enum MultiExposureOCREvaluator {
             conflictingFields: conflicting,
             enrichedFields: enriched
         )
+    }
+
+    private static func reconcileIssueDate(
+        context: inout ReconciliationContext,
+        bracketedResults: [(biasEV: Float, result: OCRResult, photoRel: String)],
+        userConfirmed: Set<String>
+    ) {
+        let canEditMonth = !userConfirmed.contains("issueMonth") && !userConfirmed.contains("issueDate")
+        let canEditYear = !userConfirmed.contains("issueYear") && !userConfirmed.contains("issueDate")
+        guard canEditMonth || canEditYear else { return }
+
+        let baseMonth = context.record.issueMonth.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseYear = context.record.issueYear.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 1. Check all brackets for any conflicting validated month/year readings against non-empty baseline.
+        for bracket in bracketedResults {
+            let altRec = bracket.result.record
+            let bias = bracket.biasEV
+            let effectiveSeries = !context.record.series.isEmpty ? context.record.series : altRec.series
+            let altMonth = altRec.issueMonth.trimmingCharacters(in: .whitespacesAndNewlines)
+            let altYear = altRec.issueYear.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if canEditMonth, !baseMonth.isEmpty, !altMonth.isEmpty,
+               isFieldValueValidated(field: "issueMonth", value: altMonth, effectiveSeries: effectiveSeries, effectiveMonth: altMonth),
+               baseMonth != altMonth
+            {
+                context.conflicting["issueMonth"] = (baseMonth, altMonth, bias)
+                context.reviewReasons.insert("exposure_conflict: issueMonth: baseline '\(baseMonth)' vs exposure \(String(format: "%+.1f", bias))EV '\(altMonth)'")
+                context.fieldConfidence["issueMonth"] = "uncertain"
+            }
+            let effectiveMonth = !baseMonth.isEmpty ? baseMonth : altMonth
+            if canEditYear, !baseYear.isEmpty, !altYear.isEmpty,
+               isFieldValueValidated(field: "issueYear", value: altYear, effectiveSeries: effectiveSeries, effectiveMonth: effectiveMonth),
+               baseYear != altYear
+            {
+                context.conflicting["issueYear"] = (baseYear, altYear, bias)
+                context.reviewReasons.insert("exposure_conflict: issueYear: baseline '\(baseYear)' vs exposure \(String(format: "%+.1f", bias))EV '\(altYear)'")
+                context.fieldConfidence["issueYear"] = "uncertain"
+            }
+        }
+
+        let baseMonthHigh = resolvedConfidence(for: "issueMonth", in: context.fieldConfidence) == "high"
+        let baseYearHigh = resolvedConfidence(for: "issueYear", in: context.fieldConfidence) == "high"
+        let basePairValid = !baseMonth.isEmpty && !baseYear.isEmpty && isFieldValueValidated(
+            field: "issueMonth", value: baseMonth, effectiveSeries: context.record.series, effectiveMonth: baseMonth
+        ) && isFieldValueValidated(
+            field: "issueYear", value: baseYear, effectiveSeries: context.record.series, effectiveMonth: baseMonth
+        )
+        let basePairHigh = basePairValid && baseMonthHigh && baseYearHigh
+
+        // Baseline already has a complete, validated, high-confidence pair.
+        if basePairHigh {
+            return
+        }
+
+        // 2. Prefer a complete, validated, high-confidence (month, year) pair from a single bracket exposure.
+        if canEditMonth, canEditYear {
+            for bracket in bracketedResults {
+                let altRec = bracket.result.record
+                let bias = bracket.biasEV
+                let photoPath = bracket.photoRel
+                let effectiveSeries = !context.record.series.isEmpty ? context.record.series : altRec.series
+                let altMonth = altRec.issueMonth.trimmingCharacters(in: .whitespacesAndNewlines)
+                let altYear = altRec.issueYear.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                guard !altMonth.isEmpty, !altYear.isEmpty else { continue }
+                let altMonthValid = isFieldValueValidated(
+                    field: "issueMonth", value: altMonth, effectiveSeries: effectiveSeries, effectiveMonth: altMonth
+                )
+                let altYearValid = isFieldValueValidated(
+                    field: "issueYear", value: altYear, effectiveSeries: effectiveSeries, effectiveMonth: altMonth
+                )
+                let altMonthHigh = isHighConfidenceReading(
+                    field: "issueMonth", value: altMonth, in: altRec, fallbackConfidenceMap: nil, context: (series: effectiveSeries, month: altMonth)
+                )
+                let altYearHigh = isHighConfidenceReading(
+                    field: "issueYear", value: altYear, in: altRec, fallbackConfidenceMap: nil, context: (series: effectiveSeries, month: altMonth)
+                )
+                guard altMonthValid, altYearValid, altMonthHigh, altYearHigh else { continue }
+
+                let source = "exposure_\(String(format: "%+.1f", bias))EV"
+                if !baseMonth.isEmpty, baseMonth != altMonth, context.previousExtracted["issueMonth"] == nil {
+                    context.previousExtracted["issueMonth"] = baseMonth
+                }
+                if !baseYear.isEmpty, baseYear != altYear, context.previousExtracted["issueYear"] == nil {
+                    context.previousExtracted["issueYear"] = baseYear
+                }
+                context.record.issueMonth = altMonth
+                context.record.issueYear = altYear
+                context.fieldPhoto["issueMonth"] = photoPath
+                context.fieldPhoto["issueYear"] = photoPath
+                context.fieldSource["issueMonth"] = source
+                context.fieldSource["issueYear"] = source
+                context.enriched["issueMonth"] = (altMonth, bias)
+                context.enriched["issueYear"] = (altYear, bias)
+
+                let hasConflict = context.conflicting["issueMonth"] != nil || context.conflicting["issueYear"] != nil
+                context.fieldConfidence["issueMonth"] = hasConflict ? "uncertain" : "high"
+                context.fieldConfidence["issueYear"] = hasConflict ? "uncertain" : "high"
+                return
+            }
+        }
+
+        // 3. No single exposure provided a complete pair; enrich missing components cautiously.
+        for bracket in bracketedResults {
+            let altRec = bracket.result.record
+            let bias = bracket.biasEV
+            let photoPath = bracket.photoRel
+            let source = "exposure_\(String(format: "%+.1f", bias))EV"
+            let effectiveSeries = !context.record.series.isEmpty ? context.record.series : altRec.series
+
+            if canEditMonth {
+                let altMonth = altRec.issueMonth.trimmingCharacters(in: .whitespacesAndNewlines)
+                let currentMonth = context.record.issueMonth.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !altMonth.isEmpty,
+                   isFieldValueValidated(field: "issueMonth", value: altMonth, effectiveSeries: effectiveSeries, effectiveMonth: altMonth),
+                   isHighConfidenceReading(field: "issueMonth", value: altMonth, in: altRec, fallbackConfidenceMap: nil, context: (series: effectiveSeries, month: altMonth))
+                {
+                    if currentMonth.isEmpty {
+                        context.record.issueMonth = altMonth
+                        context.fieldPhoto["issueMonth"] = photoPath
+                        context.fieldSource["issueMonth"] = source
+                        context.fieldConfidence["issueMonth"] = "high"
+                        context.enriched["issueMonth"] = (altMonth, bias)
+                    } else if currentMonth == altMonth, context.fieldConfidence["issueMonth"] != "high", context.conflicting["issueMonth"] == nil {
+                        context.fieldPhoto["issueMonth"] = photoPath
+                        context.fieldSource["issueMonth"] = source
+                        context.fieldConfidence["issueMonth"] = "high"
+                        context.enriched["issueMonth"] = (altMonth, bias)
+                    }
+                }
+            }
+
+            if canEditYear {
+                let altYear = altRec.issueYear.trimmingCharacters(in: .whitespacesAndNewlines)
+                let currentYear = context.record.issueYear.trimmingCharacters(in: .whitespacesAndNewlines)
+                let effectiveMonth = !context.record.issueMonth.isEmpty ? context.record.issueMonth : altRec.issueMonth
+                if !altYear.isEmpty,
+                   isFieldValueValidated(field: "issueYear", value: altYear, effectiveSeries: effectiveSeries, effectiveMonth: effectiveMonth),
+                   isHighConfidenceReading(field: "issueYear", value: altYear, in: altRec, fallbackConfidenceMap: nil, context: (series: effectiveSeries, month: effectiveMonth))
+                {
+                    if currentYear.isEmpty {
+                        context.record.issueYear = altYear
+                        context.fieldPhoto["issueYear"] = photoPath
+                        context.fieldSource["issueYear"] = source
+                        context.fieldConfidence["issueYear"] = "high"
+                        context.enriched["issueYear"] = (altYear, bias)
+                    } else if currentYear == altYear, context.fieldConfidence["issueYear"] != "high", context.conflicting["issueYear"] == nil {
+                        context.fieldPhoto["issueYear"] = photoPath
+                        context.fieldSource["issueYear"] = source
+                        context.fieldConfidence["issueYear"] = "high"
+                        context.enriched["issueYear"] = (altYear, bias)
+                    }
+                }
+            }
+        }
+
+        // If month and year were assembled from different exposures, retain uncertainty and require confirmation.
+        let finalMonth = context.record.issueMonth.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalYear = context.record.issueYear.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !finalMonth.isEmpty, !finalYear.isEmpty {
+            let monthSrc = context.fieldSource["issueMonth"] ?? ""
+            let yearSrc = context.fieldSource["issueYear"] ?? ""
+            let monthPhoto = context.fieldPhoto["issueMonth"] ?? ""
+            let yearPhoto = context.fieldPhoto["issueYear"] ?? ""
+            if monthSrc != yearSrc || monthPhoto != yearPhoto {
+                context.fieldConfidence["issueMonth"] = "uncertain"
+                context.fieldConfidence["issueYear"] = "uncertain"
+                context.reviewReasons.insert("exposure_split_date: issueMonth (\(monthSrc)) and issueYear (\(yearSrc)) combined from different exposures")
+            }
+        }
     }
 
     private static func resolvedConfidence(for field: String, in map: [String: String]?) -> String {

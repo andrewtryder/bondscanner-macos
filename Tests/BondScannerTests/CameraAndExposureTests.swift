@@ -1392,4 +1392,195 @@ final class CameraAndExposureTests: XCTestCase {
         XCTAssertEqual(restoredRecord.issueYear, "1999")
         assertAllPhotosExist(for: restoredRecord, in: restoredRoot, context: "after restore")
     }
+
+    func testConflictingHighConfidenceAlternateOverUncertainBaselineRequiresReview() {
+        let baseRecord = BondRecord(
+            id: "conflict-promote-test",
+            capturedAt: "2026-11-15T12:00:00Z",
+            series: "", serial: "", issueMonth: "", issueYear: "", denomination: "",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "PROCESSING", notes: "",
+            photo: "photos/sample.jpg", sourcePhoto: "photos/original_sample.jpg", rawOCR: ""
+        )
+
+        var baseRec = BondRecord(
+            id: "base", capturedAt: "", series: "EE", serial: "C1234567890EE",
+            issueMonth: "05", issueYear: "1995", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: "C1234567890EE"
+        )
+        baseRec.fieldConfidence = [
+            "series": "high",
+            "serial": "uncertain",
+            "denomination": "high",
+            "issueDate": "high",
+        ]
+        let baseOCR = makeOCRResult(record: baseRec)
+
+        var altRec = BondRecord(
+            id: "alt", capturedAt: "", series: "EE", serial: "C9876543210EE",
+            issueMonth: "05", issueYear: "1995", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: "C9876543210EE"
+        )
+        altRec.fieldConfidence = [
+            "series": "high",
+            "serial": "high",
+            "denomination": "high",
+            "issueDate": "high",
+        ]
+        let altOCR = makeOCRResult(record: altRec)
+
+        let eval = MultiExposureOCREvaluator.evaluate(
+            baselineResult: baseOCR,
+            baselinePhotoRel: "photos/original_sample.jpg",
+            bracketedResults: [(0.7, altOCR, "photos/original_sample_+0.7EV.jpg")],
+            baseRecord: baseRecord
+        )
+
+        let record = eval.reconciledRecord
+        XCTAssertNotNil(eval.conflictingFields["serial"])
+        XCTAssertEqual(record.previousExtracted?["serial"], "C1234567890EE")
+        XCTAssertEqual(record.sourcePhoto, "photos/original_sample.jpg")
+        XCTAssertEqual(record.fieldPhoto?["serial"], "photos/original_sample_+0.7EV.jpg")
+        XCTAssertTrue((record.reviewReasons ?? []).contains(where: { $0.contains("exposure_conflict: serial") }))
+        XCTAssertEqual(record.status, "REVIEW")
+    }
+
+    func testIssueDatePrefersCoordinatedPairAndFlagsSplitExposureAssembly() {
+        let baseRecord = BondRecord(
+            id: "date-coord-test",
+            capturedAt: "2026-11-15T12:00:00Z",
+            series: "", serial: "", issueMonth: "", issueYear: "", denomination: "",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "PROCESSING", notes: "",
+            photo: "photos/sample.jpg", sourcePhoto: "photos/original_sample.jpg", rawOCR: ""
+        )
+
+        var baseRec = BondRecord(
+            id: "base", capturedAt: "", series: "EE", serial: "C1234567890EE",
+            issueMonth: "05", issueYear: "", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: ""
+        )
+        baseRec.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high", "issueMonth": "high"]
+
+        var darkYearOnly = BondRecord(
+            id: "dark", capturedAt: "", series: "EE", serial: "C1234567890EE",
+            issueMonth: "", issueYear: "1995", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: ""
+        )
+        darkYearOnly.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high", "issueYear": "high"]
+
+        var brightFullPair = BondRecord(
+            id: "bright", capturedAt: "", series: "EE", serial: "C1234567890EE",
+            issueMonth: "05", issueYear: "1995", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: ""
+        )
+        brightFullPair.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high", "issueDate": "high"]
+
+        // 1. Coordinated complete pair from +0.7EV is preferred over split assembly
+        let preferredEval = MultiExposureOCREvaluator.evaluate(
+            baselineResult: makeOCRResult(record: baseRec),
+            baselinePhotoRel: "photos/original_sample.jpg",
+            bracketedResults: [
+                (-0.7, makeOCRResult(record: darkYearOnly), "photos/original_sample_-0.7EV.jpg"),
+                (0.7, makeOCRResult(record: brightFullPair), "photos/original_sample_+0.7EV.jpg"),
+            ],
+            baseRecord: baseRecord
+        )
+        let preferred = preferredEval.reconciledRecord
+        XCTAssertEqual(preferred.issueMonth, "05")
+        XCTAssertEqual(preferred.issueYear, "1995")
+        XCTAssertEqual(preferred.fieldPhoto?["issueMonth"], "photos/original_sample_+0.7EV.jpg")
+        XCTAssertEqual(preferred.fieldPhoto?["issueYear"], "photos/original_sample_+0.7EV.jpg")
+        XCTAssertEqual(preferred.fieldConfidence?["issueDate"], "high")
+        XCTAssertEqual(preferred.status, "OK")
+
+        // 2. When no single exposure has a complete pair, split assembly retains uncertainty & requires review
+        let splitEval = MultiExposureOCREvaluator.evaluate(
+            baselineResult: makeOCRResult(record: baseRec),
+            baselinePhotoRel: "photos/original_sample.jpg",
+            bracketedResults: [
+                (-0.7, makeOCRResult(record: darkYearOnly), "photos/original_sample_-0.7EV.jpg"),
+            ],
+            baseRecord: baseRecord
+        )
+        let split = splitEval.reconciledRecord
+        XCTAssertEqual(split.issueMonth, "05")
+        XCTAssertEqual(split.issueYear, "1995")
+        XCTAssertEqual(split.fieldConfidence?["issueDate"], "uncertain")
+        XCTAssertTrue((split.reviewReasons ?? []).contains(where: { $0.contains("exposure_split_date") }))
+        XCTAssertEqual(split.status, "REVIEW")
+    }
+
+    func testTextDetectionFallbackRoutesThroughStabilizationGate() {
+        let app = BondScannerApp()
+        app.automatic = true
+        app.fastScanEnabled = true
+        app.isProcessing = false
+        app.lockedAfterCapture = false
+        app.nextAutoAllowedAt = 0
+
+        // 1. Blurry frame must be rejected by the stabilization gate even on repeated text hits or timeout
+        let blurryFrame = createTestCGImage(width: 400, height: 200, grayValue: 128)
+        app.handleAutomaticTextDetection(hasBond: true, frame: blurryFrame)
+        app.handleAutomaticTextDetection(hasBond: true, frame: blurryFrame)
+        app.stabilizationStartTime = Date().timeIntervalSince1970 - 5.0
+        app.handleAutomaticTextDetection(hasBond: true, frame: blurryFrame)
+        XCTAssertFalse(app.isProcessing, "Blurry text-detection frames must not bypass stabilization")
+
+        // 2. Sharp frame still requires stabilization (does not trigger on first hit alone)
+        let sharpFrame = createSharpBondPatternCGImage(width: 400, height: 200)
+        app.stableFrames = 0
+        app.stabilizationStartTime = 0
+        app.huntHits = 0
+        app.priorRect = nil
+
+        app.handleAutomaticTextDetection(hasBond: true, frame: sharpFrame)
+        XCTAssertEqual(app.stableFrames, 1)
+        XCTAssertFalse(app.isProcessing, "First text-detection hit must stabilize before capturing")
+
+        app.handleAutomaticTextDetection(hasBond: true, frame: sharpFrame)
+        XCTAssertTrue(app.isProcessing, "Second stable sharp text-detection hit should trigger automatic capture")
+    }
+
+    func testObsoleteBracketCompletionDoesNotClearNewerTransactionProcessingState() throws {
+        let app = BondScannerApp()
+        app.cameraSessionGeneration = 1
+        let oldTx = try XCTUnwrap(app.captureTransactionCoordinator.startTransaction(
+            automatic: true,
+            targetBiases: [0.0, -0.7, 0.7],
+            deviceUniqueID: "cam-old",
+            sessionGeneration: 1
+        ))
+        app.isProcessing = true
+
+        // Simulate cancellation & camera failover to generation 2 with a new active capture
+        app.cancelInFlightCaptures(reason: "camera failover")
+        app.cameraSessionGeneration = 2
+        let newTx = try XCTUnwrap(app.captureTransactionCoordinator.startTransaction(
+            automatic: true,
+            targetBiases: [0.0, -0.7, 0.7],
+            deviceUniqueID: "cam-new",
+            sessionGeneration: 2
+        ))
+        app.isProcessing = true
+
+        // Late error completions from the old transaction must not clear the new transaction's state
+        app.handleBracketCompletion(transaction: oldTx, result: .failure(ExposureBracketError.captureCancelled))
+        XCTAssertTrue(app.isProcessing)
+        XCTAssertTrue(app.captureTransactionCoordinator.isTransactionActive(id: newTx.id))
+
+        app.handleBracketCompletion(transaction: oldTx, result: .failure(ExposureBracketError.exposureSettlingTimedOut))
+        XCTAssertTrue(app.isProcessing)
+        XCTAssertTrue(app.captureTransactionCoordinator.isTransactionActive(id: newTx.id))
+    }
 }
