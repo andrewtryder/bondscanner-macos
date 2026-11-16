@@ -100,12 +100,13 @@ if [ "$SKIP_TESTS" = false ]; then
     TOTAL="$(printf '%s' "$SUMMARY" | jq -r '.totalTestCount // 0')"
     FAILED="$(printf '%s' "$SUMMARY" | jq -r '.failedTests // 0')"
     PASSED="$(printf '%s' "$SUMMARY" | jq -r '.passedTests // 0')"
+    echo "XCTest results: total=$TOTAL passed=$PASSED failed=$FAILED"
     if [ "$TOTAL" -le 0 ] || [ "$PASSED" -le 0 ] || [ "$FAILED" -ne 0 ]; then
         echo "❌ XCTest result invalid: total=$TOTAL passed=$PASSED failed=$FAILED" >&2
         exit 1
     fi
     TESTS="$(xcrun xcresulttool get test-results tests --path "$RESULT_BUNDLE")"
-    for suite in ReviewWorkflowTests BondValidationTests BondScannerTests DataSafetyAndRetentionTests; do
+    for suite in ReviewWorkflowTests BondValidationTests BondScannerTests DataSafetyAndRetentionTests CameraAndExposureTests; do
         SUITE="$(printf '%s' "$TESTS" | jq -c --arg suite "$suite" '.. | objects | select(.name? == $suite and .nodeType? == "Test Suite")' | head -n 1)"
         if [ -z "$SUITE" ]; then
             echo "❌ Expected XCTest suite missing: $suite" >&2

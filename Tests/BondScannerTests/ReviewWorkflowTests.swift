@@ -972,4 +972,156 @@ final class ReviewWorkflowTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(r1After.revision ?? 0, 2)
         XCTAssertEqual(coordinator2.progress.remainingCount, 0, "Resolved review queue state must survive app restart")
     }
+
+    // MARK: - 24. Main-Thread Delegate Safety & Non-Overlapping Review UI Layout
+
+    @MainActor
+    func testReprocessAndAIReviewInvokeDelegateStrictlyOnMainThread() async throws {
+        final class DelegateThreadSpy: ReviewCoordinatorDelegate {
+            private let lock = NSLock()
+            var didUpdateRecordsThreads: [Bool] = []
+            var didSelectRecordThreads: [Bool] = []
+            var didChangeProgressThreads: [Bool] = []
+            var didUpdateSelectedRecordThreads: [Bool] = []
+
+            func reviewCoordinator(_ coordinator: ReviewCoordinator, didUpdateRecords records: [BondRecord]) {
+                lock.lock(); didUpdateRecordsThreads.append(Thread.isMainThread); lock.unlock()
+            }
+
+            func reviewCoordinator(_ coordinator: ReviewCoordinator, didSelectRecord record: BondRecord?) {
+                lock.lock(); didSelectRecordThreads.append(Thread.isMainThread); lock.unlock()
+            }
+
+            func reviewCoordinator(_ coordinator: ReviewCoordinator, didChangeProgress progress: ReviewProgress) {
+                lock.lock(); didChangeProgressThreads.append(Thread.isMainThread); lock.unlock()
+            }
+
+            func reviewCoordinator(_ coordinator: ReviewCoordinator, didUpdateSelectedRecord record: BondRecord) {
+                lock.lock(); didUpdateSelectedRecordThreads.append(Thread.isMainThread); lock.unlock()
+            }
+        }
+
+        let photosDir = tempDir.appendingPathComponent("photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: photosDir, withIntermediateDirectories: true)
+        let photoRel = "photos/reprocess_main_thread.png"
+        let photoURL = tempDir.appendingPathComponent(photoRel)
+
+        let ctx = try XCTUnwrap(CGContext(
+            data: nil,
+            width: 400,
+            height: 200,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(NSColor.white.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: 400, height: 200))
+        let cgImg = try XCTUnwrap(ctx.makeImage())
+        let nsImg = NSImage(cgImage: cgImg, size: NSSize(width: 400, height: 200))
+        let tiffData = try XCTUnwrap(nsImg.tiffRepresentation)
+        let bmp = try XCTUnwrap(NSBitmapImageRep(data: tiffData))
+        let pngData = try XCTUnwrap(bmp.representation(using: .png, properties: [:]))
+        try pngData.write(to: photoURL)
+
+        var rec = makeSampleRecord(id: "mainthread-1", serial: "C123456789OEE", status: "REVIEW")
+        rec.photo = photoRel
+        rec.sourcePhoto = photoRel
+        rec.revision = 1
+        try testDb.upsertRecord(rec)
+
+        let spy = DelegateThreadSpy()
+        let coordinator = ReviewCoordinator(records: [rec], outputRoot: tempDir, aiAnalyzer: SuggestingAI())
+        coordinator.delegate = spy
+        coordinator.selectRecord(id: rec.id)
+
+        coordinator.enqueueAIReview(recordID: rec.id, force: true)
+        for _ in 0 ..< 50 where coordinator.allRecords.first?.aiAnalysis == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        let latest = try XCTUnwrap(coordinator.allRecords.first(where: { $0.id == rec.id }))
+        _ = try await coordinator.reprocessPhoto(for: latest, userActiveEdits: [:])
+        let refreshed = try XCTUnwrap(coordinator.allRecords.first(where: { $0.id == rec.id }))
+        _ = try await Task.detached {
+            try await coordinator.reprocessPhoto(for: refreshed, userActiveEdits: [:])
+        }.value
+
+        XCTAssertFalse(spy.didUpdateRecordsThreads.isEmpty)
+        XCTAssertFalse(spy.didChangeProgressThreads.isEmpty)
+        XCTAssertFalse(spy.didUpdateSelectedRecordThreads.isEmpty)
+        XCTAssertTrue(spy.didUpdateRecordsThreads.allSatisfy { $0 }, "didUpdateRecords must run on main thread")
+        XCTAssertTrue(spy.didSelectRecordThreads.allSatisfy { $0 }, "didSelectRecord must run on main thread")
+        XCTAssertTrue(spy.didChangeProgressThreads.allSatisfy { $0 }, "didChangeProgress must run on main thread")
+        XCTAssertTrue(spy.didUpdateSelectedRecordThreads.allSatisfy { $0 }, "didUpdateSelectedRecord must run on main thread")
+    }
+
+    @MainActor
+    func testReviewEditorViewLayoutHasNoOverlappingButtonsOrDuplicatedAIProgress() {
+        let editor = ReviewEditorView(frame: NSRect(x: 0, y: 0, width: 530, height: 700))
+        let rec = makeSampleRecord(id: "layout-1", serial: "C1234567890EE", status: "REVIEW")
+        let progress = ReviewProgress(reviewedInSession: 1, totalInQueue: 3, remainingCount: 2)
+        editor.setRecord(rec, candidate: nil, progress: progress)
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 530, height: 700),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = editor
+
+        func assertNoCollisions(size: NSSize) {
+            window.setContentSize(size)
+            editor.frame = NSRect(origin: .zero, size: size)
+            window.layoutIfNeeded()
+            editor.layoutSubtreeIfNeeded()
+
+            let bottomButtons: [(String, NSView)] = [
+                ("reprocessBtn", editor.reprocessBtn),
+                ("aiAnalyzeBtn", editor.aiAnalyzeBtn),
+                ("confirmAllBtn", editor.confirmAllBtn),
+                ("revertBtn", editor.revertBtn),
+                ("saveBtn", editor.saveBtn),
+                ("saveAndNextBtn", editor.saveAndNextBtn),
+            ]
+            let frames = bottomButtons.map { ($0.0, editor.convert($0.1.bounds, from: $0.1)) }
+            for (name, frame) in frames {
+                XCTAssertGreaterThan(frame.width, 0, "\(name) must have non-zero width at \(size)")
+                XCTAssertGreaterThan(frame.height, 0, "\(name) must have non-zero height at \(size)")
+            }
+            for i in 0 ..< frames.count {
+                for j in (i + 1) ..< frames.count {
+                    XCTAssertFalse(
+                        frames[i].1.intersects(frames[j].1),
+                        "Bottom buttons \(frames[i].0) and \(frames[j].0) must not overlap at \(size)"
+                    )
+                }
+            }
+
+            let progressFrame = editor.convert(editor.progressLabel.bounds, from: editor.progressLabel)
+            let backlogFrame = editor.convert(editor.analyzeBacklogBtn.bounds, from: editor.analyzeBacklogBtn)
+            let prevFrame = editor.convert(editor.prevBtn.bounds, from: editor.prevBtn)
+            let nextFrame = editor.convert(editor.nextBtn.bounds, from: editor.nextBtn)
+
+            XCTAssertFalse(progressFrame.intersects(backlogFrame), "progressLabel must not overlap analyzeBacklogBtn at \(size)")
+            XCTAssertFalse(progressFrame.intersects(prevFrame), "progressLabel must not overlap prevBtn at \(size)")
+            XCTAssertFalse(progressFrame.intersects(nextFrame), "progressLabel must not overlap nextBtn at \(size)")
+            XCTAssertFalse(backlogFrame.intersects(prevFrame), "analyzeBacklogBtn must not overlap prevBtn at \(size)")
+            XCTAssertFalse(prevFrame.intersects(nextFrame), "prevBtn must not overlap nextBtn at \(size)")
+        }
+
+        assertNoCollisions(size: NSSize(width: 530, height: 700))
+        assertNoCollisions(size: NSSize(width: 420, height: 600))
+
+        editor.updateProgress(progress)
+        editor.updateAIProgress("AI reviewing: 1 of 2 — 1 suggestions ready, 0 unresolved")
+        editor.updateAIProgress("AI reviewing: 2 of 2 — 2 suggestions ready, 0 unresolved")
+        let occurrences = editor.progressLabel.stringValue.components(separatedBy: "AI reviewing:").count - 1
+        XCTAssertEqual(occurrences, 1, "AI progress must replace prior AI status instead of appending repeatedly")
+        XCTAssertTrue(editor.progressLabel.stringValue.contains("2 of 2"))
+
+        editor.updateAIProgress("")
+        XCTAssertEqual(editor.progressLabel.stringValue, progress.displayString)
+    }
 }

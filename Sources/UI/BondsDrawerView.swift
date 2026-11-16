@@ -161,15 +161,25 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
     }
 
     private func setupUI() {
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        let backdrop = NSVisualEffectView()
+        backdrop.material = .sidebar
+        backdrop.blendingMode = .behindWindow
+        backdrop.state = .followsWindowActiveState
+        backdrop.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(backdrop)
+        NSLayoutConstraint.activate([
+            backdrop.topAnchor.constraint(equalTo: topAnchor),
+            backdrop.bottomAnchor.constraint(equalTo: bottomAnchor),
+            backdrop.leadingAnchor.constraint(equalTo: leadingAnchor),
+            backdrop.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
 
         let divider = NSBox()
         divider.boxType = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
         addSubview(divider)
 
-        titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
         reviewNextButton.bezelStyle = .rounded
@@ -177,10 +187,15 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         reviewNextButton.target = self
         reviewNextButton.action = #selector(reviewNextClicked)
         reviewNextButton.font = .systemFont(ofSize: 11, weight: .semibold)
+        reviewNextButton.bezelColor = .controlAccentColor
+        reviewNextButton.contentTintColor = .white
         reviewNextButton.toolTip = "Start or continue reviewing unresolved records"
         reviewNextButton.translatesAutoresizingMaskIntoConstraints = false
 
-        collapseButton.bezelStyle = .rounded
+        collapseButton.title = ""
+        collapseButton.image = NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: "Hide bonds list")
+        collapseButton.toolTip = "Hide bonds list"
+        collapseButton.bezelStyle = .texturedRounded
         collapseButton.controlSize = .small
         collapseButton.target = self
         collapseButton.action = #selector(collapseClicked)
@@ -200,7 +215,7 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         sortPopup.action = #selector(sortFieldChanged)
         sortPopup.translatesAutoresizingMaskIntoConstraints = false
 
-        directionButton.bezelStyle = .rounded
+        directionButton.bezelStyle = .texturedRounded
         directionButton.controlSize = .small
         directionButton.target = self
         directionButton.action = #selector(directionToggled)
@@ -240,8 +255,10 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         configureTableColumns()
         tableView.dataSource = self
         tableView.delegate = self
-        tableView.usesAlternatingRowBackgroundColors = true
-        tableView.rowHeight = 22
+        tableView.style = .inset
+        tableView.usesAlternatingRowBackgroundColors = false
+        tableView.rowHeight = 28
+        tableView.intercellSpacing = NSSize(width: 6, height: 2)
         tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         tableView.allowsMultipleSelection = false
         tableView.target = self
@@ -250,8 +267,9 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
 
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
-        scrollView.borderType = .bezelBorder
+        scrollView.hasHorizontalScroller = false
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         let hintLabel = NSTextField(labelWithString: "Double-click a row to open Review. Press Return to edit.")
@@ -294,12 +312,12 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
 
     private func configureTableColumns() {
         let specs: [(NSUserInterfaceItemIdentifier, String, CGFloat, String)] = [
-            (ColumnID.number, "#", 42, "number"),
-            (ColumnID.serial, "Serial", 116, "serial"),
-            (ColumnID.issue, "Issue", 62, "issueDate"),
-            (ColumnID.denom, "Denom", 50, "denom"),
-            (ColumnID.status, "Status", 72, "status"),
-            (ColumnID.date, "Scanned", 94, "date"),
+            (ColumnID.number, "#", 34, "number"),
+            (ColumnID.serial, "Serial", 120, "serial"),
+            (ColumnID.issue, "Issued", 62, "issueDate"),
+            (ColumnID.denom, "Value", 54, "denom"),
+            (ColumnID.status, "Status", 88, "status"),
+            (ColumnID.date, "Scanned", 88, "date"),
         ]
         for (id, title, width, sortKey) in specs {
             let col = NSTableColumn(identifier: id)
@@ -495,14 +513,16 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
             tf.stringValue = entry.denominationDisplay
             tf.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
         case ColumnID.status:
-            tf.stringValue = entry.record.status
-            tf.font = .systemFont(ofSize: 11, weight: .semibold)
-            switch entry.record.status {
-            case "OK": tf.textColor = .systemGreen
-            case "PROCESSING": tf.textColor = .systemBlue
-            case "REVIEW", "DUPLICATE": tf.textColor = .systemOrange
-            default: tf.textColor = .secondaryLabelColor
-            }
+            let (dotColor, text) = Self.statusPresentation(entry.record.status)
+            let styled = NSMutableAttributedString(
+                string: "\u{25CF} ",
+                attributes: [.foregroundColor: dotColor, .font: NSFont.systemFont(ofSize: 9)]
+            )
+            styled.append(NSAttributedString(
+                string: text,
+                attributes: [.font: NSFont.systemFont(ofSize: 11.5, weight: .medium)]
+            ))
+            tf.attributedStringValue = styled
         case ColumnID.date:
             tf.stringValue = formatCapturedTimestamp(entry.record.capturedAt)
             tf.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
@@ -511,6 +531,16 @@ final class BondsDrawerView: NSView, NSTableViewDataSource, NSTableViewDelegate 
             tf.stringValue = ""
         }
         return cell
+    }
+
+    private static func statusPresentation(_ status: String) -> (NSColor, String) {
+        switch status {
+        case "OK": return (.systemGreen, "Verified")
+        case "PROCESSING": return (.systemBlue, "Reading\u{2026}")
+        case "REVIEW": return (.systemOrange, "Review")
+        case "DUPLICATE": return (.systemPurple, "Duplicate")
+        default: return (.secondaryLabelColor, status.capitalized)
+        }
     }
 
     private func formatCapturedTimestamp(_ iso: String) -> String {

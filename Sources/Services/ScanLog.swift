@@ -22,7 +22,7 @@ final class ScanLog {
         lock.lock()
         defer { lock.unlock() }
         let targetURL = customLogURL ?? debugURL
-        if customLogURL == nil, isProductionStorageProtected(destination: targetURL) {
+        if isProductionStorageProtected(destination: targetURL) {
             // Guard: in test mode, never create or write to production scan-debug.log
             return
         }

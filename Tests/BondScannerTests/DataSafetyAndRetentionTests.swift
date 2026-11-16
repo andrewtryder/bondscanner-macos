@@ -99,14 +99,273 @@ final class DataSafetyAndRetentionTests: XCTestCase {
         )
     }
 
+    func testCollectionLocationPreferencesRoundTripAndPendingDoesNotChangeActive() throws {
+        let suiteName = "bondscanner.tests.location.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = CollectionLocationPreferences(defaults: defaults)
+        XCTAssertEqual(try store.load(), CollectionLocationState(activePath: nil, pending: nil))
+        let active = tempDir.appendingPathComponent("original").path
+        let pending = PendingCollectionSwitch(sourcePath: active, destinationPath: tempDir.appendingPathComponent("next").path, action: .copy)
+        let state = CollectionLocationState(activePath: active, pending: pending)
+        try store.save(state)
+        XCTAssertEqual(try CollectionLocationPreferences(defaults: defaults).load(), state)
+        try store.save(CollectionLocationState(activePath: nil, pending: nil))
+        XCTAssertEqual(try store.load().activePath, nil)
+    }
+
+    func testRestoringDefaultLocationPersistsAfterReopeningPreferences() throws {
+        let custom = StorageConfiguration.shared.outputRoot
+        let restoredDefault = tempDir.appendingPathComponent("synthetic-default", isDirectory: true)
+        try FileManager.default.createDirectory(at: restoredDefault, withIntermediateDirectories: false)
+        var record = makeRecord(id: "restored-synthetic", status: "REVIEW", photo: "", sourcePhoto: "")
+        record.reviewReasons = ["synthetic: manual review"]
+        let db = try DatabaseManager(url: restoredDefault.appendingPathComponent("bonds.sqlite3"))
+        try db.upsertRecord(record)
+        db.close()
+        let suite = "bondscanner.tests.restore-default.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = CollectionLocationPreferences(defaults: defaults)
+        let request = PendingCollectionSwitch(sourcePath: custom.path, destinationPath: restoredDefault.path, action: .open)
+        try preferences.save(CollectionLocationState(activePath: custom.path, pending: request))
+        XCTAssertEqual(try preferences.applyPending(backups: StorageConfiguration.shared.backupsRoot), restoredDefault)
+        let relaunchedState = try CollectionLocationPreferences(defaults: defaults).load()
+        XCTAssertEqual(relaunchedState.activePath, restoredDefault.path)
+        XCTAssertNil(relaunchedState.pending)
+        let reopenedDB = try DatabaseManager(url: restoredDefault.appendingPathComponent("bonds.sqlite3"))
+        XCTAssertEqual(try reopenedDB.loadAllRecords(), [record])
+    }
+
+    func testFailedPendingSwitchLeavesSavedPreferenceUnchanged() throws {
+        let custom = StorageConfiguration.shared.outputRoot
+        let suite = "bondscanner.tests.failed-switch.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = CollectionLocationPreferences(defaults: defaults)
+        let request = PendingCollectionSwitch(sourcePath: custom.path, destinationPath: tempDir.appendingPathComponent("missing").path, action: .open)
+        let original = CollectionLocationState(activePath: custom.path, pending: request)
+        try preferences.save(original)
+        XCTAssertThrowsError(try preferences.applyPending(backups: StorageConfiguration.shared.backupsRoot))
+        XCTAssertEqual(try CollectionLocationPreferences(defaults: defaults).load(), original)
+    }
+
+    func testConfiguredCollectionPathsAreUnifiedAndBackupsStaySeparate() {
+        let root = StorageConfiguration.shared.outputRoot
+        XCTAssertEqual(databaseURL, root.appendingPathComponent("bonds.sqlite3"))
+        XCTAssertEqual(photosRoot, root.appendingPathComponent("photos", isDirectory: true))
+        XCTAssertEqual(recordsURLDefault, root.appendingPathComponent("records.json"))
+        XCTAssertEqual(csvURLDefault, root.appendingPathComponent("bonds.csv"))
+        XCTAssertEqual(debugURL, root.appendingPathComponent("scan-debug.log"))
+        XCTAssertNotEqual(backupsRoot, root)
+        XCTAssertEqual(StorageConfiguration.defaultOutputRoot.lastPathComponent, "BondScans")
+    }
+
+    func testCollectionValidationPreservesPhotoProvenance() throws {
+        let root = StorageConfiguration.shared.outputRoot
+        let original = createDummyImageFile(named: "original.jpg")
+        let processed = createDummyImageFile(named: "processed.jpg")
+        let associated = createDummyImageFile(named: "associated.jpg")
+        var record = makeRecord(status: "REVIEW", photo: processed.relPath, sourcePhoto: original.relPath,
+                                associatedPhotos: [associated.relPath], fieldPhoto: ["owner": original.relPath])
+        record.duplicateCandidateId = "synthetic-duplicate"
+        let db = try DatabaseManager(url: root.appendingPathComponent("bonds.sqlite3"))
+        try db.upsertRecord(record)
+        let validated = try CollectionValidator.validate(root: root, backups: StorageConfiguration.shared.backupsRoot)
+        XCTAssertEqual(validated, [record])
+    }
+
+    func testCollectionValidationRejectsMissingDatabaseAndPhotographs() throws {
+        let root = StorageConfiguration.shared.outputRoot
+        let backups = StorageConfiguration.shared.backupsRoot
+        XCTAssertThrowsError(try CollectionValidator.validate(root: root, backups: backups))
+        let db = try DatabaseManager(url: root.appendingPathComponent("bonds.sqlite3"))
+        try db.upsertRecord(makeRecord(photo: "photos/missing.jpg", sourcePhoto: "photos/missing.jpg"))
+        XCTAssertThrowsError(try CollectionValidator.validate(root: root, backups: backups))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: db.currentURL.path))
+    }
+
+    func testFirstLaunchRefusesToHideExistingPhotographs() throws {
+        let root = StorageConfiguration.shared.outputRoot
+        XCTAssertNoThrow(try CollectionValidator.validateFirstLaunch(root: root))
+        let original = createDummyImageFile(named: "unreferenced-original.jpg")
+        XCTAssertThrowsError(try CollectionValidator.validateFirstLaunch(root: root))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: original.url.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("bonds.sqlite3").path))
+    }
+
+    func testCollectionValidationRejectsOverlapAndCorruption() throws {
+        let root = StorageConfiguration.shared.outputRoot
+        let dbURL = root.appendingPathComponent("bonds.sqlite3")
+        try Data("not a database".utf8).write(to: dbURL)
+        XCTAssertThrowsError(try CollectionValidator.validate(root: root, backups: StorageConfiguration.shared.backupsRoot))
+        XCTAssertThrowsError(try CollectionValidator.validate(root: root, backups: root.appendingPathComponent("backups")))
+        XCTAssertEqual(try Data(contentsOf: dbURL), Data("not a database".utf8))
+    }
+
+    func testCollectionValidationRejectsMalformedCurrentVersionSchema() throws {
+        let root = StorageConfiguration.shared.outputRoot
+        let path = root.appendingPathComponent("bonds.sqlite3").path
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &handle), SQLITE_OK)
+        let db = try XCTUnwrap(handle)
+        XCTAssertEqual(sqlite3_exec(db, "CREATE TABLE bonds (record_json TEXT); PRAGMA user_version = 1;", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        XCTAssertThrowsError(try CollectionValidator.validate(root: root, backups: StorageConfiguration.shared.backupsRoot))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+    }
+
+    func testCollectionValidationRejectsMismatchedRecordIdentity() throws {
+        let root = StorageConfiguration.shared.outputRoot
+        let path = root.appendingPathComponent("bonds.sqlite3").path
+        let db = try DatabaseManager(url: URL(fileURLWithPath: path))
+        try db.upsertRecord(makeRecord(id: "synthetic-id", photo: "", sourcePhoto: ""))
+        db.close()
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &handle), SQLITE_OK)
+        let rawDB = try XCTUnwrap(handle)
+        XCTAssertEqual(sqlite3_exec(rawDB, "UPDATE bonds SET id = 'different-synthetic-id';", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(rawDB)
+        XCTAssertThrowsError(try CollectionValidator.validate(root: root, backups: StorageConfiguration.shared.backupsRoot))
+    }
+
+    func testCollectionValidationRejectsRulesThatCouldReplaceRecords() throws {
+        let root = StorageConfiguration.shared.outputRoot
+        let path = root.appendingPathComponent("bonds.sqlite3").path
+        let db = try DatabaseManager(url: URL(fileURLWithPath: path))
+        try db.upsertRecord(makeRecord(id: "synthetic-rule", photo: "", sourcePhoto: ""))
+        db.close()
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &handle), SQLITE_OK)
+        let rawDB = try XCTUnwrap(handle)
+        defer { sqlite3_close(rawDB) }
+        XCTAssertEqual(sqlite3_exec(rawDB, "CREATE TRIGGER unsafe_trigger AFTER INSERT ON bonds BEGIN DELETE FROM bonds WHERE id != NEW.id; END;", nil, nil, nil), SQLITE_OK)
+        XCTAssertThrowsError(try CollectionValidator.validate(root: root, backups: StorageConfiguration.shared.backupsRoot))
+        XCTAssertEqual(sqlite3_exec(rawDB, "DROP TRIGGER unsafe_trigger; CREATE UNIQUE INDEX unsafe_unique ON bonds(status);", nil, nil, nil), SQLITE_OK)
+        XCTAssertThrowsError(try CollectionValidator.validate(root: root, backups: StorageConfiguration.shared.backupsRoot))
+        XCTAssertEqual(sqlite3_exec(rawDB, "DROP INDEX unsafe_unique;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(try CollectionValidator.validate(root: root, backups: StorageConfiguration.shared.backupsRoot).count, 1)
+    }
+
+    func testCollectionValidationRejectsLinkedOutputFiles() throws {
+        let root = StorageConfiguration.shared.outputRoot
+        let db = try DatabaseManager(url: root.appendingPathComponent("bonds.sqlite3"))
+        db.close()
+        let outside = tempDir.appendingPathComponent("outside.log")
+        try Data("untouched".utf8).write(to: outside)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("scan-debug.log"), withDestinationURL: outside)
+        XCTAssertThrowsError(try CollectionValidator.validate(root: root, backups: StorageConfiguration.shared.backupsRoot))
+        XCTAssertEqual(try Data(contentsOf: outside), Data("untouched".utf8))
+    }
+
+    func testCollectionCopyRetainsOriginalAndAllReferences() throws {
+        let root = StorageConfiguration.shared.outputRoot
+        let original = createDummyImageFile(named: "source.jpg")
+        let processed = createDummyImageFile(named: "processed.jpg")
+        var record = makeRecord(status: "REVIEW", photo: processed.relPath, sourcePhoto: original.relPath,
+                                associatedPhotos: [original.relPath], fieldPhoto: ["owner": original.relPath])
+        record.duplicateCandidateId = "other-synthetic-record"
+        let db = try DatabaseManager(url: root.appendingPathComponent("bonds.sqlite3"))
+        try db.upsertRecord(record)
+        db.close()
+        let destination = tempDir.appendingPathComponent("copy", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        let request = PendingCollectionSwitch(sourcePath: root.path, destinationPath: destination.path, action: .copy)
+        XCTAssertEqual(try CollectionSwitchCoordinator.apply(request, backups: StorageConfiguration.shared.backupsRoot), destination)
+        XCTAssertEqual(try CollectionValidator.validate(root: destination, backups: StorageConfiguration.shared.backupsRoot), [record])
+        XCTAssertEqual(try CollectionValidator.validate(root: root, backups: StorageConfiguration.shared.backupsRoot), [record])
+        XCTAssertEqual(try Data(contentsOf: original.url), try Data(contentsOf: destination.appendingPathComponent(original.relPath)))
+    }
+
+    func testCollectionCopyRejectsNonemptyDestinationWithoutChangingIt() throws {
+        let destination = tempDir.appendingPathComponent("occupied", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        let unrelated = destination.appendingPathComponent("unrelated.txt")
+        try Data("keep".utf8).write(to: unrelated)
+        let request = PendingCollectionSwitch(sourcePath: StorageConfiguration.shared.outputRoot.path, destinationPath: destination.path, action: .copy)
+        XCTAssertThrowsError(try CollectionSwitchCoordinator.apply(request, backups: StorageConfiguration.shared.backupsRoot))
+        XCTAssertEqual(try Data(contentsOf: unrelated), Data("keep".utf8))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: destination.path), ["unrelated.txt"])
+    }
+
+    func testSwitchRejectsMissingAndSymlinkDestinations() throws {
+        let source = StorageConfiguration.shared.outputRoot
+        let missing = tempDir.appendingPathComponent("missing", isDirectory: true)
+        let request = PendingCollectionSwitch(sourcePath: source.path, destinationPath: missing.path, action: .new)
+        XCTAssertThrowsError(try CollectionSwitchCoordinator.apply(request, backups: StorageConfiguration.shared.backupsRoot))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+        let target = tempDir.appendingPathComponent("target", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+        let link = tempDir.appendingPathComponent("link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let symlinkRequest = PendingCollectionSwitch(sourcePath: source.path, destinationPath: link.path, action: .new)
+        XCTAssertThrowsError(try CollectionSwitchCoordinator.apply(symlinkRequest, backups: StorageConfiguration.shared.backupsRoot))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: target.path).isEmpty)
+    }
+
+    func testSwitchRejectsReadOnlyDestination() throws {
+        let source = StorageConfiguration.shared.outputRoot
+        let destination = tempDir.appendingPathComponent("readonly", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: destination.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path) }
+        let request = PendingCollectionSwitch(sourcePath: source.path, destinationPath: destination.path, action: .new)
+        XCTAssertThrowsError(try CollectionSwitchCoordinator.apply(request, backups: StorageConfiguration.shared.backupsRoot))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
+    }
+
+    func testInterruptedCollectionCopyKeepsOriginalAndPreference() throws {
+        let root = StorageConfiguration.shared.outputRoot
+        let db = try DatabaseManager(url: root.appendingPathComponent("bonds.sqlite3"))
+        let record = makeRecord(photo: "", sourcePhoto: "")
+        try db.upsertRecord(record)
+        db.close()
+        let destination = tempDir.appendingPathComponent("copy", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        let request = PendingCollectionSwitch(sourcePath: root.path, destinationPath: destination.path, action: .copy)
+        let suite = "bondscanner.tests.interrupted.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = CollectionLocationPreferences(defaults: defaults)
+        let state = CollectionLocationState(activePath: root.path, pending: request)
+        try preferences.save(state)
+        XCTAssertThrowsError(try CollectionSwitchCoordinator.apply(request, backups: StorageConfiguration.shared.backupsRoot, failAfterSnapshot: true))
+        XCTAssertEqual(try preferences.load(), state)
+        XCTAssertEqual(try CollectionValidator.validate(root: root, backups: StorageConfiguration.shared.backupsRoot), [record])
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
+    }
+
+    func testOpenAndExplicitNewCollection() throws {
+        let source = StorageConfiguration.shared.outputRoot
+        let destination = tempDir.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        let makeNew = PendingCollectionSwitch(sourcePath: source.path, destinationPath: destination.path, action: .new)
+        XCTAssertEqual(try CollectionSwitchCoordinator.apply(makeNew, backups: StorageConfiguration.shared.backupsRoot), destination)
+        XCTAssertTrue(try CollectionValidator.validate(root: destination, backups: StorageConfiguration.shared.backupsRoot).isEmpty)
+        let open = PendingCollectionSwitch(sourcePath: source.path, destinationPath: destination.path, action: .open)
+        XCTAssertEqual(try CollectionSwitchCoordinator.apply(open, backups: StorageConfiguration.shared.backupsRoot), destination)
+    }
+
     // MARK: - 1. Protect Production Data During XCTest
 
     func testProductionStorageIsProtectedInTestMode() {
         XCTAssertTrue(isProductionStorageProtected())
+        XCTAssertTrue(isProductionStorageProtected(destination: URL(fileURLWithPath: "/Users/Shared/non-test-collection")))
         let fakeProdRoot = tempDir.appendingPathComponent("fake_prod", isDirectory: true)
         StorageConfiguration.shared.setCustomProductionRoot(fakeProdRoot)
         XCTAssertTrue(isProductionStorageProtected(destination: fakeProdRoot))
         XCTAssertTrue(isProductionStorageProtected(destination: fakeProdRoot.appendingPathComponent("bonds.sqlite3")))
+    }
+
+    func testDatabaseHelpersRejectProtectedPathsAndExistingSnapshots() throws {
+        let outside = URL(fileURLWithPath: "/Users/Shared/non-test-collection/bonds.sqlite3")
+        XCTAssertThrowsError(try DatabaseManager.validateDatabaseIntegrity(at: outside))
+        XCTAssertThrowsError(try DatabaseManager.loadRecordsFromSnapshot(at: outside))
+        XCTAssertThrowsError(try testDb.backupDatabase(to: outside))
+        let existing = tempDir.appendingPathComponent("existing-snapshot.sqlite3")
+        try Data("preserve".utf8).write(to: existing)
+        XCTAssertThrowsError(try testDb.backupDatabase(to: existing))
+        XCTAssertEqual(try Data(contentsOf: existing), Data("preserve".utf8))
     }
 
     func testDirectProductionDatabaseInitForbiddenInTestMode() {

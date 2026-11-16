@@ -132,11 +132,25 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
     // MARK: - ReviewCoordinatorDelegate
 
     func reviewCoordinator(_ coordinator: ReviewCoordinator, didUpdateRecords records: [BondRecord]) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self, weak coordinator] in
+                guard let self, let coordinator else { return }
+                self.reviewCoordinator(coordinator, didUpdateRecords: records)
+            }
+            return
+        }
         onRecordsChanged?(records)
         editorView.updateAIProgress(coordinator.aiProgressText)
     }
 
     func reviewCoordinator(_ coordinator: ReviewCoordinator, didSelectRecord record: BondRecord?) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self, weak coordinator] in
+                guard let self, let coordinator else { return }
+                self.reviewCoordinator(coordinator, didSelectRecord: record)
+            }
+            return
+        }
         guard let rec = record else {
             editorView.setRecord(nil, progress: coordinator.progress)
             photoView.setImages(original: nil, processed: nil)
@@ -146,11 +160,25 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate, Review
     }
 
     func reviewCoordinator(_ coordinator: ReviewCoordinator, didUpdateSelectedRecord record: BondRecord) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self, weak coordinator] in
+                guard let self, let coordinator else { return }
+                self.reviewCoordinator(coordinator, didUpdateSelectedRecord: record)
+            }
+            return
+        }
         let candidate = coordinator.findDuplicateCandidate(for: record)
         editorView.updateExternalRecord(record, candidate: candidate, progress: coordinator.progress)
     }
 
     func reviewCoordinator(_ coordinator: ReviewCoordinator, didChangeProgress progress: ReviewProgress) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self, weak coordinator] in
+                guard let self, let coordinator else { return }
+                self.reviewCoordinator(coordinator, didChangeProgress: progress)
+            }
+            return
+        }
         editorView.updateProgress(progress)
         editorView.updateAIProgress(coordinator.aiProgressText)
     }

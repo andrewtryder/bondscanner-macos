@@ -44,9 +44,14 @@ final class PreviewView: NSView {
         previewSurface.layer?.addSublayer(videoLayer)
 
         guide.fillColor = NSColor.clear.cgColor
-        guide.strokeColor = NSColor.systemYellow.cgColor
-        guide.lineWidth = 3
-        guide.lineDashPattern = [14, 8]
+        guide.strokeColor = NSColor.white.withAlphaComponent(0.9).cgColor
+        guide.lineWidth = 4
+        guide.lineCap = .round
+        guide.lineJoin = .round
+        guide.shadowColor = NSColor.black.cgColor
+        guide.shadowOpacity = 0.45
+        guide.shadowRadius = 3
+        guide.shadowOffset = .zero
         previewSurface.layer?.addSublayer(guide)
 
         detected.fillColor = NSColor.clear.cgColor
@@ -180,9 +185,31 @@ final class PreviewView: NSView {
         videoLayer.frame = previewSurface.bounds
         flash.frame = previewSurface.bounds
         let frame = previewSurface.bounds.insetBy(dx: previewSurface.bounds.width * 0.065, dy: previewSurface.bounds.height * 0.17)
-        guide.path = CGPath(roundedRect: frame, cornerWidth: 14, cornerHeight: 14, transform: nil)
+        guide.path = Self.cornerBracketPath(in: frame)
         detected.frame = previewSurface.bounds
         CATransaction.commit()
+    }
+
+    /// Four rounded corner brackets (a viewfinder) instead of a full dashed outline.
+    private static func cornerBracketPath(in rect: CGRect) -> CGPath {
+        let arm = max(24, min(rect.width, rect.height) * 0.12)
+        let radius: CGFloat = 16
+        let path = CGMutablePath()
+        // (corner, horizontal direction inward, vertical direction inward)
+        let corners: [(CGPoint, CGFloat, CGFloat)] = [
+            (CGPoint(x: rect.minX, y: rect.minY), 1, 1),
+            (CGPoint(x: rect.maxX, y: rect.minY), -1, 1),
+            (CGPoint(x: rect.minX, y: rect.maxY), 1, -1),
+            (CGPoint(x: rect.maxX, y: rect.maxY), -1, -1),
+        ]
+        for (corner, dx, dy) in corners {
+            path.move(to: CGPoint(x: corner.x, y: corner.y + dy * arm))
+            path.addArc(tangent1End: corner,
+                        tangent2End: CGPoint(x: corner.x + dx * arm, y: corner.y),
+                        radius: radius)
+            path.addLine(to: CGPoint(x: corner.x + dx * arm, y: corner.y))
+        }
+        return path
     }
 
     func showDetected(_ observation: CGRect?) {
