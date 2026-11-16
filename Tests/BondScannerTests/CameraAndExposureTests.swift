@@ -1255,10 +1255,10 @@ final class CameraAndExposureTests: XCTestCase {
         let darkImg = createTestCGImage(width: 320, height: 160, grayValue: 80)
         let brightImg = createTestCGImage(width: 320, height: 160, grayValue: 200)
 
-        let transaction = CaptureTransaction(
+        let transaction = try XCTUnwrap(app.captureTransactionCoordinator.startTransaction(
             automatic: false,
             targetBiases: [0.0, -0.7, 0.7]
-        )
+        ))
         transaction.addExposure(CapturedExposure(
             biasEV: 0.0,
             image: baseImg,
@@ -1582,5 +1582,91 @@ final class CameraAndExposureTests: XCTestCase {
         app.handleBracketCompletion(transaction: oldTx, result: .failure(ExposureBracketError.exposureSettlingTimedOut))
         XCTAssertTrue(app.isProcessing)
         XCTAssertTrue(app.captureTransactionCoordinator.isTransactionActive(id: newTx.id))
+    }
+
+    func testDelayedMultiExposureSaveCannotInterfereWithNewerCapture() throws {
+        let app = BondScannerApp()
+        app.cameraSessionGeneration = 1
+
+        let img = createSharpBondPatternCGImage(width: 200, height: 100)
+        let bytes = try XCTUnwrap(jpegData(img))
+        let baseExp = CapturedExposure(
+            biasEV: 0.0,
+            image: img,
+            jpegBytes: bytes,
+            capturedAt: Date().timeIntervalSince1970,
+            meanLuminance: 0.5,
+            sharpnessScore: 0.2,
+            isBaseline: true
+        )
+        let darkExp = CapturedExposure(
+            biasEV: -0.7,
+            image: img,
+            jpegBytes: bytes,
+            capturedAt: Date().timeIntervalSince1970,
+            meanLuminance: 0.35,
+            sharpnessScore: 0.2,
+            isBaseline: false
+        )
+
+        let txA = try XCTUnwrap(app.captureTransactionCoordinator.startTransaction(
+            automatic: true,
+            targetBiases: [0.0, -0.7],
+            deviceUniqueID: "cam-a",
+            sessionGeneration: 1
+        ))
+        app.isProcessing = true
+        app.lockedAfterCapture = false
+        app.awaitingSerialFromCapture = false
+
+        // Block saveQueue before A's bracket completes so A's save is deliberately delayed
+        let gate = DispatchSemaphore(value: 0)
+        let saveStarted = expectation(description: "saveQueue reached barrier")
+        app.saveQueue.async {
+            saveStarted.fulfill()
+            gate.wait()
+        }
+        wait(for: [saveStarted], timeout: 2.0)
+
+        app.handleBracketCompletion(transaction: txA, result: .success([baseExp, darkExp]))
+
+        // While A is still in its saving phase, the transaction must remain active
+        XCTAssertTrue(app.captureTransactionCoordinator.isTransactionActive(id: txA.id))
+        XCTAssertNil(app.captureTransactionCoordinator.startTransaction(
+            automatic: true,
+            targetBiases: [0.0],
+            deviceUniqueID: "cam-a",
+            sessionGeneration: 1
+        ))
+
+        // Cancel A (e.g. camera failover) and start capture B on generation 2 while A's save is still pending
+        app.cancelInFlightCaptures(reason: "failover during save")
+        app.cameraSessionGeneration = 2
+        let txB = try XCTUnwrap(app.captureTransactionCoordinator.startTransaction(
+            automatic: true,
+            targetBiases: [0.0, -0.7],
+            deviceUniqueID: "cam-b",
+            sessionGeneration: 2
+        ))
+        app.isProcessing = true
+        app.lockedAfterCapture = false
+        app.awaitingSerialFromCapture = false
+
+        // Unblock A's delayed save and wait for saveQueue + main queue completion
+        gate.signal()
+        let queueDrained = expectation(description: "saveQueue drained")
+        app.saveQueue.async {
+            DispatchQueue.main.async {
+                queueDrained.fulfill()
+            }
+        }
+        wait(for: [queueDrained], timeout: 5.0)
+
+        // A's late save completion must NOT interfere with B's shared capture state
+        XCTAssertTrue(app.isProcessing, "Delayed save from A must not clear B's isProcessing")
+        XCTAssertFalse(app.lockedAfterCapture, "Delayed save from A must not set lockedAfterCapture during B")
+        XCTAssertFalse(app.awaitingSerialFromCapture, "Delayed save from A must not set awaitingSerialFromCapture during B")
+        XCTAssertTrue(app.captureTransactionCoordinator.isTransactionActive(id: txB.id), "B's transaction must remain active")
+        XCTAssertTrue(app.records.isEmpty, "Cancelled transaction A must not append a record after failover")
     }
 }

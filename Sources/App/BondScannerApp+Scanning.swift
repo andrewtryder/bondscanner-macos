@@ -428,19 +428,22 @@ extension BondScannerApp {
         }
     }
 
-    func handleBracketCompletion(transaction: CaptureTransaction, result: Result<[CapturedExposure], Error>) {
-        let isCurrent = !transaction.isCancelled
+    private func isCurrentCaptureTransaction(_ transaction: CaptureTransaction) -> Bool {
+        !transaction.isCancelled
             && transaction.sessionGeneration == cameraSessionGeneration
             && captureTransactionCoordinator.isTransactionActive(id: transaction.id)
-        captureTransactionCoordinator.finishTransaction(id: transaction.id)
+    }
 
-        guard isCurrent else {
+    func handleBracketCompletion(transaction: CaptureTransaction, result: Result<[CapturedExposure], Error>) {
+        guard isCurrentCaptureTransaction(transaction) else {
+            captureTransactionCoordinator.finishTransaction(id: transaction.id)
             ScanLog.shared.write("ignoring obsolete bracket completion id=\(transaction.id.uuidString.prefix(8)) gen=\(transaction.sessionGeneration) currentGen=\(cameraSessionGeneration)")
             return
         }
 
         switch result {
         case let .failure(error):
+            captureTransactionCoordinator.finishTransaction(id: transaction.id)
             isProcessing = false
             if (error as? ExposureBracketError) == .captureCancelled || transaction.isCancelled {
                 ScanLog.shared.write("smart exposure bracket cancelled id=\(transaction.id.uuidString.prefix(8))")
@@ -457,11 +460,13 @@ extension BondScannerApp {
     }
 
     func finishMultiExposureCapture(transaction: CaptureTransaction) {
-        guard !transaction.isCancelled, transaction.sessionGeneration == cameraSessionGeneration else {
+        guard isCurrentCaptureTransaction(transaction) else {
+            captureTransactionCoordinator.finishTransaction(id: transaction.id)
             ScanLog.shared.write("ignoring obsolete finishMultiExposureCapture id=\(transaction.id.uuidString.prefix(8)) gen=\(transaction.sessionGeneration) currentGen=\(cameraSessionGeneration)")
             return
         }
         guard let baseline = transaction.baselineExposure else {
+            captureTransactionCoordinator.finishTransaction(id: transaction.id)
             isProcessing = false
             status("Capture failed: No exposures captured.")
             checkPendingCameraSwitchAfterCapture()
@@ -469,6 +474,7 @@ extension BondScannerApp {
         }
 
         if transaction.capturedExposures.count <= 1 {
+            captureTransactionCoordinator.finishTransaction(id: transaction.id)
             finishCapture(image: baseline.image, jpegBytes: baseline.jpegBytes, automatic: transaction.automatic, requestedAt: transaction.requestedAt)
             checkPendingCameraSwitchAfterCapture()
             return
@@ -521,12 +527,13 @@ extension BondScannerApp {
                 }
             } catch {
                 DispatchQueue.main.async {
-                    if !transaction.isCancelled,
-                       transaction.sessionGeneration == self.cameraSessionGeneration,
-                       !self.captureTransactionCoordinator.isBusy
-                    {
-                        self.isProcessing = false
+                    let isCurrent = self.isCurrentCaptureTransaction(transaction)
+                    self.captureTransactionCoordinator.finishTransaction(id: transaction.id)
+                    guard isCurrent else {
+                        ScanLog.shared.write("ignoring obsolete multi-exposure save failure id=\(transaction.id.uuidString.prefix(8))")
+                        return
                     }
+                    self.isProcessing = false
                     self.status("SAVE FAILED: \(error.localizedDescription)")
                     self.preview?.captureFlash(color: .systemRed)
                     NSSound.beep()
@@ -536,6 +543,13 @@ extension BondScannerApp {
             }
 
             DispatchQueue.main.async {
+                let isCurrent = self.isCurrentCaptureTransaction(transaction)
+                self.captureTransactionCoordinator.finishTransaction(id: transaction.id)
+                guard isCurrent else {
+                    ScanLog.shared.write("ignoring obsolete multi-exposure save completion id=\(transaction.id.uuidString.prefix(8)) gen=\(transaction.sessionGeneration) currentGen=\(self.cameraSessionGeneration)")
+                    return
+                }
+
                 let captureLatencyMs = (Date().timeIntervalSince1970 - transaction.requestedAt) * 1000.0
                 self.diagnostics.totalCaptures += 1
                 self.diagnostics.totalCaptureTimeMs += captureLatencyMs
@@ -556,12 +570,7 @@ extension BondScannerApp {
                 do {
                     try saveRecordLive(record, allRecords: self.records, sortOrder: self.records.count - 1)
                 } catch {
-                    if !transaction.isCancelled,
-                       transaction.sessionGeneration == self.cameraSessionGeneration,
-                       !self.captureTransactionCoordinator.isBusy
-                    {
-                        self.isProcessing = false
-                    }
+                    self.isProcessing = false
                     self.records = previous
                     self.status("DATABASE SAVE FAILED: \(error.localizedDescription). Photos preserved.")
                     self.preview?.captureFlash(color: .systemRed)
