@@ -482,13 +482,18 @@ func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord,
         var ids = existing.fieldCaptureId ?? [:]
         var conf = existing.fieldConfidence ?? [:]
         var src = existing.fieldSource ?? [:]
-        photos[key] = contributingSource.isEmpty ? contributingPhoto : contributingSource
+        if let incomingSpecificPhoto = incoming.fieldPhoto?[key], !incomingSpecificPhoto.isEmpty {
+            photos[key] = incomingSpecificPhoto
+        } else {
+            photos[key] = contributingSource.isEmpty ? contributingPhoto : contributingSource
+        }
         ids[key] = captureId
-        if let c = incoming.fieldConfidence?[ckey] {
+        if let c = incoming.fieldConfidence?[ckey] ?? incoming.fieldConfidence?[key] {
             conf[ckey] = c
         }
-        if let s = incoming.fieldSource?[ckey] {
+        if let s = incoming.fieldSource?[key] ?? incoming.fieldSource?[ckey] {
             src[ckey] = s
+            src[key] = s
         }
         existing.fieldPhoto = photos
         existing.fieldCaptureId = ids
@@ -535,7 +540,8 @@ func mergeBondRecord(from incoming: BondRecord, into existing: inout BondRecord,
         }
         existing.reviewReasons = Array(mergedReasons).sorted()
     }
-    addAssociatedPhotos(to: &existing, newPhotos: [contributingSource, contributingPhoto] + (incoming.associatedPhotos ?? []))
+    let incomingFieldPhotos = Array((incoming.fieldPhoto ?? [:]).values)
+    addAssociatedPhotos(to: &existing, newPhotos: [contributingSource, contributingPhoto] + (incoming.associatedPhotos ?? []) + incomingFieldPhotos)
     applyRequiredStatus(&existing)
     // OCR consolidation is a meaningful mutation too.  This makes an in-flight
     // review analysis stale before any of its suggestions can be persisted.
@@ -562,6 +568,8 @@ func annotateFieldSources(_ record: inout BondRecord, photo: String, captureId: 
         }
         if photos[key] == nil {
             photos[key] = photo
+        }
+        if ids[key] == nil {
             ids[key] = captureId
         }
     }

@@ -5,15 +5,20 @@ import Foundation
 ///
 /// Principles:
 /// 1. Baseline (0.0 EV) exposure is primary.
-/// 2. Missing or uncertain fields in baseline may be enriched by confident reads from bracketed exposures.
-/// 3. Conflicting valid readings between exposures are preserved as explicit review reasons (never silently resolved by blind voting).
-/// 4. Never invent values for missing fields.
-/// 5. Never overwrite human-confirmed fields.
-/// 6. Complete provenance is tracked in fieldPhoto and fieldSource.
+/// 2. Missing or uncertain fields in baseline may be enriched ONLY by validated, high-confidence reads from bracketed exposures.
+/// 3. Missing confidence metadata defaults to "uncertain" (never "high").
+/// 4. Conflicting readings between exposures are preserved as explicit review reasons (never silently resolved by blind voting).
+/// 5. Never invent values for missing fields.
+/// 6. Never overwrite human-confirmed fields.
+/// 7. Complete provenance is tracked in fieldPhoto, fieldSource, and fieldCaptureId.
 enum MultiExposureOCREvaluator {
     static let importantFields = [
         "series", "serial", "denomination", "issueMonth", "issueYear",
         "owner", "secondName", "address", "issuingAgent", "datingStamp",
+    ]
+
+    static let coreValidatedFields: Set<String> = [
+        "series", "serial", "denomination", "issueMonth", "issueYear",
     ]
 
     struct EvaluationResult {
@@ -31,7 +36,7 @@ enum MultiExposureOCREvaluator {
         var record = baseRecord
         let userConfirmed = Set(record.userConfirmedFields ?? [])
 
-        // Populate baseline values first
+        // Populate baseline values first for unconfirmed fields
         let baseRec = baselineResult.record
         if !userConfirmed.contains("series") {
             record.series = baseRec.series
@@ -73,14 +78,31 @@ enum MultiExposureOCREvaluator {
 
         var fieldPhoto = record.fieldPhoto ?? [:]
         var fieldSource = record.fieldSource ?? [:]
-        var fieldConfidence = record.fieldConfidence ?? baseRec.fieldConfidence ?? [:]
+        var fieldConfidence = record.fieldConfidence ?? [:]
+        if let baseConfMap = baseRec.fieldConfidence {
+            for (k, v) in baseConfMap where !userConfirmed.contains(k) {
+                fieldConfidence[k] = v
+            }
+        }
+        var previousExtracted = record.previousExtracted ?? [:]
 
-        // Set baseline photo for all populated baseline fields
+        // Set baseline provenance and normalized confidence for all populated baseline fields
         for field in importantFields {
-            let val = getFieldValue(record, field: field)
-            if !val.isEmpty, fieldPhoto[field] == nil {
+            let val = getFieldValue(record, field: field).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !val.isEmpty else { continue }
+            if fieldPhoto[field] == nil {
                 fieldPhoto[field] = baselinePhotoRel
                 fieldSource[field] = "exposure_0.0EV"
+            }
+            if !userConfirmed.contains(field) {
+                let isHigh = isHighConfidenceReading(
+                    field: field,
+                    value: val,
+                    in: baseRec,
+                    fallbackConfidenceMap: fieldConfidence,
+                    context: (series: record.series, month: record.issueMonth)
+                )
+                fieldConfidence[field] = isHigh ? "high" : "uncertain"
             }
         }
 
@@ -108,25 +130,116 @@ enum MultiExposureOCREvaluator {
 
                 guard !altVal.isEmpty else { continue }
 
-                let altConf = altRec.fieldConfidence?[field] ?? "high"
-                let baseConf = fieldConfidence[field] ?? ""
+                let effectiveSeries = !record.series.isEmpty ? record.series : altRec.series
+                let effectiveMonth = !record.issueMonth.isEmpty ? record.issueMonth : altRec.issueMonth
+                let altValidated = isFieldValueValidated(
+                    field: field,
+                    value: altVal,
+                    effectiveSeries: effectiveSeries,
+                    effectiveMonth: effectiveMonth
+                )
+                let altIsHigh = isHighConfidenceReading(
+                    field: field,
+                    value: altVal,
+                    in: altRec,
+                    fallbackConfidenceMap: nil,
+                    context: (series: effectiveSeries, month: effectiveMonth)
+                )
+                let baseConf = resolvedConfidence(for: field, in: fieldConfidence)
+                let baseIsHigh = (baseConf == "high")
 
-                if baseVal.isEmpty || baseConf == "uncertain" {
-                    // Enrich missing or uncertain field from confident bracketed read
-                    setFieldValue(&record, field: field, value: altVal)
-                    fieldPhoto[field] = photoPath
-                    fieldSource[field] = "exposure_\(String(format: "%+.1f", bias))EV"
-                    fieldConfidence[field] = altConf
-                    enriched[field] = (altVal, bias)
-                } else if baseVal != altVal {
-                    // Both have valid but differing values: record conflict
-                    conflicting[field] = (baseVal, altVal, bias)
-                    let reason = "exposure_conflict: \(field): baseline '\(baseVal)' vs exposure \(String(format: "%+.1f", bias))EV '\(altVal)'"
-                    reviewReasons.insert(reason)
+                if coreValidatedFields.contains(field) {
+                    // Core fields require validated readings; never promote or substitute unvalidated or uncertain reads.
+                    guard altValidated else { continue }
+
+                    if baseVal.isEmpty {
+                        // Enrich missing core field ONLY when alternate reading is validated AND high confidence
+                        guard altIsHigh else { continue }
+                        setFieldValue(&record, field: field, value: altVal)
+                        fieldPhoto[field] = photoPath
+                        fieldSource[field] = "exposure_\(String(format: "%+.1f", bias))EV"
+                        fieldConfidence[field] = "high"
+                        enriched[field] = (altVal, bias)
+                    } else if !baseIsHigh {
+                        // Baseline has an uncertain reading
+                        if baseVal == altVal {
+                            if altIsHigh {
+                                fieldConfidence[field] = "high"
+                                fieldPhoto[field] = photoPath
+                                fieldSource[field] = "exposure_\(String(format: "%+.1f", bias))EV"
+                                enriched[field] = (altVal, bias)
+                            } else {
+                                fieldConfidence[field] = "uncertain"
+                            }
+                        } else if altIsHigh {
+                            // Confident, validated alternate reading replaces uncertain baseline reading
+                            if previousExtracted[field] == nil {
+                                previousExtracted[field] = baseVal
+                            }
+                            setFieldValue(&record, field: field, value: altVal)
+                            fieldPhoto[field] = photoPath
+                            fieldSource[field] = "exposure_\(String(format: "%+.1f", bias))EV"
+                            fieldConfidence[field] = "high"
+                            enriched[field] = (altVal, bias)
+                        } else {
+                            // Both baseline and alternate are uncertain and disagree: retain baseline, keep uncertain, flag conflict
+                            fieldConfidence[field] = "uncertain"
+                            conflicting[field] = (baseVal, altVal, bias)
+                            let reason = "exposure_conflict: \(field): baseline '\(baseVal)' vs exposure \(String(format: "%+.1f", bias))EV '\(altVal)'"
+                            reviewReasons.insert(reason)
+                        }
+                    } else if baseVal != altVal {
+                        // Baseline is high confidence and alternate differs: preserve baseline and record conflict
+                        conflicting[field] = (baseVal, altVal, bias)
+                        let reason = "exposure_conflict: \(field): baseline '\(baseVal)' vs exposure \(String(format: "%+.1f", bias))EV '\(altVal)'"
+                        reviewReasons.insert(reason)
+                    }
+                } else {
+                    // Ancillary text fields (owner, secondName, address, issuingAgent, datingStamp)
+                    if baseVal.isEmpty {
+                        setFieldValue(&record, field: field, value: altVal)
+                        fieldPhoto[field] = photoPath
+                        fieldSource[field] = "exposure_\(String(format: "%+.1f", bias))EV"
+                        fieldConfidence[field] = altIsHigh ? "high" : "uncertain"
+                        enriched[field] = (altVal, bias)
+                    } else if !baseIsHigh, altIsHigh, baseVal != altVal {
+                        if previousExtracted[field] == nil {
+                            previousExtracted[field] = baseVal
+                        }
+                        setFieldValue(&record, field: field, value: altVal)
+                        fieldPhoto[field] = photoPath
+                        fieldSource[field] = "exposure_\(String(format: "%+.1f", bias))EV"
+                        fieldConfidence[field] = "high"
+                        enriched[field] = (altVal, bias)
+                    } else if baseVal != altVal {
+                        conflicting[field] = (baseVal, altVal, bias)
+                        let reason = "exposure_conflict: \(field): baseline '\(baseVal)' vs exposure \(String(format: "%+.1f", bias))EV '\(altVal)'"
+                        reviewReasons.insert(reason)
+                    }
                 }
             }
         }
 
+        // Synchronize composite "issueDate" confidence with issueMonth & issueYear
+        if !userConfirmed.contains("issueDate") {
+            let hasMonth = !record.issueMonth.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let hasYear = !record.issueYear.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if hasMonth || hasYear {
+                let monthHigh = fieldConfidence["issueMonth"] == "high"
+                let yearHigh = fieldConfidence["issueYear"] == "high"
+                let dateConsistent = hasMonth && hasYear && isFieldValueValidated(
+                    field: "issueYear",
+                    value: record.issueYear,
+                    effectiveSeries: record.series,
+                    effectiveMonth: record.issueMonth
+                )
+                fieldConfidence["issueDate"] = (monthHigh && yearHigh && dateConsistent) ? "high" : "uncertain"
+            } else {
+                fieldConfidence["issueDate"] = nil
+            }
+        }
+
+        record.previousExtracted = previousExtracted.isEmpty ? nil : previousExtracted
         record.fieldPhoto = fieldPhoto.isEmpty ? nil : fieldPhoto
         record.fieldSource = fieldSource.isEmpty ? nil : fieldSource
         record.fieldConfidence = fieldConfidence.isEmpty ? nil : fieldConfidence
@@ -143,6 +256,88 @@ enum MultiExposureOCREvaluator {
             conflictingFields: conflicting,
             enrichedFields: enriched
         )
+    }
+
+    private static func resolvedConfidence(for field: String, in map: [String: String]?) -> String {
+        guard let map = map else { return "uncertain" }
+        if let direct = map[field], !direct.isEmpty {
+            return direct
+        }
+        if field == "issueMonth" || field == "issueYear", let dateConf = map["issueDate"], !dateConf.isEmpty {
+            return dateConf
+        }
+        return "uncertain"
+    }
+
+    private static func isFieldValueValidated(
+        field: String,
+        value: String,
+        effectiveSeries: String,
+        effectiveMonth: String
+    ) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        switch field {
+        case "series":
+            return validSeriesValues().contains(trimmed.uppercased())
+        case "serial":
+            return !validatedSerial(trimmed, series: effectiveSeries).value.isEmpty
+        case "denomination":
+            let clean = trimmed.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespaces)
+            return validFaceValues(for: effectiveSeries).contains(clean)
+        case "issueMonth":
+            return monthNumber(trimmed) != nil
+        case "issueYear":
+            guard trimmed.count == 4, let yearInt = Int(trimmed), (1935 ... 2026).contains(yearInt) else {
+                return false
+            }
+            if !effectiveSeries.isEmpty {
+                let consistency = BondValidationRules.validateSeriesIssueDate(
+                    series: effectiveSeries,
+                    month: effectiveMonth,
+                    year: trimmed
+                )
+                return consistency.status != .inconsistent
+            }
+            return true
+        default:
+            return true
+        }
+    }
+
+    private static func isHighConfidenceReading(
+        field: String,
+        value: String,
+        in record: BondRecord,
+        fallbackConfidenceMap: [String: String]?,
+        context: (series: String, month: String)
+    ) -> Bool {
+        let explicitConf: String
+        if let direct = record.fieldConfidence?[field], !direct.isEmpty {
+            explicitConf = direct
+        } else if field == "issueMonth" || field == "issueYear",
+                  let dateConf = record.fieldConfidence?["issueDate"], !dateConf.isEmpty
+        {
+            explicitConf = dateConf
+        } else if let fallback = fallbackConfidenceMap {
+            explicitConf = resolvedConfidence(for: field, in: fallback)
+        } else {
+            // Missing confidence metadata defaults to "uncertain", never "high"
+            explicitConf = "uncertain"
+        }
+
+        guard explicitConf == "high", isFieldValueValidated(
+            field: field,
+            value: value,
+            effectiveSeries: context.series,
+            effectiveMonth: context.month
+        ) else {
+            return false
+        }
+        if field == "serial" {
+            return validatedSerial(value, series: context.series).isHigh
+        }
+        return true
     }
 
     private static func getFieldValue(_ record: BondRecord, field: String) -> String {

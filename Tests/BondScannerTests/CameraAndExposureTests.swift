@@ -5,15 +5,25 @@ import CoreGraphics
 import XCTest
 
 final class CameraAndExposureTests: XCTestCase {
+    private var rootSandboxDir: URL!
     private var tempDir: URL!
+    private var backupsDir: URL!
     private var testDbURL: URL!
     private var testDb: DatabaseManager!
 
     override func setUp() {
         super.setUp()
         ScanLog.shared.isEnabled = false
-        tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("camera-exposure-tests-\(UUID().uuidString)", isDirectory: true)
+        rootSandboxDir = FileManager.default.temporaryDirectory.appendingPathComponent("camera-exposure-tests-\(UUID().uuidString)", isDirectory: true)
+        tempDir = rootSandboxDir.appendingPathComponent("output", isDirectory: true)
+        backupsDir = rootSandboxDir.appendingPathComponent("backups", isDirectory: true)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: backupsDir, withIntermediateDirectories: true)
+        StorageConfiguration.shared.setCustomRoots(outputRoot: tempDir, backupsRoot: backupsDir)
+        ExportConfiguration.shared.setCustomDestinations(
+            records: tempDir.appendingPathComponent("records.json"),
+            csv: tempDir.appendingPathComponent("bonds.csv")
+        )
         testDbURL = tempDir.appendingPathComponent("bonds.sqlite3")
         testDb = try? DatabaseManager(url: testDbURL)
         DatabaseManager.setSharedInstance(testDb)
@@ -21,11 +31,15 @@ final class CameraAndExposureTests: XCTestCase {
 
     override func tearDown() {
         ScanLog.shared.isEnabled = true
+        ExportConfiguration.shared.resetToDefaults()
+        StorageConfiguration.shared.resetToDefaults()
         DatabaseManager.setSharedInstance(nil)
         testDb = nil
-        if let dir = tempDir {
+        if let dir = rootSandboxDir {
             try? FileManager.default.removeItem(at: dir)
+            rootSandboxDir = nil
             tempDir = nil
+            backupsDir = nil
         }
         super.tearDown()
     }
@@ -43,6 +57,31 @@ final class CameraAndExposureTests: XCTestCase {
             bytesPerRow: width,
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.none.rawValue
+        )!
+        return context.makeImage()!
+    }
+
+    private func createSharpBondPatternCGImage(width: Int = 400, height: Int = 200) -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 235, count: height * bytesPerRow)
+        for y in stride(from: 20, to: height - 20, by: 12) {
+            for x in 20 ..< (width - 20) where (x / 6) % 2 == 0 {
+                let offset = y * bytesPerRow + x * 4
+                pixels[offset] = 20
+                pixels[offset + 1] = 20
+                pixels[offset + 2] = 20
+                pixels[offset + 3] = 255
+            }
+        }
+        let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         )!
         return context.makeImage()!
     }
@@ -71,7 +110,10 @@ final class CameraAndExposureTests: XCTestCase {
 
         var biasFails = false
         var settlingTimesOut = false
+        var hangsWithoutCallbackOnNonZeroBias = false
+        var hangsWithoutCallbackOnBaselineCapture = false
         var disconnects = false
+        var onStepStarted: ((Float) -> Void)?
         var luminanceByBias: [Float: Float] = [:]
         var syntheticImage: CGImage?
 
@@ -82,7 +124,12 @@ final class CameraAndExposureTests: XCTestCase {
         func setExposureBias(_ bias: Float, completion: @escaping (Result<Void, Error>) -> Void) {
             setBiasCallCount += 1
             appliedBiases.append(bias)
+            onStepStarted?(bias)
 
+            if hangsWithoutCallbackOnNonZeroBias {
+                // Intentionally never invoke completion to test ExposureBracketController timeout
+                return
+            }
             if disconnects {
                 completion(.failure(ExposureBracketError.deviceDisconnected))
                 return
@@ -105,6 +152,11 @@ final class CameraAndExposureTests: XCTestCase {
 
         func captureStillPhoto(for bias: Float, completion: @escaping (Result<CapturedExposure, Error>) -> Void) {
             captureCallCount += 1
+            onStepStarted?(bias)
+            if bias == 0.0, hangsWithoutCallbackOnBaselineCapture {
+                // Intentionally never invoke completion to test baseline capture timeout
+                return
+            }
             if disconnects {
                 completion(.failure(ExposureBracketError.deviceDisconnected))
                 return
@@ -119,9 +171,9 @@ final class CameraAndExposureTests: XCTestCase {
             let exp = CapturedExposure(
                 biasEV: bias,
                 image: img,
-                jpegBytes: Data([0xFF, 0xD8, 0xFF, 0xD9]),
+                jpegBytes: jpegData(img),
                 meanLuminance: lum,
-                sharpnessScore: 15.0,
+                sharpnessScore: 0.045,
                 isBaseline: bias == 0.0
             )
             completion(.success(exp))
@@ -475,8 +527,13 @@ final class CameraAndExposureTests: XCTestCase {
             photo: "photos/sample.jpg", sourcePhoto: "photos/original_sample.jpg", rawOCR: ""
         )
 
-        let baseOCR = makeOCRResult(record: BondRecord(id: "base", capturedAt: "", series: "EE", serial: "C1234567890EE", issueMonth: "", issueYear: "", denomination: "50", owner: "", secondName: "", secondRole: "", address: "", taxID: "", issuingAgent: "", datingStamp: "", status: "", notes: "", photo: "", sourcePhoto: "", rawOCR: "SERIES EE"), huntScore: 90)
-        let brightOCR = makeOCRResult(record: BondRecord(id: "bright", capturedAt: "", series: "EE", serial: "C1234567890EE", issueMonth: "10", issueYear: "1998", denomination: "50", owner: "", secondName: "", secondRole: "", address: "", taxID: "", issuingAgent: "", datingStamp: "", status: "", notes: "", photo: "", sourcePhoto: "", rawOCR: "10/1998"), huntScore: 88)
+        var bRec = BondRecord(id: "base", capturedAt: "", series: "EE", serial: "C1234567890EE", issueMonth: "", issueYear: "", denomination: "50", owner: "", secondName: "", secondRole: "", address: "", taxID: "", issuingAgent: "", datingStamp: "", status: "", notes: "", photo: "", sourcePhoto: "", rawOCR: "SERIES EE")
+        bRec.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high"]
+        let baseOCR = makeOCRResult(record: bRec, huntScore: 90)
+
+        var brRec = BondRecord(id: "bright", capturedAt: "", series: "EE", serial: "C1234567890EE", issueMonth: "10", issueYear: "1998", denomination: "50", owner: "", secondName: "", secondRole: "", address: "", taxID: "", issuingAgent: "", datingStamp: "", status: "", notes: "", photo: "", sourcePhoto: "", rawOCR: "10/1998")
+        brRec.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high", "issueDate": "high"]
+        let brightOCR = makeOCRResult(record: brRec, huntScore: 88)
 
         let eval = MultiExposureOCREvaluator.evaluate(
             baselineResult: baseOCR,
@@ -490,6 +547,7 @@ final class CameraAndExposureTests: XCTestCase {
         XCTAssertEqual(record.fieldPhoto?["issueMonth"], "photos/original_sample_+0.7EV.jpg")
         XCTAssertEqual(record.fieldPhoto?["issueYear"], "photos/original_sample_+0.7EV.jpg")
         XCTAssertEqual(record.fieldSource?["issueMonth"], "exposure_+0.7EV")
+        XCTAssertEqual(record.fieldConfidence?["issueDate"], "high")
     }
 
     func testContradictoryOCRValuesTriggerReview() {
@@ -626,5 +684,712 @@ final class CameraAndExposureTests: XCTestCase {
         // Check zero private bond fields are present in diagnostic
         XCTAssertFalse(text.contains("serial"))
         XCTAssertFalse(text.contains("John Doe"))
+    }
+
+    // MARK: - Code Review Regression & Integration Tests
+
+    func testCameraNamedWebcamWithoutUSBTransportClassifiedAsExternal() {
+        // A non-USB external/virtual camera whose name contains "Webcam" must be .external, not .usbWebcam
+        let nonUSB = WebcamResolver.categorize(
+            localizedName: "Studio Virtual Webcam",
+            modelID: "VirtualCam-1",
+            manufacturer: "Acme Video",
+            transportType: 0
+        )
+        XCTAssertEqual(nonUSB, .external)
+
+        // A physical USB camera with verified 'usb ' transport (1_970_496_032) is .usbWebcam
+        let physicalUSB = WebcamResolver.categorize(
+            localizedName: "NexiGo N940P",
+            modelID: "VendorID_1234",
+            manufacturer: "NexiGo",
+            transportType: 1_970_496_032
+        )
+        XCTAssertEqual(physicalUSB, .usbWebcam)
+
+        // Built-in camera transport ('bltn' = 1_651_274_862) is .builtIn
+        let builtIn = WebcamResolver.categorize(
+            localizedName: "FaceTime HD Camera",
+            modelID: "AppleCamera",
+            manufacturer: "Apple Inc.",
+            transportType: 1_651_274_862
+        )
+        XCTAssertEqual(builtIn, .builtIn)
+    }
+
+    func testMissingHardwareCallbackTimesOutAndRestoresExposure() {
+        let capabilities = CameraHardwareExposureCapabilities(
+            supportsHardwareAdjustment: true,
+            minBias: -2.0,
+            maxBias: 2.0,
+            isHardwareBracketingSupported: true
+        )
+        let mockCam = MockCameraController(capabilities: capabilities)
+        mockCam.hangsWithoutCallbackOnNonZeroBias = true
+
+        let transaction = CaptureTransaction(automatic: true, targetBiases: [0.0, -0.7, 0.7])
+        let bracketController = ExposureBracketController(timeoutSeconds: 0.12)
+
+        let exp = expectation(description: "Hanging callback timed out by controller")
+        bracketController.executeBracket(transaction: transaction, camera: mockCam) { result in
+            switch result {
+            case let .success(exposures):
+                // Baseline was captured before -0.7 EV hung; controller restores exposure and falls back to baseline
+                XCTAssertEqual(exposures.count, 1)
+                XCTAssertEqual(exposures.first?.biasEV, 0.0)
+                XCTAssertEqual(transaction.capturedExposures.count, 1)
+            case let .failure(err):
+                XCTFail("Expected fallback to captured baseline on secondary step timeout, got: \(err)")
+            }
+            exp.fulfill()
+        }
+
+        wait(for: [exp], timeout: 2.0)
+        XCTAssertEqual(mockCam.restoreExposureCallCount, 1)
+
+        // Also test when baseline capture itself never invokes its callback
+        let mockCam2 = MockCameraController(capabilities: capabilities)
+        mockCam2.hangsWithoutCallbackOnBaselineCapture = true
+        let transaction2 = CaptureTransaction(automatic: true, targetBiases: [0.0, -0.7, 0.7])
+        let exp2 = expectation(description: "Baseline hanging callback timed out")
+        bracketController.executeBracket(transaction: transaction2, camera: mockCam2) { result in
+            switch result {
+            case .success:
+                XCTFail("Expected timeout failure when baseline callback never arrives")
+            case let .failure(err):
+                XCTAssertEqual(err as? ExposureBracketError, .exposureSettlingTimedOut)
+            }
+            exp2.fulfill()
+        }
+        wait(for: [exp2], timeout: 2.0)
+        XCTAssertEqual(mockCam2.restoreExposureCallCount, 1)
+    }
+
+    func testMidFlightCancellationDuringBracketStepAbortsAndRestores() {
+        let capabilities = CameraHardwareExposureCapabilities(
+            supportsHardwareAdjustment: true,
+            minBias: -2.0,
+            maxBias: 2.0,
+            isHardwareBracketingSupported: true
+        )
+        let mockCam = MockCameraController(capabilities: capabilities)
+        let transaction = CaptureTransaction(automatic: true, targetBiases: [0.0, -0.7, 0.7])
+        mockCam.onStepStarted = { bias in
+            if bias == -0.7 {
+                transaction.cancel()
+            }
+        }
+
+        let bracketController = ExposureBracketController(timeoutSeconds: 0.5)
+        let exp = expectation(description: "Mid-flight cancellation aborts")
+        bracketController.executeBracket(transaction: transaction, camera: mockCam) { result in
+            switch result {
+            case .success:
+                XCTFail("Expected cancelled error when transaction is cancelled mid-flight")
+            case let .failure(err):
+                XCTAssertEqual(err as? ExposureBracketError, .captureCancelled)
+            }
+            exp.fulfill()
+        }
+
+        wait(for: [exp], timeout: 2.0)
+        XCTAssertEqual(mockCam.restoreExposureCallCount, 1)
+    }
+
+    func testIgnoredExposureChangesSyncTransactionExposuresToBaselineOnly() {
+        let capabilities = CameraHardwareExposureCapabilities(
+            supportsHardwareAdjustment: true,
+            minBias: -2.0,
+            maxBias: 2.0,
+            isHardwareBracketingSupported: true
+        )
+        let mockCam = MockCameraController(capabilities: capabilities)
+        mockCam.luminanceByBias = [0.0: 0.50, -0.7: 0.505, 0.7: 0.495]
+
+        let transaction = CaptureTransaction(automatic: true, targetBiases: [0.0, -0.7, 0.7])
+        let bracketController = ExposureBracketController()
+
+        let exp = expectation(description: "Unchanged exposures discarded from transaction")
+        bracketController.executeBracket(transaction: transaction, camera: mockCam) { result in
+            if case let .success(exposures) = result {
+                XCTAssertEqual(exposures.count, 1)
+                XCTAssertEqual(transaction.capturedExposures.count, 1)
+                XCTAssertEqual(transaction.capturedExposures.first?.biasEV, 0.0)
+            } else {
+                XCTFail("Expected baseline-only success")
+            }
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 2.0)
+    }
+
+    func testMissingAlternateConfidenceDefaultsToUncertainAndDoesNotPromote() {
+        let baseRecord = BondRecord(
+            id: "conf-default-test",
+            capturedAt: "2026-11-15T12:00:00Z",
+            series: "", serial: "", issueMonth: "", issueYear: "", denomination: "",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "PROCESSING", notes: "",
+            photo: "photos/sample.jpg", sourcePhoto: "photos/original_sample.jpg", rawOCR: ""
+        )
+
+        var baseRec = BondRecord(
+            id: "base", capturedAt: "", series: "EE", serial: "C1234567890EE",
+            issueMonth: "", issueYear: "", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: "SERIES EE"
+        )
+        baseRec.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high"]
+        let baseOCR = makeOCRResult(record: baseRec)
+
+        // Alternate has issueMonth/issueYear and a different serial, but NO fieldConfidence metadata (nil)
+        let altRecWithoutConfidence = BondRecord(
+            id: "alt", capturedAt: "", series: "EE", serial: "C9999999999EE",
+            issueMonth: "05", issueYear: "1995", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: "05/1995"
+        )
+        let altOCR = makeOCRResult(record: altRecWithoutConfidence)
+
+        let eval = MultiExposureOCREvaluator.evaluate(
+            baselineResult: baseOCR,
+            baselinePhotoRel: "photos/original_sample.jpg",
+            bracketedResults: [(-0.7, altOCR, "photos/original_sample_-0.7EV.jpg")],
+            baseRecord: baseRecord
+        )
+
+        let reconciled = eval.reconciledRecord
+        // Missing confidence on alternate must NOT enrich missing issueMonth/issueYear or promote them to high
+        XCTAssertEqual(reconciled.issueMonth, "")
+        XCTAssertEqual(reconciled.issueYear, "")
+        XCTAssertNil(reconciled.fieldConfidence?["issueDate"])
+    }
+
+    func testUncertainAlternateReadingDoesNotReplaceUncertainBaseline() {
+        let baseRecord = BondRecord(
+            id: "uncertain-replace-test",
+            capturedAt: "2026-11-15T12:00:00Z",
+            series: "", serial: "", issueMonth: "", issueYear: "", denomination: "",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "PROCESSING", notes: "",
+            photo: "photos/sample.jpg", sourcePhoto: "photos/original_sample.jpg", rawOCR: ""
+        )
+
+        var baseRec = BondRecord(
+            id: "base", capturedAt: "", series: "EE", serial: "C1234567890EE",
+            issueMonth: "05", issueYear: "1995", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: ""
+        )
+        baseRec.fieldConfidence = [
+            "series": "high",
+            "serial": "uncertain",
+            "denomination": "high",
+            "issueDate": "uncertain",
+        ]
+        let baseOCR = makeOCRResult(record: baseRec)
+
+        var altRec = BondRecord(
+            id: "alt", capturedAt: "", series: "EE", serial: "C1234567898EE",
+            issueMonth: "06", issueYear: "1995", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: ""
+        )
+        altRec.fieldConfidence = [
+            "series": "high",
+            "serial": "uncertain",
+            "denomination": "high",
+            "issueDate": "uncertain",
+        ]
+        let altOCR = makeOCRResult(record: altRec)
+
+        let eval = MultiExposureOCREvaluator.evaluate(
+            baselineResult: baseOCR,
+            baselinePhotoRel: "photos/original_sample.jpg",
+            bracketedResults: [(-0.7, altOCR, "photos/original_sample_-0.7EV.jpg")],
+            baseRecord: baseRecord
+        )
+
+        let reconciled = eval.reconciledRecord
+        // Baseline values must be retained; uncertain alternate readings must not replace them
+        XCTAssertEqual(reconciled.serial, "C1234567890EE")
+        XCTAssertEqual(reconciled.issueMonth, "05")
+        XCTAssertEqual(reconciled.fieldConfidence?["serial"], "uncertain")
+        XCTAssertEqual(reconciled.fieldConfidence?["issueDate"], "uncertain")
+        XCTAssertEqual(reconciled.status, "REVIEW")
+        XCTAssertTrue((reconciled.reviewReasons ?? []).contains(where: { $0.contains("exposure_conflict: serial") }))
+        XCTAssertTrue((reconciled.reviewReasons ?? []).contains(where: { $0.contains("exposure_conflict: issueMonth") }))
+    }
+
+    func testStabilizationSharpnessGateRejectsBlurryFramesAndAcceptsSharpFrames() {
+        let app = BondScannerApp()
+        app.automatic = true
+        app.fastScanEnabled = true
+        app.isProcessing = false
+        app.lockedAfterCapture = false
+
+        let rect = CGRect(x: 0.15, y: 0.15, width: 0.70, height: 0.70)
+
+        // 1. Uniform blurry frame: sharpnessScore == 0.0 (< fastScanSharpnessThreshold 0.012)
+        let blurryFrame = createTestCGImage(width: 400, height: 200, grayValue: 128)
+        let blurryQuality = evaluateImageQuality(blurryFrame, region: rect)
+        XCTAssertFalse(blurryQuality.isSharp)
+        XCTAssertLessThan(blurryQuality.sharpnessScore, ImageQualityReport.fastScanSharpnessThreshold)
+
+        app.handleRectangle(rect, frame: blurryFrame)
+        app.handleRectangle(rect, frame: blurryFrame)
+        app.handleRectangle(rect, frame: blurryFrame)
+        XCTAssertFalse(app.isProcessing, "Blurry frames must never pass the sharpness gate")
+
+        // Even after bounded timeout elapses, a blurry frame must not trigger capture
+        app.stabilizationStartTime = Date().timeIntervalSince1970 - 5.0
+        app.handleRectangle(rect, frame: blurryFrame)
+        XCTAssertFalse(app.isProcessing, "Bounded timeout fallback must still require sharpness")
+
+        // 2. Sharp frame with high-contrast edges: quality.isSharp == true (normalized score >= 0.015)
+        let sharpFrame = createSharpBondPatternCGImage(width: 400, height: 200)
+        let sharpQuality = evaluateImageQuality(sharpFrame, region: rect)
+        XCTAssertTrue(sharpQuality.isSharp)
+        XCTAssertGreaterThanOrEqual(sharpQuality.sharpnessScore, ImageQualityReport.standardSharpnessThreshold)
+        XCTAssertLessThanOrEqual(sharpQuality.sharpnessScore, 1.0)
+
+        app.stableFrames = 0
+        app.priorRect = nil
+        app.stabilizationStartTime = 0
+        app.nextAutoAllowedAt = 0
+
+        // Frame 1 establishes priorRect (stableFrames = 1)
+        app.handleRectangle(rect, frame: sharpFrame)
+        XCTAssertEqual(app.stableFrames, 1)
+        XCTAssertFalse(app.isProcessing)
+
+        // Frame 2 is position-stable, low-motion, and sharp -> triggers automatic capture!
+        app.handleRectangle(rect, frame: sharpFrame)
+        XCTAssertTrue(app.isProcessing, "Sharp, stable frames must pass the normalized sharpness gate and trigger capture")
+    }
+
+    func testUntrackedAndCancelledPhotoCallbacksAreRejectedNotSavedAsManualCapture() throws {
+        let app = BondScannerApp()
+        let img = createSharpBondPatternCGImage(width: 300, height: 150)
+        let dims = CMVideoDimensions(width: 300, height: 150)
+
+        // 1. Untracked callback (no matching entry in photoRequests) must be ignored
+        app.handlePhotoCaptureCallback(
+            uniqueID: 99999,
+            dimensions: dims,
+            jpegData: jpegData(img),
+            cgImage: img,
+            error: nil
+        )
+        XCTAssertTrue(app.records.isEmpty, "Untracked photo callback must not default to a manual capture")
+
+        // 2. Cancelled transaction callback must be ignored
+        let tx = try XCTUnwrap(app.captureTransactionCoordinator.startTransaction(
+            automatic: false,
+            targetBiases: [0.0],
+            deviceUniqueID: "cam-1",
+            sessionGeneration: app.cameraSessionGeneration
+        ))
+        var callbackResult: Result<CapturedExposure, Error>?
+        app.photoRequests[1001] = BondScannerApp.PhotoRequestInfo(
+            transactionId: tx.id,
+            sessionGeneration: app.cameraSessionGeneration,
+            deviceUniqueID: nil,
+            automatic: false,
+            requestedAt: Date().timeIntervalSince1970,
+            biasEV: 0.0,
+            completion: { callbackResult = $0 }
+        )
+        app.cancelInFlightCaptures(reason: "unit test cancellation")
+        if case let .failure(err) = callbackResult {
+            XCTAssertEqual(err as? ExposureBracketError, .captureCancelled)
+        } else {
+            XCTFail("Cancelling in-flight captures must notify pending request completion")
+        }
+
+        // Late arrival of hardware callback 1001 after cancellation
+        app.handlePhotoCaptureCallback(
+            uniqueID: 1001,
+            dimensions: dims,
+            jpegData: jpegData(img),
+            cgImage: img,
+            error: nil
+        )
+        XCTAssertTrue(app.records.isEmpty, "Cancelled photo callback must be ignored")
+
+        // 3. Superseded cameraSessionGeneration callback must be ignored
+        let tx2 = try XCTUnwrap(app.captureTransactionCoordinator.startTransaction(
+            automatic: false,
+            targetBiases: [0.0],
+            deviceUniqueID: nil,
+            sessionGeneration: app.cameraSessionGeneration
+        ))
+        app.photoRequests[1002] = BondScannerApp.PhotoRequestInfo(
+            transactionId: tx2.id,
+            sessionGeneration: app.cameraSessionGeneration,
+            deviceUniqueID: nil,
+            automatic: false,
+            requestedAt: Date().timeIntervalSince1970,
+            biasEV: 0.0,
+            completion: nil
+        )
+        // Simulate camera switch incrementing generation before callback arrives
+        app.cameraSessionGeneration &+= 1
+        app.handlePhotoCaptureCallback(
+            uniqueID: 1002,
+            dimensions: dims,
+            jpegData: jpegData(img),
+            cgImage: img,
+            error: nil
+        )
+        XCTAssertTrue(app.records.isEmpty, "Callback from superseded camera session generation must be ignored")
+        app.captureTransactionCoordinator.finishTransaction(id: tx2.id)
+    }
+
+    func testMultiExposureExactDuplicateConsolidatesIntoExistingRecord() throws {
+        let app = BondScannerApp()
+        let img = createSharpBondPatternCGImage(width: 300, height: 150)
+
+        // Create existing record in app and SQLite (missing issueMonth/issueYear)
+        try FileManager.default.createDirectory(at: photosRoot, withIntermediateDirectories: true)
+        let priorOrig = "photos/original_prior.jpg"
+        let priorProc = "photos/prior.jpg"
+        try XCTUnwrap(jpegData(img)).write(to: tempDir.appendingPathComponent(priorOrig))
+        try XCTUnwrap(jpegData(img)).write(to: tempDir.appendingPathComponent(priorProc))
+
+        var existing = BondRecord(
+            id: "existing-bond-1",
+            capturedAt: "2026-11-15T10:00:00Z",
+            series: "EE",
+            serial: "L1234567890EE",
+            issueMonth: "",
+            issueYear: "",
+            denomination: "50",
+            owner: "JANE DOE",
+            secondName: "",
+            secondRole: "",
+            address: "",
+            taxID: "",
+            issuingAgent: "",
+            datingStamp: "",
+            status: "OK",
+            notes: "",
+            photo: priorProc,
+            sourcePhoto: priorOrig,
+            rawOCR: "SERIES EE L1234567890EE",
+            fieldPhoto: ["series": priorOrig, "serial": priorOrig, "denomination": priorOrig],
+            fieldConfidence: ["series": "high", "serial": "high", "denomination": "high"]
+        )
+        applyRequiredStatus(&existing)
+        app.records = [existing]
+        try saveRecordLive(existing, allRecords: app.records, sortOrder: 0)
+
+        // Create incoming PROCESSING record from a multi-exposure capture of the SAME bond
+        let incomingOrig = "photos/original_incoming.jpg"
+        let incomingProc = "photos/incoming.jpg"
+        let incomingPlus = "photos/original_incoming_+0.7EV.jpg"
+        try XCTUnwrap(jpegData(img)).write(to: tempDir.appendingPathComponent(incomingOrig))
+        try XCTUnwrap(jpegData(img)).write(to: tempDir.appendingPathComponent(incomingPlus))
+
+        var incomingPlaceholder = emptyBondRecord(id: "incoming-multi-1", capturedAt: "2026-11-15T10:05:00Z")
+        incomingPlaceholder.photo = incomingProc
+        incomingPlaceholder.sourcePhoto = incomingOrig
+        incomingPlaceholder.associatedPhotos = [incomingPlus]
+        app.records.append(incomingPlaceholder)
+        try saveRecordLive(incomingPlaceholder, allRecords: app.records, sortOrder: 1)
+
+        var baseRec = BondRecord(
+            id: "base", capturedAt: "", series: "EE", serial: "L1234567890EE",
+            issueMonth: "", issueYear: "", denomination: "50",
+            owner: "JANE DOE", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: "SERIES EE L1234567890EE"
+        )
+        baseRec.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high"]
+        let baseOCR = OCRResult(record: baseRec, image: img, originalImage: img, huntScore: 90, lineCount: 5, rectified: true, bondTextFound: true)
+
+        var brightRec = BondRecord(
+            id: "bright", capturedAt: "", series: "EE", serial: "L1234567890EE",
+            issueMonth: "08", issueYear: "1996", denomination: "50",
+            owner: "JANE DOE", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: "08/1996"
+        )
+        brightRec.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high", "issueDate": "high"]
+        let brightOCR = OCRResult(record: brightRec, image: img, originalImage: img, huntScore: 88, lineCount: 5, rectified: true, bondTextFound: true)
+
+        app.applyMultiExposureOCR(
+            baselineResult: baseOCR,
+            baselinePhotoRel: incomingOrig,
+            bracketedResults: [(0.7, brightOCR, incomingPlus)],
+            to: "incoming-multi-1"
+        )
+
+        // Must consolidate into the single existing record (never leaving a duplicate row)
+        XCTAssertEqual(app.records.count, 1)
+        let merged = try XCTUnwrap(app.records.first)
+        XCTAssertEqual(merged.id, "existing-bond-1")
+        XCTAssertEqual(merged.issueMonth, "08")
+        XCTAssertEqual(merged.issueYear, "1996")
+        XCTAssertEqual(merged.fieldPhoto?["issueMonth"], incomingPlus)
+        XCTAssertTrue((merged.associatedPhotos ?? []).contains(incomingOrig))
+        XCTAssertTrue((merged.associatedPhotos ?? []).contains(incomingPlus))
+
+        let dbRecords = try testDb.loadAllRecords()
+        XCTAssertEqual(dbRecords.count, 1)
+        XCTAssertEqual(dbRecords.first?.id, "existing-bond-1")
+        XCTAssertEqual(dbRecords.first?.issueMonth, "08")
+    }
+
+    func testMultiExposureNearMatchPreservedAsSeparateReviewRecord() throws {
+        let app = BondScannerApp()
+        let img = createSharpBondPatternCGImage(width: 300, height: 150)
+        try FileManager.default.createDirectory(at: photosRoot, withIntermediateDirectories: true)
+
+        let priorOrig = "photos/original_near1.jpg"
+        let priorProc = "photos/near1.jpg"
+        try XCTUnwrap(jpegData(img)).write(to: tempDir.appendingPathComponent(priorOrig))
+        try XCTUnwrap(jpegData(img)).write(to: tempDir.appendingPathComponent(priorProc))
+
+        var existing = BondRecord(
+            id: "near-existing-1",
+            capturedAt: "2026-11-15T10:00:00Z",
+            series: "EE",
+            serial: "L1234567890EE",
+            issueMonth: "05",
+            issueYear: "1995",
+            denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "OK", notes: "",
+            photo: priorProc, sourcePhoto: priorOrig, rawOCR: "",
+            fieldConfidence: ["series": "high", "serial": "high", "denomination": "high", "issueDate": "high"]
+        )
+        applyRequiredStatus(&existing)
+        app.records = [existing]
+        try saveRecordLive(existing, allRecords: app.records, sortOrder: 0)
+
+        let incomingOrig = "photos/original_near2.jpg"
+        let incomingProc = "photos/near2.jpg"
+        try XCTUnwrap(jpegData(img)).write(to: tempDir.appendingPathComponent(incomingOrig))
+
+        var incomingPlaceholder = emptyBondRecord(id: "near-incoming-2", capturedAt: "2026-11-15T10:02:00Z")
+        incomingPlaceholder.photo = incomingProc
+        incomingPlaceholder.sourcePhoto = incomingOrig
+        app.records.append(incomingPlaceholder)
+        try saveRecordLive(incomingPlaceholder, allRecords: app.records, sortOrder: 1)
+
+        // Single confusable character difference: '0' vs '8' at last digit
+        var nearRec = BondRecord(
+            id: "base", capturedAt: "", series: "EE", serial: "L1234567898EE",
+            issueMonth: "05", issueYear: "1995", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: ""
+        )
+        nearRec.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high", "issueDate": "high"]
+        let nearOCR = OCRResult(record: nearRec, image: img, originalImage: img, huntScore: 92, lineCount: 5, rectified: true, bondTextFound: true)
+
+        app.applyMultiExposureOCR(
+            baselineResult: nearOCR,
+            baselinePhotoRel: incomingOrig,
+            bracketedResults: [],
+            to: "near-incoming-2"
+        )
+
+        XCTAssertEqual(app.records.count, 2)
+        let savedNear = try XCTUnwrap(app.records.first(where: { $0.id == "near-incoming-2" }))
+        XCTAssertEqual(savedNear.status, "REVIEW")
+        XCTAssertTrue((savedNear.reviewReasons ?? []).contains("near_match: near-existing-1"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent(savedNear.photo).path))
+    }
+
+    func testMultiExposureDatabaseWriteFailureRollsBackInMemoryStateAndNeverSuppressesError() throws {
+        let app = BondScannerApp()
+        let img = createSharpBondPatternCGImage(width: 300, height: 150)
+        try FileManager.default.createDirectory(at: photosRoot, withIntermediateDirectories: true)
+
+        let origRel = "photos/original_dbfail.jpg"
+        let procRel = "photos/dbfail.jpg"
+        try XCTUnwrap(jpegData(img)).write(to: tempDir.appendingPathComponent(origRel))
+
+        var placeholder = emptyBondRecord(id: "dbfail-1", capturedAt: "2026-11-15T11:00:00Z")
+        placeholder.photo = procRel
+        placeholder.sourcePhoto = origRel
+        app.records = [placeholder]
+        try saveRecordLive(placeholder, allRecords: app.records, sortOrder: 0)
+
+        // Force DatabaseManager writes to fail by closing the underlying database connection
+        testDb.close()
+
+        var ocrRec = BondRecord(
+            id: "base", capturedAt: "", series: "EE", serial: "L1234567890EE",
+            issueMonth: "05", issueYear: "1995", denomination: "50",
+            owner: "", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: ""
+        )
+        ocrRec.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high", "issueDate": "high"]
+        let ocrRes = OCRResult(record: ocrRec, image: img, originalImage: img, huntScore: 90, lineCount: 5, rectified: true, bondTextFound: true)
+
+        app.applyMultiExposureOCR(
+            baselineResult: ocrRes,
+            baselinePhotoRel: origRel,
+            bracketedResults: [],
+            to: "dbfail-1"
+        )
+
+        // Because the SQLite write failed, in-memory records must roll back to the pre-save state (status == "PROCESSING")
+        XCTAssertEqual(app.records.first?.status, "PROCESSING")
+        // And both original and processed photographs remain preserved on disk
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent(origRel).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent(procRel).path))
+    }
+
+    func testMultiExposureAllStoredPhotographReferencesResolveAfterOCRRestartBackupAndRestore() throws {
+        let app = BondScannerApp()
+        let baseImg = createSharpBondPatternCGImage(width: 320, height: 160)
+        let darkImg = createTestCGImage(width: 320, height: 160, grayValue: 80)
+        let brightImg = createTestCGImage(width: 320, height: 160, grayValue: 200)
+
+        let transaction = CaptureTransaction(
+            automatic: false,
+            targetBiases: [0.0, -0.7, 0.7]
+        )
+        transaction.addExposure(CapturedExposure(
+            biasEV: 0.0,
+            image: baseImg,
+            jpegBytes: jpegData(baseImg),
+            meanLuminance: 0.50,
+            sharpnessScore: 0.05,
+            isBaseline: true
+        ))
+        transaction.addExposure(CapturedExposure(
+            biasEV: -0.7,
+            image: darkImg,
+            jpegBytes: jpegData(darkImg),
+            meanLuminance: 0.31,
+            sharpnessScore: 0.04,
+            isBaseline: false
+        ))
+        transaction.addExposure(CapturedExposure(
+            biasEV: 0.7,
+            image: brightImg,
+            jpegBytes: jpegData(brightImg),
+            meanLuminance: 0.78,
+            sharpnessScore: 0.04,
+            isBaseline: false
+        ))
+
+        // Prevent automatic background OCR from racing with our controlled step-by-step assertions
+        app.ocrBusy = true
+        app.finishMultiExposureCapture(transaction: transaction)
+
+        let savedExp = expectation(description: "Multi-exposure files and PROCESSING record saved")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            savedExp.fulfill()
+        }
+        wait(for: [savedExp], timeout: 2.0)
+
+        let processingRecord = try XCTUnwrap(app.records.first)
+        XCTAssertEqual(processingRecord.id, transaction.id.uuidString)
+
+        // 1. Even BEFORE OCR runs (while PROCESSING), every photo path on the record must exist on disk
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent(processingRecord.photo).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent(processingRecord.sourcePhoto).path))
+        for assoc in processingRecord.associatedPhotos ?? [] {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent(assoc).path))
+        }
+
+        // 2. Run multi-exposure OCR reconciliation through production applyMultiExposureOCR
+        let bracketedJob = try XCTUnwrap(app.ocrPending.first)
+        var baseRec = BondRecord(
+            id: "base", capturedAt: "", series: "EE", serial: "L1234567890EE",
+            issueMonth: "", issueYear: "", denomination: "50",
+            owner: "JOHN SMITH", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: "SERIES EE L1234567890EE"
+        )
+        baseRec.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high"]
+        let baseOCR = OCRResult(record: baseRec, image: baseImg, originalImage: baseImg, huntScore: 95, lineCount: 6, rectified: true, bondTextFound: true)
+
+        var darkRec = BondRecord(
+            id: "dark", capturedAt: "", series: "EE", serial: "L1234567890EE",
+            issueMonth: "11", issueYear: "1999", denomination: "50",
+            owner: "JOHN SMITH", secondName: "", secondRole: "", address: "", taxID: "",
+            issuingAgent: "FEDERAL RESERVE", datingStamp: "", status: "", notes: "",
+            photo: "", sourcePhoto: "", rawOCR: "11/1999 FEDERAL RESERVE"
+        )
+        darkRec.fieldConfidence = ["series": "high", "serial": "high", "denomination": "high", "issueDate": "high"]
+        let darkOCR = OCRResult(record: darkRec, image: darkImg, originalImage: darkImg, huntScore: 90, lineCount: 5, rectified: true, bondTextFound: true)
+
+        let bracketInput: [(biasEV: Float, result: OCRResult, photoRel: String)] = bracketedJob.bracketedExposures.map { item in
+            (biasEV: item.biasEV, result: darkOCR, photoRel: item.relativePath)
+        }
+
+        app.applyMultiExposureOCR(
+            baselineResult: baseOCR,
+            baselinePhotoRel: processingRecord.sourcePhoto,
+            bracketedResults: bracketInput,
+            to: processingRecord.id
+        )
+
+        func assertAllPhotosExist(for record: BondRecord, in root: URL, context: String) {
+            XCTAssertFalse(record.photo.isEmpty, "photo empty in \(context)")
+            XCTAssertFalse(record.sourcePhoto.isEmpty, "sourcePhoto empty in \(context)")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(record.photo).path), "Missing record.photo (\(record.photo)) in \(context)")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(record.sourcePhoto).path), "Missing record.sourcePhoto (\(record.sourcePhoto)) in \(context)")
+            for assoc in record.associatedPhotos ?? [] {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(assoc).path), "Missing associatedPhoto (\(assoc)) in \(context)")
+            }
+            for (field, path) in record.fieldPhoto ?? [:] {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(path).path), "Missing fieldPhoto[\(field)] (\(path)) in \(context)")
+            }
+        }
+
+        // Verify after OCR
+        let postOCRRecord = try XCTUnwrap(app.records.first)
+        XCTAssertEqual(postOCRRecord.status, "OK")
+        XCTAssertEqual(postOCRRecord.issueMonth, "11")
+        XCTAssertEqual(postOCRRecord.issueYear, "1999")
+        assertAllPhotosExist(for: postOCRRecord, in: tempDir, context: "after OCR")
+
+        // 3. Simulate application restart by reopening SQLite database from disk
+        let reopenedDB = try DatabaseManager(url: testDbURL)
+        let restartedRecords = try reopenedDB.loadAllRecords()
+        XCTAssertEqual(restartedRecords.count, 1)
+        let restartedRecord = try XCTUnwrap(restartedRecords.first)
+        assertAllPhotosExist(for: restartedRecord, in: tempDir, context: "after restart")
+
+        // 4. Create backup and verify all referenced photographs exist in backup
+        let backupURL = backupsDir.appendingPathComponent("multi_exp_backup", isDirectory: true)
+        try reopenedDB.backupCollection(
+            to: backupURL,
+            photosSourceDir: tempDir.appendingPathComponent("photos", isDirectory: true)
+        )
+        assertAllPhotosExist(for: restartedRecord, in: backupURL, context: "inside backup archive")
+
+        // 5. Restore backup into a clean collection root and verify every photograph reference resolves
+        let restoredRoot = rootSandboxDir.appendingPathComponent("restored_collection", isDirectory: true)
+        let restoredPhotosDir = restoredRoot.appendingPathComponent("photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: restoredPhotosDir, withIntermediateDirectories: true)
+        let restoredDBURL = restoredRoot.appendingPathComponent("bonds.sqlite3")
+        let restoredDB = try DatabaseManager(url: restoredDBURL)
+        try restoredDB.restoreCollection(
+            from: backupURL,
+            destinationDBURL: restoredDBURL,
+            destinationPhotosDir: restoredPhotosDir,
+            authorized: true
+        )
+        let restoredRecords = try restoredDB.loadAllRecords()
+        XCTAssertEqual(restoredRecords.count, 1)
+        let restoredRecord = try XCTUnwrap(restoredRecords.first)
+        XCTAssertEqual(restoredRecord.serial, "L1234567890EE")
+        XCTAssertEqual(restoredRecord.issueMonth, "11")
+        XCTAssertEqual(restoredRecord.issueYear, "1999")
+        assertAllPhotosExist(for: restoredRecord, in: restoredRoot, context: "after restore")
     }
 }

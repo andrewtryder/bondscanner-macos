@@ -146,15 +146,38 @@ enum WebcamResolver {
 
     /// Categorizes an AVFoundation AVCaptureDevice.
     static func categorize(device: AVCaptureDevice) -> WebcamCategory {
+        var isContinuity = false
         if #available(macOS 14.0, *) {
             if device.deviceType == .continuityCamera {
-                return .continuity
+                isContinuity = true
             }
         }
+        return categorize(
+            localizedName: device.localizedName,
+            modelID: device.modelID,
+            manufacturer: device.manufacturer,
+            transportType: device.transportType,
+            isBuiltInDeviceType: device.deviceType == .builtInWideAngleCamera,
+            isContinuityDeviceType: isContinuity
+        )
+    }
 
-        let nameLower = device.localizedName.lowercased()
-        let modelLower = device.modelID.lowercased()
-        let mfgLower = device.manufacturer.lowercased()
+    /// Pure classification helper preferring verified transport information over generic display names.
+    static func categorize(
+        localizedName: String,
+        modelID: String,
+        manufacturer: String,
+        transportType: Int32,
+        isBuiltInDeviceType: Bool = false,
+        isContinuityDeviceType: Bool = false
+    ) -> WebcamCategory {
+        if isContinuityDeviceType {
+            return .continuity
+        }
+
+        let nameLower = localizedName.lowercased()
+        let modelLower = modelID.lowercased()
+        let mfgLower = manufacturer.lowercased()
 
         if nameLower.contains("continuity") || modelLower.contains("continuity")
             || nameLower.contains("iphone") || nameLower.contains("ipad")
@@ -162,17 +185,19 @@ enum WebcamResolver {
             return .continuity
         }
 
-        if device.deviceType == .builtInWideAngleCamera || device.transportType == 1_651_274_862 { // 'bltn'
+        // 1651274862 is 'bltn' in ASCII (kIOAudioDeviceTransportTypeBuiltIn)
+        if isBuiltInDeviceType || transportType == 1_651_274_862 {
             return .builtIn
         }
 
         // Physical USB Transport:
-        // 1970496032 is 'usb ' in ASCII (kIOAudioDeviceTransportTypeUSB)
-        if device.transportType == 1_970_496_032
+        // 1970496032 is 'usb ' in ASCII (kIOAudioDeviceTransportTypeUSB).
+        // Prefer verified transport or explicit UVC/USB hardware identifiers; do not classify
+        // as physical USB merely because the display name contains "webcam".
+        if transportType == 1_970_496_032
             || modelLower.contains("uvc")
             || modelLower.contains("usb")
             || mfgLower.contains("usb")
-            || nameLower.contains("webcam")
             || nameLower.contains("usb")
         {
             return .usbWebcam

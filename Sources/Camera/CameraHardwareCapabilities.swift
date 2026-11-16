@@ -120,30 +120,7 @@ struct CameraHardwareExposureCapabilities: Equatable {
         var minBias: Float = 0.0
         var maxBias: Float = 0.0
         var curBias: Float = 0.0
-        var supportsBias = false
-
-        // Check if device responds to exposure bias selectors dynamically
-        var err: NSError?
-        let ok = BondScanTry({
-            if device.responds(to: NSSelectorFromString("minExposureTargetBias")),
-               device.responds(to: NSSelectorFromString("maxExposureTargetBias")),
-               let minVal = (device.value(forKey: "minExposureTargetBias") as? NSNumber)?.floatValue,
-               let maxVal = (device.value(forKey: "maxExposureTargetBias") as? NSNumber)?.floatValue
-            {
-                minBias = minVal
-                maxBias = maxVal
-                if let curVal = (device.value(forKey: "exposureTargetBias") as? NSNumber)?.floatValue {
-                    curBias = curVal
-                }
-                if maxBias > minBias, (maxBias - minBias) >= 0.2 {
-                    supportsBias = true
-                }
-            }
-        }, &err)
-
-        if !ok || err != nil {
-            supportsBias = false
-        }
+        let supportsBias = BondScanGetExposureBiasCapabilities(device, &minBias, &maxBias, &curBias)
 
         let isBracketing = supportsBias && (maxBias - minBias >= 0.4)
         let statusDesc: String

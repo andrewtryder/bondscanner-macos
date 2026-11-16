@@ -240,36 +240,76 @@ extension BondScannerApp {
         ScanLog.shared.write("hardware/USB could not deliver a 2K uncompressed video frame (got \(hoped); activeFormat is \(d.width)x\(d.height) subtype=\(sub)). Uncompressed 420v above 1080p exceeds this camera's USB 2.0 ceiling (~480 Mbps). Accepting \(d.width)x\(d.height). Preview and stills will use this size; OCR relies on crop, upscale, and multi-frame reads.")
     }
 
+    func cancelInFlightCaptures(reason: String) {
+        if let cancelled = captureTransactionCoordinator.cancelActiveTransaction() {
+            ScanLog.shared.write("cancelled active capture transaction=\(cancelled.id.uuidString.prefix(8)) reason=\(reason)")
+        }
+        let pending = photoRequests
+        photoRequests.removeAll()
+        for (_, req) in pending {
+            req.completion?(.failure(ExposureBracketError.captureCancelled))
+        }
+        isProcessing = false
+    }
+
     func startCamera() {
         setupCameraNotifications()
-        let devices = videoCaptureDevices()
-        connectedDeviceDescriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
-        ScanLog.shared.write("video devices found=\(devices.count) descriptors=\(connectedDeviceDescriptors.map(\.displayNameWithCategory))")
-
+        cameraSessionGeneration &+= 1
+        let generation = cameraSessionGeneration
         let selection = webcamPreferences.loadSelection()
-        let resolution = WebcamResolver.resolveActiveCamera(selection: selection, available: connectedDeviceDescriptors)
 
-        guard let chosenDescriptor = resolution.selected,
-              let camera = devices.first(where: { $0.uniqueID == chosenDescriptor.id })
-        else {
-            captureDevice = nil
-            currentDeviceInput = nil
-            currentExposureCapabilities = .inspect(device: nil)
-            status("No camera available. Connect a webcam or built-in camera; you can still import photos.")
-            focusInfo = "Focus: no camera available"
-            focusLabel?.stringValue = focusInfo
-            refreshCameraMenu()
-            refreshSettingsCamera()
-            return
+        cameraQueue.async { [weak self] in
+            guard let self = self else { return }
+            let devices = videoCaptureDevices()
+            let descriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
+            ScanLog.shared.write("video devices found=\(devices.count) descriptors=\(descriptors.map(\.displayNameWithCategory))")
+
+            let resolution = WebcamResolver.resolveActiveCamera(selection: selection, available: descriptors)
+            guard let chosenDescriptor = resolution.selected,
+                  let camera = devices.first(where: { $0.uniqueID == chosenDescriptor.id })
+            else {
+                DispatchQueue.main.async {
+                    guard self.cameraSessionGeneration == generation else { return }
+                    self.connectedDeviceDescriptors = descriptors
+                    self.captureDevice = nil
+                    self.currentDeviceInput = nil
+                    self.currentExposureCapabilities = .inspect(device: nil)
+                    self.status("No camera available. Connect a webcam or built-in camera; you can still import photos.")
+                    self.focusInfo = "Focus: no camera available"
+                    self.focusLabel?.stringValue = self.focusInfo
+                    self.refreshCameraMenu()
+                    self.refreshSettingsCamera()
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                if self.cameraSessionGeneration == generation {
+                    self.connectedDeviceDescriptors = descriptors
+                }
+            }
+            self.configureAndStartCameraOnQueue(camera, descriptor: chosenDescriptor, generation: generation)
         }
-
-        attachAndStartCamera(camera, descriptor: chosenDescriptor)
     }
 
     func attachAndStartCamera(_ camera: AVCaptureDevice, descriptor: WebcamDescriptor) {
+        cameraSessionGeneration &+= 1
+        let generation = cameraSessionGeneration
+        cameraQueue.async { [weak self] in
+            self?.configureAndStartCameraOnQueue(camera, descriptor: descriptor, generation: generation)
+        }
+    }
+
+    /// Runs strictly on `cameraQueue` so session reconfiguration and startup are serialized.
+    func configureAndStartCameraOnQueue(_ camera: AVCaptureDevice, descriptor: WebcamDescriptor, generation: UInt64) {
+        guard cameraSessionGeneration == generation else {
+            ScanLog.shared.write("camera configuration superseded before start for '\(descriptor.localizedName)'")
+            return
+        }
         do {
             captureDevice = camera
-            currentExposureCapabilities = CameraHardwareExposureCapabilities.inspect(device: camera)
+            let inspectedCapabilities = CameraHardwareExposureCapabilities.inspect(device: camera)
+            currentExposureCapabilities = inspectedCapabilities
             logAllCameraFormats(camera)
             let input = try AVCaptureDeviceInput(device: camera)
             session.beginConfiguration()
@@ -346,32 +386,44 @@ extension BondScannerApp {
                     camera.whiteBalanceMode = .continuousAutoWhiteBalance
                 }
                 camera.unlockForConfiguration()
-            } catch { ScanLog.shared.write("could not configure autofocus or exposure (camera may manage them internally)") }
+            } catch {
+                ScanLog.shared.write("could not configure autofocus or exposure (camera may manage them internally)")
+            }
             logCameraControls(camera)
-            focusInfo = continuous ? "Focus: continuous autofocus requested" :
+            let nextFocusInfo = continuous ? "Focus: continuous autofocus requested" :
                 (autoFocus ? "Focus: one-shot autofocus requested" : "Focus: webcam controls unavailable / hardware-managed")
-            focusLabel?.stringValue = focusInfo
 
             session.commitConfiguration()
             logActiveFormatState(camera, at: "after_commit")
-            ScanLog.shared.write("camera=\(camera.localizedName) category=\(descriptor.category.rawValue) continuous_focus=\(continuous) one_shot_focus=\(autoFocus) focus_point=\(pointSupported) hardware_exposure=\(currentExposureCapabilities.supportsHardwareAdjustment)")
-            status("Camera: [\(descriptor.category.displayBadge)] \(descriptor.localizedName). Finding bond outline or printed text…")
+            ScanLog.shared.write("camera=\(camera.localizedName) category=\(descriptor.category.rawValue) continuous_focus=\(continuous) one_shot_focus=\(autoFocus) focus_point=\(pointSupported) hardware_exposure=\(inspectedCapabilities.supportsHardwareAdjustment)")
+
             deliveredFrameLogged = false
             resolutionSettled = false
             didReassertFormat = false
             didTryHigherFormat = false
-            cameraQueue.async {
-                if !self.session.isRunning {
-                    self.session.startRunning()
-                }
-                self.reassertChosenFormatIfNeeded(afterStart: true)
+
+            if !session.isRunning {
+                session.startRunning()
             }
-            refreshCameraMenu()
-            refreshSettingsCamera()
+            reassertChosenFormatIfNeeded(afterStart: true)
+
+            DispatchQueue.main.async {
+                guard self.cameraSessionGeneration == generation else { return }
+                self.focusInfo = nextFocusInfo
+                self.focusLabel?.stringValue = nextFocusInfo
+                self.status("Camera: [\(descriptor.category.displayBadge)] \(descriptor.localizedName). Finding bond outline or printed text…")
+                self.isCameraSwitching = false
+                self.refreshCameraMenu()
+                self.refreshSettingsCamera()
+            }
         } catch {
-            status("Camera error: \(error.localizedDescription)")
-            refreshCameraMenu()
-            refreshSettingsCamera()
+            DispatchQueue.main.async {
+                guard self.cameraSessionGeneration == generation else { return }
+                self.isCameraSwitching = false
+                self.status("Camera error: \(error.localizedDescription)")
+                self.refreshCameraMenu()
+                self.refreshSettingsCamera()
+            }
         }
     }
 
@@ -381,7 +433,7 @@ extension BondScannerApp {
             webcamPreferences.saveSelection(.explicit(uniqueID: descriptor.id))
         }
 
-        if captureDevice?.uniqueID == descriptor.id {
+        if captureDevice?.uniqueID == descriptor.id, !isCameraSwitching {
             refreshCameraMenu()
             refreshSettingsCamera()
             return
@@ -395,24 +447,26 @@ extension BondScannerApp {
         }
 
         isCameraSwitching = true
-        _ = captureTransactionCoordinator.cancelActiveTransaction()
+        cameraSessionGeneration &+= 1
+        let generation = cameraSessionGeneration
+        cancelInFlightCaptures(reason: "switching to \(descriptor.localizedName)")
 
         cameraQueue.async { [weak self] in
-            guard let self = self else { return }
+            guard let self = self, self.cameraSessionGeneration == generation else { return }
             let devices = videoCaptureDevices()
             guard let newDevice = devices.first(where: { $0.uniqueID == descriptor.id }) else {
                 DispatchQueue.main.async {
+                    guard self.cameraSessionGeneration == generation else { return }
                     self.isCameraSwitching = false
                     self.status("Selected camera '\(descriptor.localizedName)' is not available.")
+                    self.refreshCameraMenu()
+                    self.refreshSettingsCamera()
                 }
                 return
             }
 
-            DispatchQueue.main.async {
-                self.attachAndStartCamera(newDevice, descriptor: descriptor)
-                self.isCameraSwitching = false
-                ScanLog.shared.write("successfully switched camera to '\(descriptor.localizedName)' [\(descriptor.category.rawValue)]")
-            }
+            self.configureAndStartCameraOnQueue(newDevice, descriptor: descriptor, generation: generation)
+            ScanLog.shared.write("successfully switched camera to '\(descriptor.localizedName)' [\(descriptor.category.rawValue)]")
         }
     }
 
@@ -425,58 +479,72 @@ extension BondScannerApp {
     }
 
     @objc func handleCameraConnected(_ notification: Notification) {
-        DispatchQueue.main.async { [weak self] in
+        cameraQueue.async { [weak self] in
             guard let self = self else { return }
             let devices = videoCaptureDevices()
-            self.connectedDeviceDescriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
-            self.refreshCameraMenu()
-            self.refreshSettingsCamera()
+            let descriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
+            DispatchQueue.main.async {
+                self.connectedDeviceDescriptors = descriptors
+                self.refreshCameraMenu()
+                self.refreshSettingsCamera()
 
-            let selection = self.webcamPreferences.loadSelection()
-            let resolution = WebcamResolver.resolveActiveCamera(selection: selection, available: self.connectedDeviceDescriptors)
+                let selection = self.webcamPreferences.loadSelection()
+                let resolution = WebcamResolver.resolveActiveCamera(selection: selection, available: self.connectedDeviceDescriptors)
 
-            guard let best = resolution.selected else { return }
+                guard let best = resolution.selected else { return }
 
-            // If the best available device is different from current active device, switch to it safely
-            if self.captureDevice?.uniqueID != best.id {
-                ScanLog.shared.write("preferred camera connected or available: '\(best.localizedName)' [\(best.category.rawValue)]")
-                self.switchCamera(to: best, isExplicit: false)
+                // If the best available device is different from current active device, switch to it safely
+                if self.captureDevice?.uniqueID != best.id {
+                    ScanLog.shared.write("preferred camera connected or available: '\(best.localizedName)' [\(best.category.rawValue)]")
+                    self.switchCamera(to: best, isExplicit: false)
+                }
             }
         }
     }
 
     @objc func handleCameraDisconnected(_ notification: Notification) {
         guard let disconnectedDevice = notification.object as? AVCaptureDevice else { return }
-        DispatchQueue.main.async { [weak self] in
+        let disconnectedID = disconnectedDevice.uniqueID
+        let disconnectedName = disconnectedDevice.localizedName
+
+        cameraQueue.async { [weak self] in
             guard let self = self else { return }
-            ScanLog.shared.write("camera disconnected: '\(disconnectedDevice.localizedName)' (uid: \(disconnectedDevice.uniqueID))")
             let devices = videoCaptureDevices()
-            self.connectedDeviceDescriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
-            self.refreshCameraMenu()
-            self.refreshSettingsCamera()
+            let descriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
 
-            // If the disconnected device was the active camera, failover safely
-            if self.captureDevice?.uniqueID == disconnectedDevice.uniqueID {
-                _ = self.captureTransactionCoordinator.cancelActiveTransaction()
-                self.isProcessing = false
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                ScanLog.shared.write("camera disconnected: '\(disconnectedName)' (uid: \(disconnectedID))")
+                self.connectedDeviceDescriptors = descriptors
+                self.refreshCameraMenu()
+                self.refreshSettingsCamera()
 
-                let selection = self.webcamPreferences.loadSelection()
-                let resolution = WebcamResolver.resolveActiveCamera(selection: selection, available: self.connectedDeviceDescriptors)
+                // If the disconnected device was the active camera, failover safely
+                if self.captureDevice?.uniqueID == disconnectedID {
+                    self.cameraSessionGeneration &+= 1
+                    let generation = self.cameraSessionGeneration
+                    self.cancelInFlightCaptures(reason: "active camera disconnected")
 
-                if let fallback = resolution.selected,
-                   let fallbackDevice = devices.first(where: { $0.uniqueID == fallback.id })
-                {
-                    self.status("Selected camera disconnected. Active camera: [\(fallback.category.displayBadge)] \(fallback.localizedName).")
-                    self.attachAndStartCamera(fallbackDevice, descriptor: fallback)
-                } else {
-                    self.captureDevice = nil
-                    self.currentDeviceInput = nil
-                    self.currentExposureCapabilities = .inspect(device: nil)
-                    self.status("Active camera disconnected. No remaining cameras; you can still import photos.")
-                    self.focusInfo = "Focus: camera disconnected"
-                    self.focusLabel?.stringValue = self.focusInfo
-                    self.refreshCameraMenu()
-                    self.refreshSettingsCamera()
+                    let selection = self.webcamPreferences.loadSelection()
+                    let resolution = WebcamResolver.resolveActiveCamera(selection: selection, available: self.connectedDeviceDescriptors)
+
+                    if let fallback = resolution.selected,
+                       let fallbackDevice = devices.first(where: { $0.uniqueID == fallback.id })
+                    {
+                        self.status("Selected camera disconnected. Active camera: [\(fallback.category.displayBadge)] \(fallback.localizedName).")
+                        self.cameraQueue.async { [weak self] in
+                            self?.configureAndStartCameraOnQueue(fallbackDevice, descriptor: fallback, generation: generation)
+                        }
+                    } else {
+                        self.captureDevice = nil
+                        self.currentDeviceInput = nil
+                        self.currentExposureCapabilities = .inspect(device: nil)
+                        self.status("Active camera disconnected. No remaining cameras; you can still import photos.")
+                        self.focusInfo = "Focus: camera disconnected"
+                        self.focusLabel?.stringValue = self.focusInfo
+                        self.refreshCameraMenu()
+                        self.refreshSettingsCamera()
+                    }
                 }
             }
         }
@@ -485,11 +553,17 @@ extension BondScannerApp {
     func checkPendingCameraSwitchAfterCapture() {
         guard let pendingID = pendingReconnectionDeviceID else { return }
         pendingReconnectionDeviceID = nil
-        let devices = videoCaptureDevices()
-        let descriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
-        if let target = descriptors.first(where: { $0.id == pendingID }) {
-            ScanLog.shared.write("applying deferred camera switch to '\(target.localizedName)'")
-            switchCamera(to: target, isExplicit: false)
+        cameraQueue.async { [weak self] in
+            guard let self = self else { return }
+            let devices = videoCaptureDevices()
+            let descriptors = devices.map { WebcamResolver.makeDescriptor(from: $0) }
+            DispatchQueue.main.async {
+                self.connectedDeviceDescriptors = descriptors
+                if let target = descriptors.first(where: { $0.id == pendingID }) {
+                    ScanLog.shared.write("applying deferred camera switch to '\(target.localizedName)'")
+                    self.switchCamera(to: target, isExplicit: false)
+                }
+            }
         }
     }
 
@@ -546,63 +620,104 @@ extension BondScannerApp {
         let jpeg = (failure == nil) ? photo.fileDataRepresentation() : nil
         let cg = (failure == nil) ? photo.cgImageRepresentation() : nil
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            let requestInfo = self.photoRequests.removeValue(forKey: uniqueID)
-            let automatic = requestInfo?.automatic ?? false
-            let requestedAt = requestInfo?.requestedAt ?? Date().timeIntervalSince1970
-            let biasEV = requestInfo?.biasEV ?? 0.0
+            self?.handlePhotoCaptureCallback(
+                uniqueID: uniqueID,
+                dimensions: dims,
+                jpegData: jpeg,
+                cgImage: cg,
+                error: failure
+            )
+        }
+    }
 
-            if let completion = requestInfo?.completion {
-                if let failure = failure {
-                    completion(.failure(failure))
-                    return
-                }
-                guard let image = cg ?? jpeg.flatMap({ cgImageFromData($0) }) else {
-                    completion(.failure(NSError(domain: "Camera", code: 4, userInfo: [NSLocalizedDescriptionKey: "Photograph could not be decoded"])))
-                    return
-                }
-                let quality = evaluateImageQuality(image)
-                let exp = CapturedExposure(
-                    biasEV: biasEV,
-                    image: image,
-                    jpegBytes: jpeg,
-                    capturedAt: Date().timeIntervalSince1970,
-                    meanLuminance: quality.meanLuminance,
-                    sharpnessScore: quality.sharpnessScore,
-                    isBaseline: biasEV == 0.0
-                )
-                completion(.success(exp))
+    /// Processes a photo output callback on the main thread, rejecting untracked, cancelled, or superseded requests.
+    func handlePhotoCaptureCallback(
+        uniqueID: Int64,
+        dimensions: CMVideoDimensions,
+        jpegData jpeg: Data?,
+        cgImage cg: CGImage?,
+        error failure: Error?
+    ) {
+        guard let requestInfo = photoRequests.removeValue(forKey: uniqueID) else {
+            ScanLog.shared.write("ignoring untracked or stale photo callback id=\(uniqueID)")
+            return
+        }
+
+        let generationMatches = requestInfo.sessionGeneration == cameraSessionGeneration
+        let deviceMatches = requestInfo.deviceUniqueID == nil || requestInfo.deviceUniqueID == captureDevice?.uniqueID
+        let transactionActive = captureTransactionCoordinator.isTransactionActive(id: requestInfo.transactionId)
+
+        guard generationMatches, deviceMatches, transactionActive else {
+            ScanLog.shared.write("ignoring stale photo callback for cancelled or superseded transaction=\(requestInfo.transactionId.uuidString.prefix(8))")
+            requestInfo.completion?(.failure(ExposureBracketError.captureCancelled))
+            return
+        }
+
+        let automatic = requestInfo.automatic
+        let requestedAt = requestInfo.requestedAt
+        let biasEV = requestInfo.biasEV
+
+        if let completion = requestInfo.completion {
+            if let failure = failure {
+                completion(.failure(failure))
                 return
             }
+            guard let image = cg ?? jpeg.flatMap({ cgImageFromData($0) }) else {
+                completion(.failure(NSError(domain: "Camera", code: 4, userInfo: [NSLocalizedDescriptionKey: "Photograph could not be decoded"])))
+                return
+            }
+            let quality = evaluateImageQuality(image)
+            let exp = CapturedExposure(
+                biasEV: biasEV,
+                image: image,
+                jpegBytes: jpeg,
+                capturedAt: Date().timeIntervalSince1970,
+                meanLuminance: quality.meanLuminance,
+                sharpnessScore: quality.sharpnessScore,
+                isBaseline: biasEV == 0.0
+            )
+            completion(.success(exp))
+            return
+        }
 
-            if failure != nil {
-                ScanLog.shared.write("photo output failed; falling back to video frame")
-                if let frame = self.latestImage {
-                    self.finishCapture(image: frame, jpegBytes: nil, automatic: automatic, requestedAt: requestedAt)
-                } else if automatic {
-                    self.isProcessing = false
+        captureTransactionCoordinator.finishTransaction(id: requestInfo.transactionId)
+
+        if failure != nil {
+            ScanLog.shared.write("photo output failed; falling back to video frame")
+            if let frame = latestImage {
+                finishCapture(image: frame, jpegBytes: nil, automatic: automatic, requestedAt: requestedAt)
+                checkPendingCameraSwitchAfterCapture()
+            } else {
+                if automatic {
+                    isProcessing = false
                 } else {
-                    self.status("Photograph capture failed and no video frame is available.")
-                    self.preview.captureFlash(color: .systemRed)
+                    status("Photograph capture failed and no video frame is available.")
+                    preview?.captureFlash(color: .systemRed)
                     NSSound.beep()
                 }
-                return
+                checkPendingCameraSwitchAfterCapture()
             }
-            ScanLog.shared.write("photo output captured \(dims.width)x\(dims.height)")
-            let image = cg ?? jpeg.flatMap { cgImageFromData($0) }
-            guard let image = image else {
-                if let frame = self.latestImage {
-                    self.finishCapture(image: frame, jpegBytes: nil, automatic: automatic, requestedAt: requestedAt)
-                } else if automatic {
-                    self.isProcessing = false
-                } else {
-                    self.status("Photograph could not be decoded.")
-                    self.preview.captureFlash(color: .systemRed)
-                }
-                return
-            }
-            self.finishCapture(image: image, jpegBytes: jpeg, automatic: automatic, requestedAt: requestedAt)
+            return
         }
+        ScanLog.shared.write("photo output captured \(dimensions.width)x\(dimensions.height)")
+        let image = cg ?? jpeg.flatMap { cgImageFromData($0) }
+        guard let image = image else {
+            if let frame = latestImage {
+                finishCapture(image: frame, jpegBytes: nil, automatic: automatic, requestedAt: requestedAt)
+                checkPendingCameraSwitchAfterCapture()
+            } else {
+                if automatic {
+                    isProcessing = false
+                } else {
+                    status("Photograph could not be decoded.")
+                    preview?.captureFlash(color: .systemRed)
+                }
+                checkPendingCameraSwitchAfterCapture()
+            }
+            return
+        }
+        finishCapture(image: image, jpegBytes: jpeg, automatic: automatic, requestedAt: requestedAt)
+        checkPendingCameraSwitchAfterCapture()
     }
 
     // MARK: - Camera Menu & Settings Controls

@@ -39,43 +39,99 @@ final class CaptureTransaction {
     let requestedAt: TimeInterval
     let automatic: Bool
     let targetBiases: [Float]
-    private(set) var capturedExposures: [CapturedExposure] = []
-    private(set) var isCancelled: Bool = false
+    let deviceUniqueID: String?
+    let sessionGeneration: UInt64
+    private let lock = NSLock()
+    private var _capturedExposures: [CapturedExposure] = []
+    private var _isCancelled: Bool = false
+
+    var capturedExposures: [CapturedExposure] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _capturedExposures
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _isCancelled
+    }
 
     init(
         id: UUID = UUID(),
         requestedAt: TimeInterval = Date().timeIntervalSince1970,
         automatic: Bool,
-        targetBiases: [Float]
+        targetBiases: [Float],
+        deviceUniqueID: String? = nil,
+        sessionGeneration: UInt64 = 0
     ) {
         self.id = id
         self.requestedAt = requestedAt
         self.automatic = automatic
         self.targetBiases = targetBiases.isEmpty ? [0.0] : targetBiases
+        self.deviceUniqueID = deviceUniqueID
+        self.sessionGeneration = sessionGeneration
     }
 
     func addExposure(_ exposure: CapturedExposure) {
-        guard !isCancelled else { return }
-        capturedExposures.append(exposure)
+        lock.lock()
+        defer { lock.unlock() }
+        guard !_isCancelled else { return }
+        _capturedExposures.append(exposure)
+    }
+
+    func replaceExposures(_ exposures: [CapturedExposure]) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !_isCancelled else { return }
+        _capturedExposures = exposures
     }
 
     func cancel() {
-        isCancelled = true
+        lock.lock()
+        defer { lock.unlock() }
+        _isCancelled = true
     }
 
     var isComplete: Bool {
-        isCancelled || capturedExposures.count >= targetBiases.count
+        lock.lock()
+        defer { lock.unlock() }
+        return _isCancelled || _capturedExposures.count >= targetBiases.count
     }
 
     var baselineExposure: CapturedExposure? {
-        capturedExposures.first(where: \.isBaseline) ?? capturedExposures.first
+        lock.lock()
+        defer { lock.unlock() }
+        return _capturedExposures.first(where: \.isBaseline) ?? _capturedExposures.first
+    }
+
+    /// Returns only the exposures that exhibit genuinely distinct luminance compared to the baseline.
+    /// If no bracketed exposure differs from the baseline by at least `minDifference`, returns only the baseline.
+    func acceptedDistinctExposures(minDifference: Float = 0.02) -> [CapturedExposure] {
+        lock.lock()
+        let snapshot = _capturedExposures
+        lock.unlock()
+        guard let baseline = snapshot.first(where: \.isBaseline) ?? snapshot.first else {
+            return []
+        }
+        guard snapshot.count >= 2 else {
+            return [baseline]
+        }
+        var accepted: [CapturedExposure] = [baseline]
+        for exp in snapshot where !exp.isBaseline {
+            if abs(exp.meanLuminance - baseline.meanLuminance) >= minDifference {
+                accepted.append(exp)
+            }
+        }
+        return accepted
     }
 
     /// Verifies whether the captured exposures demonstrate genuinely different exposure levels.
     /// Returns true if multiple exposures exist and their mean luminances differ by at least minDifference.
     func haveGenuinelyDifferentExposures(minDifference: Float = 0.025) -> Bool {
-        guard capturedExposures.count >= 2 else { return false }
-        let luminances = capturedExposures.map(\.meanLuminance)
+        let exposures = capturedExposures
+        guard exposures.count >= 2 else { return false }
+        let luminances = exposures.map(\.meanLuminance)
         guard let minL = luminances.min(), let maxL = luminances.max() else { return false }
         return (maxL - minL) >= minDifference
     }
@@ -96,44 +152,85 @@ final class CaptureTransactionCoordinator {
         case active(transactionId: UUID)
     }
 
-    private(set) var state: State = .idle
+    private let lock = NSLock()
+    private var _state: State = .idle
     private var currentTransaction: CaptureTransaction?
 
     init() {}
 
+    var state: State {
+        lock.lock()
+        defer { lock.unlock() }
+        return _state
+    }
+
     var isBusy: Bool {
-        if case .active = state {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .active = _state {
             return true
         }
         return false
     }
 
+    var activeTransaction: CaptureTransaction? {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentTransaction
+    }
+
+    func isTransactionActive(id: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case let .active(activeId) = _state,
+              activeId == id,
+              let current = currentTransaction,
+              !current.isCancelled
+        else {
+            return false
+        }
+        return true
+    }
+
     func startTransaction(
         automatic: Bool,
-        targetBiases: [Float]
+        targetBiases: [Float],
+        deviceUniqueID: String? = nil,
+        sessionGeneration: UInt64 = 0
     ) -> CaptureTransaction? {
-        guard case .idle = state else {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .idle = _state else {
             return nil
         }
-        let transaction = CaptureTransaction(automatic: automatic, targetBiases: targetBiases)
-        state = .active(transactionId: transaction.id)
+        let transaction = CaptureTransaction(
+            automatic: automatic,
+            targetBiases: targetBiases,
+            deviceUniqueID: deviceUniqueID,
+            sessionGeneration: sessionGeneration
+        )
+        _state = .active(transactionId: transaction.id)
         currentTransaction = transaction
         return transaction
     }
 
     func finishTransaction(id: UUID) {
-        if case let .active(activeId) = state, activeId == id {
-            state = .idle
+        lock.lock()
+        defer { lock.unlock() }
+        if case let .active(activeId) = _state, activeId == id {
+            _state = .idle
             currentTransaction = nil
         }
     }
 
     func cancelActiveTransaction() -> CaptureTransaction? {
-        guard case let .active(activeId) = state, let current = currentTransaction, current.id == activeId else {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case let .active(activeId) = _state, let current = currentTransaction, current.id == activeId else {
             return nil
         }
         current.cancel()
-        state = .idle
+        _state = .idle
         currentTransaction = nil
         return current
     }

@@ -142,6 +142,9 @@ func computeAutoContrastParameters(_ image: CGImage, region: CGRect? = nil) -> (
 }
 
 struct ImageQualityReport {
+    static let standardSharpnessThreshold: Float = 0.015
+    static let fastScanSharpnessThreshold: Float = 0.012
+
     let sharpnessScore: Float
     let meanLuminance: Float
     let dynamicRange: Float
@@ -227,7 +230,7 @@ func evaluateImageQuality(_ image: CGImage, region: CGRect? = nil) -> ImageQuali
         sharpness = (Float(edgeBuf[0]) + Float(edgeBuf[1]) + Float(edgeBuf[2])) / (3.0 * 255.0)
     }
 
-    let isSharp = sharpness >= 0.015
+    let isSharp = sharpness >= ImageQualityReport.standardSharpnessThreshold
     let isProperlyExposed = lAvg >= 0.18 && lAvg <= 0.88 && dynamicRange >= 0.20
 
     var warning: String?

@@ -8,8 +8,8 @@ import Vision
 
 extension BondScannerApp {
     func handleRectangle(_ rect: CGRect?, frame: CGImage) {
-        preview.sourceSize = CGSize(width: CGFloat(frame.width), height: CGFloat(frame.height))
-        preview.showDetected(rect)
+        preview?.sourceSize = CGSize(width: CGFloat(frame.width), height: CGFloat(frame.height))
+        preview?.showDetected(rect)
         let now = Date().timeIntervalSince1970
         // During an auto-fill retry, a removed or replaced bond must end the
         // retry immediately. "Still some paper in view" is not the same bond.
@@ -62,7 +62,10 @@ extension BondScannerApp {
             let maxShift: CGFloat = fastScanEnabled ? 0.025 : 0.05
             let maxScale: CGFloat = fastScanEnabled ? 0.04 : 0.075
             let quality = evaluateImageQuality(frame, region: rect)
-            let isSharp = quality.sharpnessScore >= (fastScanEnabled ? 8.0 : 10.0)
+            let minSharpness: Float = fastScanEnabled
+                ? ImageQualityReport.fastScanSharpnessThreshold
+                : ImageQualityReport.standardSharpnessThreshold
+            let isSharp = quality.isSharp || quality.sharpnessScore >= minSharpness
             let motionDelta = abs(quality.meanLuminance - priorFrameLuminance)
             let isMotionLow = motionDelta < 0.12
             priorFrameLuminance = quality.meanLuminance
@@ -98,7 +101,7 @@ extension BondScannerApp {
                 stableFrames = 0
                 stabilizationStartTime = 0
                 huntHits = 0
-                ScanLog.shared.write("auto capture: stable outline (sharpness=\(String(format: "%.1f", quality.sharpnessScore)) timeoutReached=\(boundedTimeoutReached)); OCR starts")
+                ScanLog.shared.write("auto capture: stable outline (sharpness=\(String(format: "%.3f", quality.sharpnessScore)) timeoutReached=\(boundedTimeoutReached)); OCR starts")
                 performScan(frame, automaticScan: true)
                 return
             }
@@ -228,9 +231,14 @@ extension BondScannerApp {
         let mode = smartExposurePreferences.loadMode()
         let targetBiases = currentExposureCapabilities.targetExposureBiases(requestedMode: mode)
 
-        if targetBiases.count > 1, photoCaptureSupported, session.isRunning, let camera = captureDevice {
-            // Multi-exposure Smart Exposure capture
-            guard let transaction = captureTransactionCoordinator.startTransaction(automatic: automatic, targetBiases: targetBiases) else {
+        if targetBiases.count > 1, photoCaptureSupported, session != nil, session.isRunning, let camera = captureDevice {
+            // Multi-exposure Smart Exposure capture via tested ExposureBracketController
+            guard let transaction = captureTransactionCoordinator.startTransaction(
+                automatic: automatic,
+                targetBiases: targetBiases,
+                deviceUniqueID: camera.uniqueID,
+                sessionGeneration: cameraSessionGeneration
+            ) else {
                 return
             }
             if automatic {
@@ -246,7 +254,15 @@ extension BondScannerApp {
         }
 
         // Single photo capture (standard path)
-        if photoCaptureSupported, session.isRunning {
+        if photoCaptureSupported, session != nil, session.isRunning {
+            guard let transaction = captureTransactionCoordinator.startTransaction(
+                automatic: automatic,
+                targetBiases: [0.0],
+                deviceUniqueID: captureDevice?.uniqueID,
+                sessionGeneration: cameraSessionGeneration
+            ) else {
+                return
+            }
             let settings = AVCapturePhotoSettings()
             if #available(macOS 13.0, *) {
                 let max = photoOutput.maxPhotoDimensions
@@ -255,7 +271,15 @@ extension BondScannerApp {
                     settings.maxPhotoDimensions = max
                 }
             }
-            photoRequests[settings.uniqueID] = PhotoRequestInfo(automatic: automatic, requestedAt: requestedAt, biasEV: 0.0, completion: nil)
+            photoRequests[settings.uniqueID] = PhotoRequestInfo(
+                transactionId: transaction.id,
+                sessionGeneration: transaction.sessionGeneration,
+                deviceUniqueID: transaction.deviceUniqueID,
+                automatic: automatic,
+                requestedAt: requestedAt,
+                biasEV: 0.0,
+                completion: nil
+            )
             if automatic {
                 isProcessing = true
             } else {
@@ -289,8 +313,20 @@ extension BondScannerApp {
         finishCapture(image: image, jpegBytes: nil, automatic: automatic, requestedAt: requestedAt)
     }
 
-    func captureOnePhoto(biasEV: Float, fallback: CGImage?, completion: @escaping (Result<CapturedExposure, Error>) -> Void) {
-        if photoCaptureSupported, session.isRunning {
+    func captureOnePhoto(
+        transaction: CaptureTransaction,
+        biasEV: Float,
+        fallback: CGImage?,
+        completion: @escaping (Result<CapturedExposure, Error>) -> Void
+    ) {
+        guard !transaction.isCancelled,
+              transaction.sessionGeneration == cameraSessionGeneration
+        else {
+            completion(.failure(ExposureBracketError.captureCancelled))
+            return
+        }
+
+        if photoCaptureSupported, session != nil, session.isRunning {
             let settings = AVCapturePhotoSettings()
             if #available(macOS 13.0, *) {
                 let max = photoOutput.maxPhotoDimensions
@@ -300,7 +336,10 @@ extension BondScannerApp {
                 }
             }
             photoRequests[settings.uniqueID] = PhotoRequestInfo(
-                automatic: true,
+                transactionId: transaction.id,
+                sessionGeneration: transaction.sessionGeneration,
+                deviceUniqueID: transaction.deviceUniqueID,
+                automatic: transaction.automatic,
                 requestedAt: Date().timeIntervalSince1970,
                 biasEV: biasEV,
                 completion: completion
@@ -326,105 +365,66 @@ extension BondScannerApp {
         }
     }
 
-    func executeMultiExposureCapture(transaction: CaptureTransaction, camera: AVCaptureDevice, requestedAt: TimeInterval, fallback: CGImage?) {
-        captureOnePhoto(biasEV: 0.0, fallback: fallback) { [weak self] baseResult in
-            guard let self = self else { return }
-            switch baseResult {
-            case let .failure(error):
-                self.isProcessing = false
-                self.captureTransactionCoordinator.finishTransaction(id: transaction.id)
-                self.status("Smart Exposure failed on baseline: \(error.localizedDescription)")
-                self.preview.captureFlash(color: .systemRed)
-            case let .success(baseExp):
-                transaction.addExposure(baseExp)
-                let remainingTargets = Array(transaction.targetBiases.dropFirst())
-                self.stepMultiExposure(transaction: transaction, camera: camera, remainingTargets: remainingTargets, fallback: fallback)
+    func executeMultiExposureCapture(
+        transaction: CaptureTransaction,
+        camera: AVCaptureDevice,
+        requestedAt: TimeInterval,
+        fallback: CGImage?
+    ) {
+        let adapter = AVCaptureExposureAdapter(
+            device: camera,
+            capabilities: currentExposureCapabilities,
+            settlingTimeout: exposureBracketController.timeoutSeconds,
+            workQueue: cameraQueue
+        ) { [weak self] bias, done in
+            DispatchQueue.main.async {
+                guard let self = self else {
+                    done(.failure(ExposureBracketError.captureCancelled))
+                    return
+                }
+                self.captureOnePhoto(transaction: transaction, biasEV: bias, fallback: fallback, completion: done)
             }
         }
-    }
 
-    private func stepMultiExposure(transaction: CaptureTransaction, camera: AVCaptureDevice, remainingTargets: [Float], fallback: CGImage?) {
-        guard !transaction.isCancelled, let nextBias = remainingTargets.first else {
-            restoreCameraExposure(camera)
-            captureTransactionCoordinator.finishTransaction(id: transaction.id)
-            finishMultiExposureCapture(transaction: transaction)
-            return
-        }
-
-        let applied = applyHardwareExposureBias(nextBias, on: camera)
-        if !applied {
-            restoreCameraExposure(camera)
-            captureTransactionCoordinator.finishTransaction(id: transaction.id)
-            finishMultiExposureCapture(transaction: transaction)
-            return
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self = self else { return }
-            self.captureOnePhoto(biasEV: nextBias, fallback: fallback) { [weak self] photoResult in
+        exposureBracketController.executeBracket(transaction: transaction, camera: adapter) { [weak self] bracketResult in
+            DispatchQueue.main.async {
                 guard let self = self else { return }
-                switch photoResult {
-                case let .success(exp):
-                    transaction.addExposure(exp)
-                case .failure:
-                    ScanLog.shared.write("bracket step for \(nextBias) EV failed; continuing with gathered exposures")
+                self.captureTransactionCoordinator.finishTransaction(id: transaction.id)
+                switch bracketResult {
+                case let .failure(error):
+                    self.isProcessing = false
+                    if (error as? ExposureBracketError) == .captureCancelled || transaction.isCancelled {
+                        ScanLog.shared.write("smart exposure bracket cancelled id=\(transaction.id.uuidString.prefix(8))")
+                        self.checkPendingCameraSwitchAfterCapture()
+                        return
+                    }
+                    self.status("Smart Exposure failed: \(error.localizedDescription)")
+                    self.preview?.captureFlash(color: .systemRed)
+                    self.checkPendingCameraSwitchAfterCapture()
+                case let .success(exposures):
+                    transaction.replaceExposures(exposures)
+                    self.finishMultiExposureCapture(transaction: transaction)
                 }
-                self.stepMultiExposure(transaction: transaction, camera: camera, remainingTargets: Array(remainingTargets.dropFirst()), fallback: fallback)
-            }
-        }
-    }
-
-    private func applyHardwareExposureBias(_ bias: Float, on camera: AVCaptureDevice) -> Bool {
-        var success = false
-        _ = bondScanTry("set exposure bias \(bias)") {
-            if camera.responds(to: NSSelectorFromString("setExposureTargetBias:completionHandler:")) {
-                do {
-                    try camera.lockForConfiguration()
-                    typealias Fn = @convention(c) (AnyObject, Selector, Float, ((CMTime) -> Void)?) -> Void
-                    let sel = NSSelectorFromString("setExposureTargetBias:completionHandler:")
-                    let imp = camera.method(for: sel)
-                    let fn = unsafeBitCast(imp, to: Fn.self)
-                    fn(camera, sel, bias, nil)
-                    camera.unlockForConfiguration()
-                    success = true
-                } catch {
-                    success = false
-                }
-            }
-        }
-        return success
-    }
-
-    private func restoreCameraExposure(_ camera: AVCaptureDevice) {
-        _ = bondScanTry("restore camera exposure") {
-            do {
-                try camera.lockForConfiguration()
-                if camera.isExposureModeSupported(.continuousAutoExposure) {
-                    camera.exposureMode = .continuousAutoExposure
-                }
-                if camera.responds(to: NSSelectorFromString("setExposureTargetBias:completionHandler:")) {
-                    typealias Fn = @convention(c) (AnyObject, Selector, Float, ((CMTime) -> Void)?) -> Void
-                    let sel = NSSelectorFromString("setExposureTargetBias:completionHandler:")
-                    let imp = camera.method(for: sel)
-                    let fn = unsafeBitCast(imp, to: Fn.self)
-                    fn(camera, sel, 0.0, nil)
-                }
-                camera.unlockForConfiguration()
-            } catch {
-                ScanLog.shared.write("could not restore camera exposure configuration")
             }
         }
     }
 
     func finishMultiExposureCapture(transaction: CaptureTransaction) {
+        guard !transaction.isCancelled else {
+            isProcessing = false
+            checkPendingCameraSwitchAfterCapture()
+            return
+        }
         guard let baseline = transaction.baselineExposure else {
             isProcessing = false
             status("Capture failed: No exposures captured.")
+            checkPendingCameraSwitchAfterCapture()
             return
         }
 
         if transaction.capturedExposures.count <= 1 {
             finishCapture(image: baseline.image, jpegBytes: baseline.jpegBytes, automatic: transaction.automatic, requestedAt: transaction.requestedAt)
+            checkPendingCameraSwitchAfterCapture()
             return
         }
 
@@ -434,13 +434,14 @@ extension BondScannerApp {
         let primaryOriginalRel = "photos/original_" + baseFilename
         let primaryProcessedRel = "photos/" + baseFilename
         let primaryOriginalURL = outputRoot.appendingPathComponent(primaryOriginalRel)
+        let primaryProcessedURL = outputRoot.appendingPathComponent(primaryProcessedRel)
 
         var savedBracketed: [(biasEV: Float, url: URL, relativePath: String)] = []
         var qualityNotes: [String] = []
 
         let quality = evaluateImageQuality(baseline.image)
         if quality.isBlurry {
-            qualityNotes.append("blurry (\(String(format: "%.1f", quality.sharpnessScore)))")
+            qualityNotes.append("blurry (\(String(format: "%.3f", quality.sharpnessScore)))")
         }
         if quality.isUnderExposed {
             qualityNotes.append("underexposed")
@@ -458,6 +459,9 @@ extension BondScannerApp {
                     throw NSError(domain: "Save", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to encode baseline photo"])
                 }
                 try baseData.write(to: primaryOriginalURL, options: .atomic)
+                // Ensure the primary processed path also exists immediately so the record
+                // never references a missing file before or during OCR.
+                try baseData.write(to: primaryProcessedURL, options: .atomic)
 
                 for exp in transaction.capturedExposures where !exp.isBaseline {
                     let biasStr = String(format: "%+.1fEV", exp.biasEV)
@@ -473,8 +477,9 @@ extension BondScannerApp {
                 DispatchQueue.main.async {
                     self.isProcessing = false
                     self.status("SAVE FAILED: \(error.localizedDescription)")
-                    self.preview.captureFlash(color: .systemRed)
+                    self.preview?.captureFlash(color: .systemRed)
                     NSSound.beep()
+                    self.checkPendingCameraSwitchAfterCapture()
                 }
                 return
             }
@@ -503,13 +508,14 @@ extension BondScannerApp {
                     self.isProcessing = false
                     self.records = previous
                     self.status("DATABASE SAVE FAILED: \(error.localizedDescription). Photos preserved.")
-                    self.preview.captureFlash(color: .systemRed)
+                    self.preview?.captureFlash(color: .systemRed)
                     NSSound.beep()
+                    self.checkPendingCameraSwitchAfterCapture()
                     return
                 }
 
                 self.updateCount()
-                self.preview.captureFlash(color: .systemBlue)
+                self.preview?.captureFlash(color: .systemBlue)
                 NSSound(named: NSSound.Name("Glass"))?.play()
                 self.isProcessing = false
                 self.lockedAfterCapture = true
@@ -519,7 +525,7 @@ extension BondScannerApp {
                 let waiting = self.ocrPending.count + (self.ocrBusy ? 1 : 0)
                 self.diagnostics.highWaterQueueDepth = max(self.diagnostics.highWaterQueueDepth, waiting + 1)
                 self.status("Smart Exposure captured (\(transaction.capturedExposures.count) photos)! Reading in background…")
-                self.lastLabel.stringValue = "Last: multi-exposure saved, OCR pending…"
+                self.lastLabel?.stringValue = "Last: multi-exposure saved, OCR pending…"
 
                 let focus = self.shouldFocusIssueDate()
                 let recent = recentScanIssueDates(before: ISO8601DateFormatter().string(from: Date()), among: self.records)
@@ -566,19 +572,20 @@ extension BondScannerApp {
         let originalRel = "photos/original_" + filename
         let processedRel = "photos/" + filename
         let originalURL = outputRoot.appendingPathComponent(originalRel)
+        let processedURL = outputRoot.appendingPathComponent(processedRel)
         let width = image.width
         let height = image.height
 
         let quality = evaluateImageQuality(image)
         var qualityNotes: [String] = []
         if quality.isBlurry {
-            qualityNotes.append("blurry (sharpness: \(String(format: "%.1f", quality.sharpnessScore)))")
+            qualityNotes.append("blurry (sharpness: \(String(format: "%.3f", quality.sharpnessScore)))")
         }
         if quality.isUnderExposed {
-            qualityNotes.append("underexposed (mean: \(String(format: "%.1f", quality.meanLuminance)))")
+            qualityNotes.append("underexposed (mean: \(String(format: "%.2f", quality.meanLuminance)))")
         }
         if quality.isOverExposed {
-            qualityNotes.append("overexposed (mean: \(String(format: "%.1f", quality.meanLuminance)))")
+            qualityNotes.append("overexposed (mean: \(String(format: "%.2f", quality.meanLuminance)))")
         }
 
         saveQueue.async { [weak self] in
@@ -587,7 +594,7 @@ extension BondScannerApp {
                 DispatchQueue.main.async {
                     self.isProcessing = false
                     self.status("SAVE FAILED: could not encode the photograph.")
-                    self.preview.captureFlash(color: .systemRed)
+                    self.preview?.captureFlash(color: .systemRed)
                     NSSound.beep()
                     ScanLog.shared.write("original photograph encode failed")
                 }
@@ -596,11 +603,12 @@ extension BondScannerApp {
             do {
                 try FileManager.default.createDirectory(at: photosRoot, withIntermediateDirectories: true)
                 try data.write(to: originalURL, options: .atomic)
+                try data.write(to: processedURL, options: .atomic)
             } catch {
                 DispatchQueue.main.async {
                     self.isProcessing = false
                     self.status("SAVE FAILED: \(error.localizedDescription)")
-                    self.preview.captureFlash(color: .systemRed)
+                    self.preview?.captureFlash(color: .systemRed)
                     NSSound.beep()
                     ScanLog.shared.write("original photograph save failed")
                 }
@@ -624,13 +632,13 @@ extension BondScannerApp {
                     self.isProcessing = false
                     self.records = previous
                     self.status("DATABASE SAVE FAILED: \(error.localizedDescription). Photo preserved on disk.")
-                    self.preview.captureFlash(color: .systemRed)
+                    self.preview?.captureFlash(color: .systemRed)
                     NSSound.beep()
                     ScanLog.shared.write("original photograph record write failed; photo file preserved on disk")
                     return
                 }
                 self.updateCount()
-                self.preview.captureFlash(color: .systemBlue)
+                self.preview?.captureFlash(color: .systemBlue)
                 NSSound(named: NSSound.Name("Glass"))?.play()
                 self.isProcessing = false
                 self.lockedAfterCapture = true
@@ -643,16 +651,32 @@ extension BondScannerApp {
                 } else {
                     self.status("Captured (\(width)×\(height))! Slide next bond in (\(waiting) in OCR queue).")
                 }
-                self.lastLabel.stringValue = "Last: photograph saved, OCR pending…"
-                ScanLog.shared.write("original saved status=PROCESSING frame=\(width)x\(height) bytes=\(data.count) total=\(self.records.count) capture_latency_ms=\(String(format: "%.1f", captureLatencyMs)) ocr_queue=\(waiting + 1) hwm=\(self.diagnostics.highWaterQueueDepth) sharpness=\(String(format: "%.1f", quality.sharpnessScore)) lum=\(String(format: "%.1f", quality.meanLuminance))")
+                self.lastLabel?.stringValue = "Last: photograph saved, OCR pending…"
+                ScanLog.shared.write("original saved status=PROCESSING frame=\(width)x\(height) bytes=\(data.count) total=\(self.records.count) capture_latency_ms=\(String(format: "%.1f", captureLatencyMs)) ocr_queue=\(waiting + 1) hwm=\(self.diagnostics.highWaterQueueDepth) sharpness=\(String(format: "%.3f", quality.sharpnessScore)) lum=\(String(format: "%.2f", quality.meanLuminance))")
                 self.enqueueOCR(id: id, originalURL: originalURL, automatic: automatic, requestedAt: requestedAt)
             }
         }
     }
 
-    func enqueueOCR(id: String, originalURL: URL, automatic: Bool, requestedAt: TimeInterval = Date().timeIntervalSince1970) {
+    func enqueueOCR(
+        id: String,
+        originalURL: URL,
+        automatic: Bool,
+        requestedAt: TimeInterval = Date().timeIntervalSince1970,
+        associatedPhotos: [String]? = nil
+    ) {
         let focus = shouldFocusIssueDate()
         let recent = recentScanIssueDates(before: ISO8601DateFormatter().string(from: Date()), among: records)
+        var bracketed: [(biasEV: Float, url: URL, relativePath: String)] = []
+        if let assoc = associatedPhotos {
+            for rel in assoc where rel.hasSuffix("EV.jpg") {
+                let url = outputRoot.appendingPathComponent(rel)
+                if FileManager.default.fileExists(atPath: url.path) {
+                    let parsedBias = Self.parseBiasEV(fromRelativePath: rel)
+                    bracketed.append((biasEV: parsedBias, url: url, relativePath: rel))
+                }
+            }
+        }
         let job = OCRJobContext(
             id: id,
             originalURL: originalURL,
@@ -660,10 +684,18 @@ extension BondScannerApp {
             focusIssueDate: focus,
             recentIssueDates: recent,
             captureRequestedAt: requestedAt,
-            enqueuedAt: Date().timeIntervalSince1970
+            enqueuedAt: Date().timeIntervalSince1970,
+            bracketedExposures: bracketed
         )
         ocrPending.append(job)
         pumpOCR()
+    }
+
+    private static func parseBiasEV(fromRelativePath relativePath: String) -> Float {
+        let name = URL(fileURLWithPath: relativePath).deletingPathExtension().lastPathComponent
+        guard let lastUnderscore = name.lastIndex(of: "_") else { return 0.0 }
+        let suffix = name[name.index(after: lastUnderscore)...].replacingOccurrences(of: "EV", with: "")
+        return Float(suffix) ?? 0.0
     }
 
     func pumpOCR() {
@@ -702,7 +734,13 @@ extension BondScannerApp {
                     self.diagnostics.totalProcessingTimeMs += processingMs
                     ScanLog.shared.write("multi-exposure ocr finished exposures=\(job.bracketedExposures.count + 1) processing_ms=\(String(format: "%.1f", processingMs))")
                     let basePhotoRel = "photos/original_" + job.originalURL.lastPathComponent.replacingOccurrences(of: "original_", with: "")
-                    self.applyMultiExposureOCR(baselineResult: baselineResult, baselinePhotoRel: basePhotoRel, bracketedResults: bracketedResults, to: job.id)
+                    self.applyMultiExposureOCR(
+                        baselineResult: baselineResult,
+                        baselinePhotoRel: basePhotoRel,
+                        bracketedResults: bracketedResults,
+                        to: job.id,
+                        automatic: job.automatic
+                    )
                     self.ocrBusy = false
                     self.pumpOCR()
                     self.reviewWindowController?.coordinator.setAIBackgroundWorkDeferred(self.ocrBusy || !self.ocrPending.isEmpty)
@@ -715,7 +753,7 @@ extension BondScannerApp {
                 self.diagnostics.totalOCRCompleted += 1
                 self.diagnostics.totalProcessingTimeMs += processingMs
                 ScanLog.shared.write("ocr finished processing_ms=\(String(format: "%.1f", processingMs)) avg_ocr_ms=\(String(format: "%.1f", self.diagnostics.averageOCRLatencyMs)) bpm=\(String(format: "%.1f", self.diagnostics.throughputBondsPerMinute)) queue_remaining=\(self.ocrPending.count)")
-                self.applyOCR(baselineResult, to: job.id)
+                self.applyOCR(baselineResult, to: job.id, automatic: job.automatic)
                 self.ocrBusy = false
                 self.pumpOCR()
                 self.reviewWindowController?.coordinator.setAIBackgroundWorkDeferred(self.ocrBusy || !self.ocrPending.isEmpty)
@@ -745,19 +783,21 @@ extension BondScannerApp {
             return
         }
         updateCount()
-        preview.captureFlash(color: .systemRed)
+        preview?.captureFlash(color: .systemRed)
         status(message)
         awaitingSerialFromCapture = false
         ScanLog.shared.write("ocr failed; original photograph preserved")
     }
 
     func writeProcessedImage(_ image: CGImage, to relative: String, fallbackSource: String) {
+        guard !relative.isEmpty else { return }
         let dest = outputRoot.appendingPathComponent(relative)
         let original = outputRoot.appendingPathComponent(fallbackSource)
         do {
+            try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
             if let data = jpegData(image) {
                 try data.write(to: dest, options: .atomic)
-            } else if FileManager.default.fileExists(atPath: original.path) {
+            } else if !fallbackSource.isEmpty, FileManager.default.fileExists(atPath: original.path) {
                 if FileManager.default.fileExists(atPath: dest.path) {
                     try FileManager.default.removeItem(at: dest)
                 }
@@ -765,7 +805,10 @@ extension BondScannerApp {
             }
         } catch {
             ScanLog.shared.write("processed photograph write issue; original is preserved")
-            if !FileManager.default.fileExists(atPath: dest.path), FileManager.default.fileExists(atPath: original.path) {
+            if !FileManager.default.fileExists(atPath: dest.path),
+               !fallbackSource.isEmpty,
+               FileManager.default.fileExists(atPath: original.path)
+            {
                 try? FileManager.default.copyItem(at: original, to: dest)
             }
         }
@@ -812,18 +855,28 @@ extension BondScannerApp {
         if record.status != priorStatus || record.notes != priorNotes,
            let idx = records.firstIndex(where: { $0.id == record.id })
         {
+            let previous = records
             records[idx] = record
-            try? saveRecordLive(record, allRecords: records, sortOrder: idx)
+            do {
+                try saveRecordLive(record, allRecords: records, sortOrder: idx)
+            } catch {
+                records = previous
+                status("DATABASE SAVE FAILED: \(error.localizedDescription)")
+                preview?.captureFlash(color: .systemRed)
+                NSSound.beep()
+                ScanLog.shared.write("presentRecord save failed; rolling back in-memory state")
+                return
+            }
         }
         updateCount()
         let serialDisplay = record.serial.isEmpty ? "unreadable serial" : record.serial
-        lastLabel.stringValue = "Last: \(record.series) \(serialDisplay) | \(record.issueMonth)/\(record.issueYear) | $\(record.denomination) | \(record.status)"
+        lastLabel?.stringValue = "Last: \(record.series) \(serialDisplay) | \(record.issueMonth)/\(record.issueYear) | $\(record.denomination) | \(record.status)"
         let captured = normalizeSerial(record.serial)
         if !captured.isEmpty {
             lastCapturedSerial = captured
         }
         awaitingSerialFromCapture = false
-        preview.captureFlash(color: flash)
+        preview?.captureFlash(color: flash)
         status(message)
         emptyFrames = 0
         // AI is suggestion-only and queued after normal OCR/capture has completed.
@@ -860,7 +913,7 @@ extension BondScannerApp {
         }
     }
 
-    func applyOCR(_ result: OCRResult, to id: String) {
+    func applyOCR(_ result: OCRResult, to id: String, automatic: Bool = false) {
         guard let index = records.firstIndex(where: { $0.id == id }) else {
             ScanLog.shared.write("ocr result ignored; record no longer present")
             return
@@ -870,7 +923,17 @@ extension BondScannerApp {
         incoming.id = row.id
         incoming.capturedAt = row.capturedAt
         incoming.sourcePhoto = row.sourcePhoto
-        incoming.photo = row.photo
+        if row.photo.isEmpty {
+            incoming.photo = row.sourcePhoto.replacingOccurrences(of: "photos/original_", with: "photos/")
+        } else {
+            incoming.photo = row.photo
+        }
+        if let rowAssoc = row.associatedPhotos, !rowAssoc.isEmpty {
+            addAssociatedPhotos(to: &incoming, newPhotos: rowAssoc)
+        }
+        if !row.notes.isEmpty, row.notes != "Photograph saved; OCR pending", !incoming.notes.contains(row.notes) {
+            incoming.notes = incoming.notes.isEmpty ? row.notes : "\(row.notes); \(incoming.notes)"
+        }
         incoming.revision = (row.revision ?? 0) + 1
         applyRequiredStatus(&incoming)
 
@@ -878,8 +941,8 @@ extension BondScannerApp {
         if row.status != "PROCESSING" {
             var preserved = row
             _ = mergeBondRecord(from: incoming, into: &preserved,
-                                contributingPhoto: row.photo,
-                                contributingSource: row.sourcePhoto,
+                                contributingPhoto: incoming.photo,
+                                contributingSource: incoming.sourcePhoto,
                                 captureId: row.id)
             incoming = preserved
         }
@@ -893,6 +956,9 @@ extension BondScannerApp {
             endAutoFill(reason: reason)
         }
 
+        // Always persist the processed image so `incoming.photo` resolves on disk across all paths
+        writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
+
         // DUPLICATE CONSOLIDATION: Exact, validated serial match with no conflicting fields
         // Prioritized before near-matches so valid captures are not misclassified as near-duplicates
         if let prior = priorRecord(for: incoming), let priorIndex = records.firstIndex(where: { $0.id == prior.id }) {
@@ -901,11 +967,15 @@ extension BondScannerApp {
                                          contributingPhoto: incoming.photo,
                                          contributingSource: incoming.sourcePhoto,
                                          captureId: incoming.id)
+            let incomingFieldPhotos = Array((incoming.fieldPhoto ?? [:]).values)
             if filled.isEmpty {
                 // Exact match with no new fields. Keep the original photograph on disk. Never trash it!
                 let preserveNote = "Duplicate scan photo preserved at \(incoming.sourcePhoto)"
                 merged.notes = merged.notes.isEmpty ? preserveNote : "\(merged.notes); \(preserveNote)"
-                addAssociatedPhotos(to: &merged, newPhotos: [incoming.sourcePhoto, incoming.photo] + (incoming.associatedPhotos ?? []))
+                addAssociatedPhotos(
+                    to: &merged,
+                    newPhotos: [incoming.sourcePhoto, incoming.photo] + (incoming.associatedPhotos ?? []) + incomingFieldPhotos
+                )
                 let previous = records
                 records.removeAll { $0.id == incoming.id }
                 if let idx = records.firstIndex(where: { $0.id == prior.id }) {
@@ -916,18 +986,22 @@ extension BondScannerApp {
                     ScanLog.shared.write("duplicate consolidated atomically into prior id=\(prior.id.prefix(8)); photo preserved")
                     presentRecord(merged, flash: .systemOrange,
                                   message: "Same bond — no new required fields. Photograph preserved.",
-                                  automatic: false, contributed: false, isNew: false)
+                                  automatic: automatic, contributed: false, isNew: false)
+                    checkPendingCameraSwitchAfterCapture()
                 } catch {
                     records = previous
                     status("Atomic duplicate merge failed: \(error.localizedDescription). Photo preserved.")
-                    preview.captureFlash(color: .systemRed)
+                    preview?.captureFlash(color: .systemRed)
                     NSSound.beep()
                     ScanLog.shared.write("atomic duplicate merge failed; photo preserved")
+                    checkPendingCameraSwitchAfterCapture()
                 }
                 return
             }
-            writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
-            addAssociatedPhotos(to: &merged, newPhotos: [incoming.sourcePhoto, incoming.photo] + (incoming.associatedPhotos ?? []))
+            addAssociatedPhotos(
+                to: &merged,
+                newPhotos: [incoming.sourcePhoto, incoming.photo] + (incoming.associatedPhotos ?? []) + incomingFieldPhotos
+            )
             let previous = records
             records.removeAll { $0.id == incoming.id }
             let targetIndex: Int
@@ -943,9 +1017,10 @@ extension BondScannerApp {
             } catch {
                 records = previous
                 status("OCR results could not be merged: \(error.localizedDescription). Photo preserved.")
-                preview.captureFlash(color: .systemRed)
+                preview?.captureFlash(color: .systemRed)
                 NSSound.beep()
                 ScanLog.shared.write("atomic merge failed; photo preserved")
+                checkPendingCameraSwitchAfterCapture()
                 return
             }
             let fieldList = filled.joined(separator: ", ")
@@ -954,14 +1029,14 @@ extension BondScannerApp {
             let message = requiredFieldsComplete(merged)
                 ? "Updated the existing record with \(fieldList). Automatic validation passed. Remove the bond."
                 : "Updated the existing record with \(fieldList). Still missing \(requiredFieldsMissing(merged).joined(separator: ", "))."
-            presentRecord(merged, flash: flash, message: message, automatic: false, contributed: true, isNew: false)
+            presentRecord(merged, flash: flash, message: message, automatic: automatic, contributed: true, isNew: false)
+            checkPendingCameraSwitchAfterCapture()
             return
         }
 
         // DUPLICATE SAFETY: OCR-confusable near-match handling (Priority 2)
         // Never automatically merge near-matches. Preserve as a separate record for user review with structured review reason.
         if let near = findNearMatchRecord(incoming, in: records, excluding: incoming.id) {
-            writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
             annotateFieldSources(&incoming, photo: incoming.sourcePhoto, captureId: incoming.id)
             var reasons = Set(incoming.reviewReasons ?? [])
             reasons.insert("near_match: \(near.id)")
@@ -978,19 +1053,20 @@ extension BondScannerApp {
                 ScanLog.shared.write("near match preserved as separate review record; photo preserved (near id=\(near.id.prefix(8)))")
                 presentRecord(incoming, flash: .systemYellow,
                               message: "Near-match detected. Preserved as separate record for user review.",
-                              automatic: false, contributed: true, isNew: true)
+                              automatic: automatic, contributed: true, isNew: true)
+                checkPendingCameraSwitchAfterCapture()
                 return
             } catch {
                 records = previous
                 status("Near-match record could not be saved: \(error.localizedDescription)")
-                preview.captureFlash(color: .systemRed)
+                preview?.captureFlash(color: .systemRed)
                 NSSound.beep()
                 ScanLog.shared.write("near-match record write failed; photograph preserved")
+                checkPendingCameraSwitchAfterCapture()
                 return
             }
         }
 
-        writeProcessedImage(result.image, to: incoming.photo, fallbackSource: incoming.sourcePhoto)
         annotateFieldSources(&incoming, photo: incoming.sourcePhoto, captureId: incoming.id)
         applyRequiredStatus(&incoming)
         let previous = records
@@ -999,9 +1075,10 @@ extension BondScannerApp {
         catch {
             records = previous
             status("OCR results could not be saved: \(error.localizedDescription)")
-            preview.captureFlash(color: .systemRed)
+            preview?.captureFlash(color: .systemRed)
             NSSound.beep()
             ScanLog.shared.write("ocr record write failed; original photograph preserved")
+            checkPendingCameraSwitchAfterCapture()
             return
         }
         ScanLog.shared.write("scan updated status=\(incoming.status) fields_nonempty=\([incoming.series, incoming.serial, incoming.issueMonth, incoming.issueYear, incoming.denomination].filter { !$0.isEmpty }.count) rectified=\(result.rectified) total=\(records.count)")
@@ -1009,7 +1086,8 @@ extension BondScannerApp {
         let message = incoming.status == "OK"
             ? "OCR complete — automatic validation passed. Remove the bond, then show the next one."
             : "OCR complete — review needed (\(requiredFieldsMissing(incoming).joined(separator: ", "))). Remove the bond, then show the next one."
-        presentRecord(incoming, flash: flash, message: message, automatic: false, contributed: true, isNew: true)
+        let isNew = (incoming.userConfirmedFields ?? []).isEmpty
+        presentRecord(incoming, flash: flash, message: message, automatic: automatic, contributed: true, isNew: isNew)
         checkPendingCameraSwitchAfterCapture()
     }
 
@@ -1017,9 +1095,13 @@ extension BondScannerApp {
         baselineResult: OCRResult,
         baselinePhotoRel: String,
         bracketedResults: [(biasEV: Float, result: OCRResult, photoRel: String)],
-        to id: String
+        to id: String,
+        automatic: Bool = false
     ) {
-        guard let index = records.firstIndex(where: { $0.id == id }) else { return }
+        guard let index = records.firstIndex(where: { $0.id == id }) else {
+            ScanLog.shared.write("multi-exposure ocr result ignored; record no longer present")
+            return
+        }
         let baseRecord = records[index]
 
         let evalResult = MultiExposureOCREvaluator.evaluate(
@@ -1029,25 +1111,18 @@ extension BondScannerApp {
             baseRecord: baseRecord
         )
 
-        var record = evalResult.reconciledRecord
-        record.revision = (record.revision ?? 0) + 1
+        let anyBondText = baselineResult.bondTextFound || bracketedResults.contains(where: \.result.bondTextFound)
+        let reconciledOCR = OCRResult(
+            record: evalResult.reconciledRecord,
+            image: baselineResult.image,
+            originalImage: baselineResult.originalImage,
+            huntScore: baselineResult.huntScore,
+            lineCount: baselineResult.lineCount,
+            rectified: baselineResult.rectified,
+            bondTextFound: anyBondText
+        )
 
-        let flashColor: NSColor
-        let message: String
-        let isNew = (record.userConfirmedFields ?? []).isEmpty
-        if record.status == "OK" {
-            flashColor = .systemGreen
-            message = "Verified! \(record.series) serial \(record.serial) | $\(record.denomination)"
-        } else {
-            flashColor = .systemOrange
-            let reasons = (record.reviewReasons ?? []).joined(separator: ", ")
-            message = "Need review: \(reasons.isEmpty ? "unverified fields" : reasons)"
-        }
-
-        records[index] = record
-        try? saveRecordLive(record, allRecords: records, sortOrder: index)
-        presentRecord(record, flash: flashColor, message: message, automatic: true, contributed: true, isNew: isNew)
-        checkPendingCameraSwitchAfterCapture()
+        applyOCR(reconciledOCR, to: id, automatic: automatic)
     }
 
     func handleOCR(_ result: OCRResult, auto: Bool) {

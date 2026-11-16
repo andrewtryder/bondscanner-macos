@@ -51,6 +51,8 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     var webcamPreferences = WebcamPreferences()
     var smartExposurePreferences = SmartExposurePreferences()
     var captureTransactionCoordinator = CaptureTransactionCoordinator()
+    var exposureBracketController = ExposureBracketController()
+    var cameraSessionGeneration: UInt64 = 0
     var pendingReconnectionDeviceID: String?
     var stabilizationStartTime: TimeInterval = 0
     var priorFrameLuminance: Float = 0
@@ -128,6 +130,9 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
     let ocrQueue = DispatchQueue(label: "bondscanner.ocr", qos: .userInitiated)
     let saveQueue = DispatchQueue(label: "bondscanner.save", qos: .userInitiated)
     struct PhotoRequestInfo {
+        let transactionId: UUID
+        let sessionGeneration: UInt64
+        let deviceUniqueID: String?
         let automatic: Bool
         let requestedAt: TimeInterval
         var biasEV: Float = 0.0
@@ -278,7 +283,7 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
             let url = outputRoot.appendingPathComponent(record.sourcePhoto)
             if FileManager.default.fileExists(atPath: url.path) {
                 ScanLog.shared.write("resuming OCR for a photograph saved before the last quit")
-                enqueueOCR(id: record.id, originalURL: url, automatic: false)
+                enqueueOCR(id: record.id, originalURL: url, automatic: false, associatedPhotos: record.associatedPhotos)
             }
         }
     }
@@ -637,13 +642,13 @@ final class BondScannerApp: NSObject, NSApplicationDelegate, AVCaptureVideoDataO
         let duplicates = records.filter { $0.status == "DUPLICATE" }.count
         let reviews = records.filter { $0.status != "OK" && $0.status != "PROCESSING" && $0.status != "DUPLICATE" }.count
         let verified = records.filter { $0.status == "OK" }.count
-        capturedChip.setValue(records.count)
-        verifiedChip.setValue(verified)
-        reviewChip.setValue(reviews)
-        duplicateChip.setValue(duplicates)
-        duplicateChip.isHidden = duplicates == 0
-        readingChip.setValue(processing)
-        readingChip.isHidden = processing == 0
+        capturedChip?.setValue(records.count)
+        verifiedChip?.setValue(verified)
+        reviewChip?.setValue(reviews)
+        duplicateChip?.setValue(duplicates)
+        duplicateChip?.isHidden = duplicates == 0
+        readingChip?.setValue(processing)
+        readingChip?.isHidden = processing == 0
         bondsDrawer?.updateRecords(records)
         if syncReviewCoordinator {
             reviewWindowController?.coordinator.setAllRecords(records)
